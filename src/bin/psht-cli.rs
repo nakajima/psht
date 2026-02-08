@@ -23,11 +23,18 @@ enum CliCommand {
     /// List running apps
     Ps,
     /// Show app logs
-    Logs { app: String },
+    Logs {
+        app: String,
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Stop and remove an app
     Stop { app: String },
     /// Set up project for deployment
     Setup,
+    /// Update the psht CLI
+    Update,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -145,6 +152,25 @@ fn setup_project_in(host: &str, cwd: &Path, config_path: &Path) -> Result<(), St
     Ok(())
 }
 
+fn update(host: &str) -> Result<(), String> {
+    let ssh = Command::new("ssh")
+        .arg(format!("psht@{host}"))
+        .arg("update")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run ssh: {e}"))?;
+    let stdin = ssh.stdout.ok_or_else(|| "failed to capture ssh stdout".to_string())?;
+    let status = Command::new("sh")
+        .stdin(stdin)
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run update script: {e}"))?;
+    if !status.success() {
+        return Err("update failed".to_string());
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
@@ -166,13 +192,21 @@ fn run() -> Result<(), String> {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             ssh_cmd(&host, &["ps"])
         }
-        CliCommand::Logs { app } => {
+        CliCommand::Logs { app, follow } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            ssh_cmd(&host, &["logs", &app])
+            if follow {
+                ssh_cmd(&host, &["logs", "-f", &app])
+            } else {
+                ssh_cmd(&host, &["logs", &app])
+            }
         }
         CliCommand::Stop { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             ssh_cmd(&host, &["stop", &app])
+        }
+        CliCommand::Update => {
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            update(&host)
         }
     }
 }

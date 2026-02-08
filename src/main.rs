@@ -27,7 +27,12 @@ enum Command {
     /// List running apps
     Ps,
     /// Show app logs
-    Logs { app: String },
+    Logs {
+        app: String,
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Stop and remove an app
     Stop { app: String },
     #[command(hide = true)]
@@ -86,7 +91,7 @@ fn run() -> Result<(), String> {
         Command::Deploy { app } => commands::deploy(&app),
         Command::Push { app } => commands::push(&app),
         Command::Ps => commands::ps(),
-        Command::Logs { app } => commands::logs(&app),
+        Command::Logs { app, follow } => commands::logs(&app, follow),
         Command::Stop { app } => commands::stop(&app),
         Command::Setup => commands::setup(),
         Command::Update => commands::update(),
@@ -171,7 +176,20 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Logs {
-                app: "myapp".to_string()
+                app: "myapp".to_string(),
+                follow: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_logs_follow() {
+        let cli = parse_cli(&["psht", "logs", "-f", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Logs {
+                app: "myapp".to_string(),
+                follow: true,
             })
         );
     }
@@ -227,7 +245,8 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Logs {
-                app: "myapp".to_string()
+                app: "myapp".to_string(),
+                follow: false,
             })
         );
     }

@@ -137,11 +137,12 @@ pub fn delete(app: &str) -> Result<(), String> {
     incus().arg("delete").arg(container_name(app)).run()
 }
 
-pub fn logs(app: &str) -> Result<(), String> {
+pub fn logs(app: &str, follow: bool) -> Result<(), String> {
+    let cmd = if follow { "tail -f /app/app.log" } else { "cat /app/app.log" };
     incus()
         .arg("exec")
         .arg(container_name(app))
-        .args(&["--", "cat", "/app/app.log"])
+        .args(&["--", "sh", "-c", cmd])
         .run()
 }
 
@@ -173,6 +174,36 @@ mod tests {
     fn container_name_format() {
         assert_eq!(container_name("myapp"), "psht-myapp");
         assert_eq!(container_name("test-app"), "psht-test-app");
+    }
+
+    #[test]
+    fn incus_logs_cat_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .arg("exec")
+            .arg(&name)
+            .args(&["--", "sh", "-c", "cat /app/app.log"])
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["exec", "psht-myapp", "--", "sh", "-c", "cat /app/app.log"]
+        );
+    }
+
+    #[test]
+    fn incus_logs_follow_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .arg("exec")
+            .arg(&name)
+            .args(&["--", "sh", "-c", "tail -f /app/app.log"])
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["exec", "psht-myapp", "--", "sh", "-c", "tail -f /app/app.log"]
+        );
     }
 
     #[test]

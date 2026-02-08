@@ -112,7 +112,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             .to_string();
         if remote_hash == hash {
             eprintln!("-----> Reusing container");
-            container::exec_cmd(app, "pkill -f '[n]ohup' || true")?;
+            container::exec_cmd(app, "kill $(cat /app/app.pid 2>/dev/null) 2>/dev/null || true")?;
             false
         } else {
             eprintln!("-----> Rebuilding container");
@@ -149,7 +149,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
     let start_cmd = format!(
-        "cd /app && PORT={port} nohup {cmd} > /app/app.log 2>&1 &",
+        "cd /app && PORT={port} nohup {cmd} > /app/app.log 2>&1 & echo $! > /app/app.pid",
         cmd = config.start_command
     );
     container::exec_cmd(app, &start_cmd)?;
@@ -172,8 +172,8 @@ pub fn ps() -> Result<(), String> {
     Ok(())
 }
 
-pub fn logs(app: &str) -> Result<(), String> {
-    container::logs(app)
+pub fn logs(app: &str, follow: bool) -> Result<(), String> {
+    container::logs(app, follow)
 }
 
 fn help_text(hostname: &str) -> String {
@@ -184,7 +184,7 @@ fn help_text(hostname: &str) -> String {
         ("setup", " | sh", "Set up project and install CLI"),
         ("update", " | sh", "Update CLI to latest version"),
         ("ps", "", "List running apps"),
-        ("logs", " <app>", "Show app logs"),
+        ("logs", " [-f] <app>", "Show app logs"),
         ("stop", " <app>", "Stop and remove an app"),
     ];
 
@@ -391,7 +391,7 @@ mod tests {
         assert!(plain.contains("ssh psht@example.com setup"), "missing setup");
         assert!(plain.contains("ssh psht@example.com update"), "missing update");
         assert!(plain.contains("ssh psht@example.com ps"), "missing ps");
-        assert!(plain.contains("ssh psht@example.com logs <app>"), "missing logs");
+        assert!(plain.contains("ssh psht@example.com logs [-f] <app>"), "missing logs");
         assert!(plain.contains("ssh psht@example.com stop <app>"), "missing stop");
     }
 
