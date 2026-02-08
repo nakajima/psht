@@ -115,6 +115,61 @@ pub fn logs(app: &str) -> Result<(), String> {
     container::logs(app)
 }
 
+fn help_text(hostname: &str) -> String {
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+    let prefix = format!("ssh psht@{hostname} ");
+    let commands: &[(&str, &str, &str)] = &[
+        ("setup", " | sh", "Set up a git remote for deployment"),
+        ("ps", "", "List running apps"),
+        ("logs", " <app>", "Show app logs"),
+        ("stop", " <app>", "Stop and remove an app"),
+    ];
+
+    let mut lines = vec![
+        "psht - deploy apps with git push".to_string(),
+        String::new(),
+        "Commands:".to_string(),
+    ];
+    for (name, suffix, desc) in commands {
+        let visible_len = name.len() + suffix.len();
+        let pad = 14_usize.saturating_sub(visible_len);
+        lines.push(format!(
+            "  {dim}{prefix}{reset}{name}{dim}{suffix}{reset}{:pad$}  {desc}",
+            "",
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn help() -> Result<(), String> {
+    eprintln!("{}", help_text(&hostname()));
+    Ok(())
+}
+
+fn setup_script(hostname: &str) -> String {
+    let url = format!("psht@{hostname}:$(basename $PWD)");
+    [
+        "git remote remove psht 2>/dev/null",
+        &format!("git remote add psht {url}"),
+        r#"echo "Ready! Deploy with: git push psht main" >&2"#,
+    ]
+    .join("\n")
+}
+
+pub fn setup() -> Result<(), String> {
+    let hostname = hostname();
+    eprintln!("{}", help_text(&hostname));
+    println!("{}", setup_script(&hostname));
+    Ok(())
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "localhost".to_string())
+}
+
 pub fn stop(app: &str) -> Result<(), String> {
     eprintln!("-----> Stopping {app}");
     container::stop(app)?;
@@ -148,6 +203,47 @@ mod tests {
         let port2 = allocate_port("other");
         // Not guaranteed, but very likely to differ
         assert_ne!(port1, port2);
+    }
+
+    #[test]
+    fn setup_script_is_idempotent() {
+        let script = setup_script("example.com");
+        // Must remove existing remote before adding, so re-running doesn't error
+        assert!(
+            script.contains("git remote remove psht"),
+            "script should remove existing remote first"
+        );
+    }
+
+    #[test]
+    fn setup_script_prints_next_step() {
+        let script = setup_script("example.com");
+        assert!(
+            script.contains("git push psht"),
+            "script should tell user how to deploy"
+        );
+    }
+
+    #[test]
+    fn setup_script_has_no_help_text() {
+        let script = setup_script("example.com");
+        assert!(
+            !script.contains("Commands:"),
+            "script should not contain help text — help goes to stderr"
+        );
+    }
+
+    #[test]
+    fn help_text_contains_all_commands() {
+        let text = help_text("example.com");
+        // Strip ANSI codes for content assertions
+        let plain: String = text
+            .replace("\x1b[2m", "")
+            .replace("\x1b[0m", "");
+        assert!(plain.contains("ssh psht@example.com setup"), "missing setup");
+        assert!(plain.contains("ssh psht@example.com ps"), "missing ps");
+        assert!(plain.contains("ssh psht@example.com logs <app>"), "missing logs");
+        assert!(plain.contains("ssh psht@example.com stop <app>"), "missing stop");
     }
 
     #[test]
