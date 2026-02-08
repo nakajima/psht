@@ -20,8 +20,10 @@ struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 enum Command {
-    /// Set up a git remote for deployment
+    /// Set up project and install CLI
     Setup,
+    /// Update the CLI
+    Update,
     /// List running apps
     Ps,
     /// Show app logs
@@ -30,6 +32,8 @@ enum Command {
     Stop { app: String },
     #[command(hide = true)]
     Deploy { app: String },
+    #[command(hide = true)]
+    Push { app: String },
     #[command(name = "git-receive-pack", hide = true)]
     GitReceivePack { app: String },
     #[command(name = "git-upload-pack", hide = true)]
@@ -80,10 +84,12 @@ fn run() -> Result<(), String> {
         Command::GitReceivePack { app } => git::handle_receive_pack(&strip_git_suffix(&app)),
         Command::GitUploadPack { app } => git::handle_upload_pack(&strip_git_suffix(&app)),
         Command::Deploy { app } => commands::deploy(&app),
+        Command::Push { app } => commands::push(&app),
         Command::Ps => commands::ps(),
         Command::Logs { app } => commands::logs(&app),
         Command::Stop { app } => commands::stop(&app),
         Command::Setup => commands::setup(),
+        Command::Update => commands::update(),
     }
 }
 
@@ -176,6 +182,17 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Stop {
+                app: "myapp".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_push() {
+        let cli = parse_cli(&["psht", "push", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Push {
                 app: "myapp".to_string()
             })
         );

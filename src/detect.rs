@@ -3,6 +3,7 @@ use std::path::Path;
 
 #[derive(Debug, PartialEq)]
 pub enum AppType {
+    Bun,
     Node,
     Python,
     Rust,
@@ -14,11 +15,13 @@ pub enum AppType {
 pub struct AppConfig {
     pub app_type: AppType,
     pub start_command: String,
+    pub install_command: String,
 }
 
 impl AppType {
     fn default_start_command(&self) -> &str {
         match self {
+            AppType::Bun => "bun run index.ts",
             AppType::Node => "npm start",
             AppType::Python => "python app.py",
             AppType::Rust => "./target/release/app",
@@ -27,8 +30,20 @@ impl AppType {
         }
     }
 
+    pub fn stack(&self) -> &str {
+        match self {
+            AppType::Bun => "bun",
+            AppType::Node => "node",
+            AppType::Python => "python",
+            AppType::Rust => "rust",
+            AppType::Go => "go",
+            AppType::Static => "static",
+        }
+    }
+
     fn install_command(&self) -> &str {
         match self {
+            AppType::Bun => "bun install",
             AppType::Node => "npm install",
             AppType::Python => "pip install -r requirements.txt",
             AppType::Rust => "cargo build --release",
@@ -39,8 +54,8 @@ impl AppType {
 }
 
 impl AppConfig {
-    pub fn install_command(&self) -> &str {
-        self.app_type.install_command()
+    pub fn stack(&self) -> &str {
+        self.app_type.stack()
     }
 }
 
@@ -49,6 +64,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
 
     let markers: &[(&str, AppType)] = &[
         ("Cargo.toml", AppType::Rust),
+        ("index.ts", AppType::Bun),
         ("package.json", AppType::Node),
         ("requirements.txt", AppType::Python),
         ("Pipfile", AppType::Python),
@@ -60,9 +76,14 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
         if dir.join(file).exists() {
             let start = start_command
                 .unwrap_or_else(|| app_type.default_start_command().to_string());
+            let install = match app_type {
+                AppType::Bun if !dir.join("package.json").exists() => "",
+                _ => app_type.install_command(),
+            };
             return Ok(AppConfig {
                 app_type: *app_type,
                 start_command: start,
+                install_command: install.to_string(),
             });
         }
     }
@@ -94,6 +115,43 @@ impl Clone for AppType {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn detect_bun_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("index.ts"), "console.log('hi')").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Bun);
+        assert!(config.start_command.contains("bun run index.ts"));
+    }
+
+    #[test]
+    fn bun_skips_install_without_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("index.ts"), "console.log('hi')").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert!(config.install_command.is_empty());
+    }
+
+    #[test]
+    fn bun_installs_with_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("index.ts"), "").unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Bun);
+        assert!(config.install_command.contains("bun install"));
+    }
+
+    #[test]
+    fn stack_returns_correct_name() {
+        assert_eq!(AppType::Bun.stack(), "bun");
+        assert_eq!(AppType::Node.stack(), "node");
+        assert_eq!(AppType::Python.stack(), "python");
+        assert_eq!(AppType::Rust.stack(), "rust");
+        assert_eq!(AppType::Go.stack(), "go");
+        assert_eq!(AppType::Static.stack(), "static");
+    }
 
     #[test]
     fn detect_node_app() {
@@ -172,6 +230,7 @@ mod tests {
 
     #[test]
     fn install_command_for_each_type() {
+        assert!(AppType::Bun.install_command().contains("bun install"));
         assert_eq!(AppType::Node.install_command(), "npm install");
         assert_eq!(AppType::Python.install_command(), "pip install -r requirements.txt");
         assert_eq!(AppType::Rust.install_command(), "cargo build --release");

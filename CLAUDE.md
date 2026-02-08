@@ -35,6 +35,8 @@ Detected by marker file in priority order: Rust (`Cargo.toml`), Node (`package.j
 
 ## Build commands
 
+When we update the CLI, we need to bump the patch version (unless instructed otherwise)
+
 ```
 cargo test     # Run all tests
 cargo check    # Type-check without building
@@ -45,3 +47,4 @@ cargo check    # Type-check without building
 - **New app type:** Add variant to `AppType` in `detect.rs`, add marker file to the `markers` slice, implement `default_start_command()` and `install_command()`, add a detection test.
 - **New SSH command:** Add variant to `Command` enum in `main.rs`, handle in `parse_ssh_command()` and `parse_args()`, dispatch in `run()`, implement in `commands.rs`.
 - **New container operation:** Add a function in `container.rs` using the `incus()` builder, add a test that verifies the built command args.
+

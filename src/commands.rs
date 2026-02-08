@@ -1,19 +1,35 @@
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::container;
 use crate::detect;
 
+fn home_dir() -> PathBuf {
+    PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
+}
+
 fn builds_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string());
-    PathBuf::from(home).join("builds")
+    home_dir().join("builds")
 }
 
 fn repos_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string());
-    PathBuf::from(home).join("repos")
+    home_dir().join("repos")
+}
+
+fn stacks_dir() -> PathBuf {
+    home_dir().join("stacks")
+}
+
+fn stack_hash(path: &Path) -> Result<String, String> {
+    let contents = fs::read(path)
+        .map_err(|e| format!("failed to read stack script {}: {e}", path.display()))?;
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
 }
 
 fn checkout_code(app: &str) -> Result<PathBuf, String> {
@@ -49,43 +65,88 @@ fn allocate_port(app: &str) -> u16 {
 pub fn deploy(app: &str) -> Result<(), String> {
     eprintln!("-----> Deploying {app}");
 
-    // 1. Check out code
     eprintln!("-----> Checking out code");
     let build_dir = checkout_code(app)?;
 
-    // 2. Detect app type
+    deploy_from(app, &build_dir)
+}
+
+pub fn push(app: &str) -> Result<(), String> {
+    eprintln!("-----> Deploying {app}");
+
+    let code_dir = home_dir().join(app);
+
+    if code_dir.exists() {
+        fs::remove_dir_all(&code_dir)
+            .map_err(|e| format!("failed to clean code dir: {e}"))?;
+    }
+    fs::create_dir_all(&code_dir)
+        .map_err(|e| format!("failed to create code dir: {e}"))?;
+
+    eprintln!("-----> Receiving code");
+    let status = Command::new("tar")
+        .args(["xz", "-C"])
+        .arg(&code_dir)
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to extract tar: {e}"))?;
+    if !status.success() {
+        return Err("tar extraction failed".to_string());
+    }
+
+    deploy_from(app, &code_dir)
+}
+
+fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Detecting app type");
-    let config = detect::detect(&build_dir)?;
+    let config = detect::detect(code_dir)?;
     eprintln!("       Detected: {:?}", config.app_type);
 
-    // 3. Tear down existing container if present
-    if container::exists(app) {
-        eprintln!("-----> Removing existing container");
-        let _ = container::stop(app);
-        let _ = container::delete(app);
+    let script_path = stacks_dir().join(format!("{}.sh", config.stack()));
+    let hash = stack_hash(&script_path)?;
+
+    let needs_setup = if container::exists(app) {
+        let remote_hash = container::exec_output(app, "cat /etc/psht-setup-hash 2>/dev/null")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if remote_hash == hash {
+            eprintln!("-----> Reusing container");
+            container::exec_cmd(app, "pkill -f '[n]ohup' || true")?;
+            false
+        } else {
+            eprintln!("-----> Rebuilding container");
+            let _ = container::stop(app);
+            let _ = container::delete(app);
+            true
+        }
+    } else {
+        true
+    };
+
+    if needs_setup {
+        eprintln!("-----> Creating container");
+        container::create(app)?;
+
+        eprintln!("-----> Setting up runtime");
+        container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
+        container::exec_cmd(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh")?;
+        container::exec_cmd(app, &format!("echo -n '{hash}' > /etc/psht-setup-hash"))?;
+
+        let port = allocate_port(app);
+        eprintln!("-----> Setting up port forwarding on :{port}");
+        container::add_proxy(app, port, port)?;
     }
 
-    // 4. Create new container
-    eprintln!("-----> Creating container");
-    container::create(app)?;
-
-    // 5. Push code into container
     eprintln!("-----> Pushing code to container");
-    container::push_code(app, &build_dir.to_string_lossy())?;
+    container::push_code(app, &code_dir.to_string_lossy())?;
 
-    // 6. Install deps + build
-    let install_cmd = config.install_command();
-    if !install_cmd.is_empty() {
+    if !config.install_command.is_empty() {
         eprintln!("-----> Installing dependencies");
-        container::exec_cmd(app, install_cmd)?;
+        container::exec_cmd(app, &config.install_command)?;
     }
 
-    // 7. Allocate port and set up proxy
     let port = allocate_port(app);
-    eprintln!("-----> Setting up port forwarding on :{port}");
-    container::add_proxy(app, port, port)?;
-
-    // 8. Start the app
     eprintln!("-----> Starting app");
     let start_cmd = format!(
         "cd /app && PORT={port} nohup {cmd} > /app/app.log 2>&1 &",
@@ -120,14 +181,15 @@ fn help_text(hostname: &str) -> String {
     let reset = "\x1b[0m";
     let prefix = format!("ssh psht@{hostname} ");
     let commands: &[(&str, &str, &str)] = &[
-        ("setup", " | sh", "Set up a git remote for deployment"),
+        ("setup", " | sh", "Set up project and install CLI"),
+        ("update", " | sh", "Update CLI to latest version"),
         ("ps", "", "List running apps"),
         ("logs", " <app>", "Show app logs"),
         ("stop", " <app>", "Stop and remove an app"),
     ];
 
     let mut lines = vec![
-        "psht - deploy apps with git push".to_string(),
+        "psht - deploy apps with psht deploy".to_string(),
         String::new(),
         "Commands:".to_string(),
     ];
@@ -139,6 +201,9 @@ fn help_text(hostname: &str) -> String {
             "",
         ));
     }
+    lines.push(String::new());
+    lines.push("Deploy:".to_string());
+    lines.push(format!("  psht deploy{:>21}  Deploy current directory", ""));
     lines.join("\n")
 }
 
@@ -148,19 +213,64 @@ pub fn help() -> Result<(), String> {
 }
 
 fn setup_script(hostname: &str) -> String {
-    let url = format!("psht@{hostname}:$(basename $PWD)");
-    [
-        "git remote remove psht 2>/dev/null",
-        &format!("git remote add psht {url}"),
-        r#"echo "Ready! Deploy with: git push psht main" >&2"#,
-    ]
-    .join("\n")
+    format!(
+        r#"#!/bin/sh
+set -e
+
+# Find or install psht CLI
+if command -v psht >/dev/null 2>&1; then
+  PSHT_BIN=$(command -v psht)
+else
+  printf "Install psht CLI to (default: ~/.local/bin): " >&2
+  read -r install_dir < /dev/tty
+  install_dir="${{install_dir:-$HOME/.local/bin}}"
+  mkdir -p "$install_dir"
+  scp "psht@{hostname}:bin/psht-cli" "$install_dir/psht"
+  chmod +x "$install_dir/psht"
+  PSHT_BIN="$install_dir/psht"
+  case ":$PATH:" in
+    *":$install_dir:"*) ;;
+    *) echo "NOTE: Add $install_dir to your PATH: export PATH=\"$install_dir:\$PATH\"" >&2 ;;
+  esac
+  echo "Installed psht CLI to $PSHT_BIN" >&2
+fi
+
+# Write default host
+mkdir -p "$HOME/.psht"
+config="$HOME/.psht/config.toml"
+if [ ! -f "$config" ]; then
+  echo 'host = "{hostname}"' > "$config"
+fi
+
+# Set up project
+"$PSHT_BIN" setup"#
+    )
 }
 
 pub fn setup() -> Result<(), String> {
-    let hostname = hostname();
-    eprintln!("{}", help_text(&hostname));
-    println!("{}", setup_script(&hostname));
+    println!("{}", setup_script(&hostname()));
+    Ok(())
+}
+
+fn update_script(hostname: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"#!/bin/sh
+set -e
+PSHT_BIN=$(command -v psht) || {{ echo "psht not found. Run: ssh psht@{hostname} setup | sh" >&2; exit 1; }}
+current=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || current=""
+if [ "$current" = "{version}" ]; then
+  echo "psht {version} (up to date)" >&2
+  exit 0
+fi
+scp "psht@{hostname}:bin/psht-cli" "$PSHT_BIN"
+chmod +x "$PSHT_BIN"
+echo "psht {version} (updated)" >&2"#
+    )
+}
+
+pub fn update() -> Result<(), String> {
+    println!("{}", update_script(&hostname()));
     Ok(())
 }
 
@@ -181,6 +291,7 @@ pub fn stop(app: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn allocate_port_is_deterministic() {
@@ -206,21 +317,33 @@ mod tests {
     }
 
     #[test]
-    fn setup_script_is_idempotent() {
+    fn setup_script_calls_psht_setup() {
         let script = setup_script("example.com");
-        // Must remove existing remote before adding, so re-running doesn't error
         assert!(
-            script.contains("git remote remove psht"),
-            "script should remove existing remote first"
+            script.contains("\"$PSHT_BIN\" setup"),
+            "script should delegate project setup to CLI via full path"
         );
     }
 
     #[test]
-    fn setup_script_prints_next_step() {
+    fn setup_script_reads_from_tty() {
         let script = setup_script("example.com");
         assert!(
-            script.contains("git push psht"),
-            "script should tell user how to deploy"
+            script.contains("< /dev/tty"),
+            "read should use /dev/tty so prompts work when piped"
+        );
+    }
+
+    #[test]
+    fn setup_script_tracks_binary_path() {
+        let script = setup_script("example.com");
+        assert!(
+            script.contains("PSHT_BIN=$(command -v psht)"),
+            "should capture existing binary path"
+        );
+        assert!(
+            script.contains("PSHT_BIN=\"$install_dir/psht\""),
+            "should capture newly installed binary path"
         );
     }
 
@@ -229,21 +352,94 @@ mod tests {
         let script = setup_script("example.com");
         assert!(
             !script.contains("Commands:"),
-            "script should not contain help text — help goes to stderr"
+            "script should not contain help text"
+        );
+    }
+
+    #[test]
+    fn setup_script_installs_cli() {
+        let script = setup_script("example.com");
+        assert!(
+            script.contains("Install psht CLI"),
+            "script should install the CLI"
+        );
+        assert!(
+            script.contains("scp \"psht@example.com:bin/psht-cli\""),
+            "script should download CLI via scp"
+        );
+        assert!(
+            script.contains("chmod +x"),
+            "script should make CLI executable"
+        );
+    }
+
+    #[test]
+    fn setup_script_writes_default_host() {
+        let script = setup_script("example.com");
+        assert!(
+            script.contains("host = \"example.com\""),
+            "script should write default host to config"
         );
     }
 
     #[test]
     fn help_text_contains_all_commands() {
         let text = help_text("example.com");
-        // Strip ANSI codes for content assertions
         let plain: String = text
             .replace("\x1b[2m", "")
             .replace("\x1b[0m", "");
         assert!(plain.contains("ssh psht@example.com setup"), "missing setup");
+        assert!(plain.contains("ssh psht@example.com update"), "missing update");
         assert!(plain.contains("ssh psht@example.com ps"), "missing ps");
         assert!(plain.contains("ssh psht@example.com logs <app>"), "missing logs");
         assert!(plain.contains("ssh psht@example.com stop <app>"), "missing stop");
+    }
+
+    #[test]
+    fn help_text_mentions_deploy() {
+        let text = help_text("example.com");
+        let plain: String = text
+            .replace("\x1b[2m", "")
+            .replace("\x1b[0m", "");
+        assert!(plain.contains("psht deploy"), "missing deploy method");
+        assert!(!plain.contains("git push"), "should not mention git push");
+    }
+
+    #[test]
+    fn update_script_scps_binary() {
+        let script = update_script("example.com");
+        assert!(
+            script.contains("scp \"psht@example.com:bin/psht-cli\" \"$PSHT_BIN\""),
+            "should scp the binary to the existing install path"
+        );
+    }
+
+    #[test]
+    fn update_script_errors_if_not_installed() {
+        let script = update_script("example.com");
+        assert!(
+            script.contains("psht not found"),
+            "should error if psht is not installed"
+        );
+    }
+
+    #[test]
+    fn update_script_skips_if_up_to_date() {
+        let script = update_script("example.com");
+        assert!(
+            script.contains("up to date"),
+            "should say up to date when versions match"
+        );
+        assert!(
+            script.contains(env!("CARGO_PKG_VERSION")),
+            "should embed the current version"
+        );
+    }
+
+    #[test]
+    fn home_dir_under_home() {
+        let dir = home_dir();
+        assert!(!dir.to_string_lossy().is_empty());
     }
 
     #[test]
@@ -256,5 +452,48 @@ mod tests {
     fn repos_dir_under_home() {
         let dir = repos_dir();
         assert!(dir.to_string_lossy().ends_with("repos"));
+    }
+
+    #[test]
+    fn stacks_dir_under_home() {
+        let dir = stacks_dir();
+        assert!(dir.to_string_lossy().ends_with("stacks"));
+    }
+
+    #[test]
+    fn stack_hash_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("test.sh");
+        fs::write(&script, "#!/bin/sh\necho hello").unwrap();
+        let hash1 = stack_hash(&script).unwrap();
+        let hash2 = stack_hash(&script).unwrap();
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn stack_hash_changes_with_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("test.sh");
+        fs::write(&script, "#!/bin/sh\necho hello").unwrap();
+        let hash1 = stack_hash(&script).unwrap();
+        fs::write(&script, "#!/bin/sh\necho world").unwrap();
+        let hash2 = stack_hash(&script).unwrap();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn stack_hash_is_hex_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("test.sh");
+        fs::write(&script, "#!/bin/sh\necho hello").unwrap();
+        let hash = stack_hash(&script).unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn stack_hash_errors_on_missing_file() {
+        let result = stack_hash(Path::new("/nonexistent/file.sh"));
+        assert!(result.is_err());
     }
 }

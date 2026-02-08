@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn container_name(app: &str) -> String {
     format!("psht-{app}")
@@ -72,11 +72,26 @@ pub fn create(app: &str) -> Result<(), String> {
 }
 
 pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
-    incus()
-        .args(&["file", "push", "-r", "-p"])
-        .arg(format!("{source_dir}/"))
-        .arg(format!("{}/app/", container_name(app)))
-        .run()
+    exec_cmd(app, "rm -rf /app && mkdir -p /app")?;
+    let mut tar = Command::new("tar")
+        .args(["-C", source_dir, "-cf", "-", "."])
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to tar code: {e}"))?;
+    let stdin = tar.stdout.take()
+        .ok_or_else(|| "failed to capture tar stdout".to_string())?;
+    let status = Command::new("incus")
+        .arg("exec")
+        .arg(container_name(app))
+        .args(["--", "tar", "xf", "-", "-C", "/app"])
+        .stdin(stdin)
+        .status()
+        .map_err(|e| format!("failed to push code to container: {e}"))?;
+    if !status.success() {
+        return Err("failed to push code to container".to_string());
+    }
+    tar.wait().map_err(|e| format!("tar failed: {e}"))?;
+    Ok(())
 }
 
 pub fn exec_cmd(app: &str, cmd: &str) -> Result<(), String> {
@@ -84,6 +99,22 @@ pub fn exec_cmd(app: &str, cmd: &str) -> Result<(), String> {
         .arg("exec")
         .arg(container_name(app))
         .args(&["--", "sh", "-c", cmd])
+        .run()
+}
+
+pub fn exec_output(app: &str, cmd: &str) -> Result<String, String> {
+    incus()
+        .arg("exec")
+        .arg(container_name(app))
+        .args(&["--", "sh", "-c", cmd])
+        .output()
+}
+
+pub fn push_file(app: &str, local_path: &str, remote_path: &str) -> Result<(), String> {
+    incus()
+        .args(&["file", "push"])
+        .arg(local_path)
+        .arg(format!("{}{}", container_name(app), remote_path))
         .run()
 }
 
@@ -202,12 +233,43 @@ mod tests {
     }
 
     #[test]
-    fn incus_push_code_command_builds_correctly() {
+    fn incus_push_code_exec_builds_correctly() {
+        // push_code uses tar | incus exec to untar into /app
         let name = container_name("myapp");
         let cmd = incus()
-            .args(&["file", "push", "-r", "-p"])
-            .arg("/builds/myapp/")
-            .arg(format!("{name}/app/"))
+            .arg("exec")
+            .arg(&name)
+            .args(&["--", "tar", "xf", "-", "-C", "/app"])
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["exec", "psht-myapp", "--", "tar", "xf", "-", "-C", "/app"]
+        );
+    }
+
+    #[test]
+    fn incus_exec_output_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .arg("exec")
+            .arg(&name)
+            .args(&["--", "sh", "-c", "cat /etc/psht-setup-hash"])
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["exec", "psht-myapp", "--", "sh", "-c", "cat /etc/psht-setup-hash"]
+        );
+    }
+
+    #[test]
+    fn incus_push_file_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["file", "push"])
+            .arg("/home/psht/stacks/node.sh")
+            .arg(format!("{name}/tmp/setup.sh"))
             .build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
@@ -215,10 +277,8 @@ mod tests {
             vec![
                 "file",
                 "push",
-                "-r",
-                "-p",
-                "/builds/myapp/",
-                "psht-myapp/app/"
+                "/home/psht/stacks/node.sh",
+                "psht-myapp/tmp/setup.sh"
             ]
         );
     }

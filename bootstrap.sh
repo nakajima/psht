@@ -71,6 +71,12 @@ INSTALLED_BIN="/usr/local/bin/psht"
 cp "$PSHT_BIN" "$INSTALLED_BIN"
 chmod 755 "$INSTALLED_BIN"
 
+# Install client CLI binary for scp distribution
+mkdir -p "$PSHT_HOME/bin"
+cp "$SCRIPT_DIR/target/release/psht-cli" "$PSHT_HOME/bin/psht-cli"
+chmod 755 "$PSHT_HOME/bin/psht-cli"
+chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
+
 if ! grep -qx "$INSTALLED_BIN" /etc/shells; then
     log "Adding $INSTALLED_BIN to /etc/shells"
     echo "$INSTALLED_BIN" >> /etc/shells
@@ -89,10 +95,16 @@ fi
 log "Adding $PSHT_USER to incus group"
 usermod -aG incus "$PSHT_USER"
 
+# Trigger creation of the user project, then allow proxy devices
+sudo -u "$PSHT_USER" incus list &>/dev/null || true
+PSHT_UID=$(id -u "$PSHT_USER")
+incus project set "user-${PSHT_UID}" restricted.devices.proxy=allow
+
 # --- Create directories ---
 log "Setting up directories"
-mkdir -p "$PSHT_HOME/repos" "$PSHT_HOME/builds"
-chown -R "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/repos" "$PSHT_HOME/builds"
+mkdir -p "$PSHT_HOME/repos" "$PSHT_HOME/builds" "$PSHT_HOME/stacks"
+cp "$SCRIPT_DIR"/stacks/*.sh "$PSHT_HOME/stacks/"
+chown -R "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/repos" "$PSHT_HOME/builds" "$PSHT_HOME/stacks"
 
 # --- Done ---
 TS_HOSTNAME=$(tailscale status --json | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\.$//')
