@@ -7,6 +7,7 @@ use std::process::Command;
 
 use crate::container;
 use crate::detect;
+use crate::tailscale;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -30,6 +31,22 @@ fn stack_hash(path: &Path) -> Result<String, String> {
     let mut hasher = DefaultHasher::new();
     contents.hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn resolve_stack_in(app: &str, code_dir: &Path, detected_stack: &str, stacks: &Path) -> Result<(String, PathBuf), String> {
+    let custom = code_dir.join("psht-stack.sh");
+    if custom.exists() {
+        let saved = stacks.join(format!("{app}.sh"));
+        fs::copy(&custom, &saved)
+            .map_err(|e| format!("failed to save custom stack: {e}"))?;
+        Ok((app.to_string(), saved))
+    } else {
+        Ok((detected_stack.to_string(), stacks.join(format!("{detected_stack}.sh"))))
+    }
+}
+
+fn resolve_stack(app: &str, code_dir: &Path, detected_stack: &str) -> Result<(String, PathBuf), String> {
+    resolve_stack_in(app, code_dir, detected_stack, &stacks_dir())
 }
 
 fn checkout_code(app: &str) -> Result<PathBuf, String> {
@@ -102,7 +119,11 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     let config = detect::detect(code_dir)?;
     eprintln!("       Detected: {:?}", config.app_type);
 
-    let script_path = stacks_dir().join(format!("{}.sh", config.stack()));
+    if code_dir.join("psht-stack.sh").exists() {
+        eprintln!("       Using custom stack");
+    }
+
+    let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
     let hash = stack_hash(&script_path)?;
 
     let needs_setup = if container::exists(app) {
@@ -112,7 +133,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             .to_string();
         if remote_hash == hash {
             eprintln!("-----> Reusing container");
-            container::exec_cmd(app, "kill $(cat /app/app.pid 2>/dev/null) 2>/dev/null || true")?;
+            container::exec_cmd(app, "kill $(cat /var/psht/app.pid 2>/dev/null) 2>/dev/null || true")?;
             false
         } else {
             eprintln!("-----> Rebuilding container");
@@ -125,13 +146,33 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     };
 
     if needs_setup {
-        eprintln!("-----> Creating container");
-        container::create(app)?;
+        if container::image_exists(&stack, &hash) {
+            eprintln!("-----> Creating container from cached image");
+            container::create_from_image(app, &stack, &hash)?;
 
-        eprintln!("-----> Setting up runtime");
-        container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
-        container::exec_cmd(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh")?;
+            eprintln!("-----> Installing tailscale");
+            tailscale::install_in_container(app)?;
+        } else {
+            eprintln!("-----> Creating container");
+            container::create(app)?;
+
+            eprintln!("-----> Installing tailscale");
+            tailscale::install_in_container(app)?;
+
+            eprintln!("-----> Setting up runtime");
+            container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
+            container::exec_cmd_rolling(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh", 5)?;
+
+            eprintln!("-----> Caching stack image");
+            if let Err(e) = container::publish_image(app, &stack, &hash) {
+                eprintln!("       Warning: failed to cache stack image: {e}");
+            }
+        }
+
         container::exec_cmd(app, &format!("echo -n '{hash}' > /etc/psht-setup-hash"))?;
+
+        eprintln!("-----> Connecting to tailnet");
+        tailscale::join_in_container(app)?;
 
         let port = allocate_port(app);
         eprintln!("-----> Setting up port forwarding on :{port}");
@@ -143,13 +184,13 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     if !config.install_command.is_empty() {
         eprintln!("-----> Installing dependencies");
-        container::exec_cmd(app, &config.install_command)?;
+        container::exec_cmd_rolling(app, &config.install_command, 5)?;
     }
 
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
     let start_cmd = format!(
-        "cd /app && PORT={port} nohup {cmd} > /app/app.log 2>&1 & echo $! > /app/app.pid",
+        "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
         cmd = config.start_command
     );
     container::exec_cmd(app, &start_cmd)?;
@@ -185,7 +226,9 @@ fn help_text(hostname: &str) -> String {
         ("update", " | sh", "Update CLI to latest version"),
         ("ps", "", "List running apps"),
         ("logs", " [-f] <app>", "Show app logs"),
-        ("stop", " <app>", "Stop and remove an app"),
+        ("stop", " <app>", "Stop an app"),
+        ("start", " <app>", "Start a stopped app"),
+        ("destroy", " <app>", "Stop and remove an app"),
     ];
 
     let mut lines = vec![
@@ -263,6 +306,7 @@ if [ "$current" = "{version}" ]; then
   echo "psht {version} (up to date)" >&2
   exit 0
 fi
+rm -f "$PSHT_BIN"
 scp "psht@{hostname}:bin/psht-cli" "$PSHT_BIN"
 chmod +x "$PSHT_BIN"
 echo "psht {version} (updated)" >&2"#
@@ -281,10 +325,33 @@ fn hostname() -> String {
 }
 
 pub fn stop(app: &str) -> Result<(), String> {
+    if !container::exists(app) {
+        return Err(format!("app '{app}' not found"));
+    }
     eprintln!("-----> Stopping {app}");
     container::stop(app)?;
-    container::delete(app)?;
     eprintln!("=====> {app} stopped");
+    Ok(())
+}
+
+pub fn start(app: &str) -> Result<(), String> {
+    if !container::exists(app) {
+        return Err(format!("app '{app}' not found"));
+    }
+    eprintln!("-----> Starting {app}");
+    container::start(app)?;
+    eprintln!("=====> {app} started");
+    Ok(())
+}
+
+pub fn destroy(app: &str) -> Result<(), String> {
+    if !container::exists(app) {
+        return Err(format!("app '{app}' not found"));
+    }
+    eprintln!("-----> Destroying {app}");
+    container::stop(app)?;
+    container::delete(app)?;
+    eprintln!("=====> {app} destroyed");
     Ok(())
 }
 
@@ -393,6 +460,8 @@ mod tests {
         assert!(plain.contains("ssh psht@example.com ps"), "missing ps");
         assert!(plain.contains("ssh psht@example.com logs [-f] <app>"), "missing logs");
         assert!(plain.contains("ssh psht@example.com stop <app>"), "missing stop");
+        assert!(plain.contains("ssh psht@example.com start <app>"), "missing start");
+        assert!(plain.contains("ssh psht@example.com destroy <app>"), "missing destroy");
     }
 
     #[test]
@@ -412,6 +481,16 @@ mod tests {
             script.contains("scp \"psht@example.com:bin/psht-cli\" \"$PSHT_BIN\""),
             "should scp the binary to the existing install path"
         );
+    }
+
+    #[test]
+    fn update_script_removes_before_scp() {
+        let script = update_script("example.com");
+        let rm_pos = script.find("rm -f \"$PSHT_BIN\"")
+            .expect("should rm the old binary to avoid ETXTBSY");
+        let scp_pos = script.find("scp ")
+            .expect("should scp the new binary");
+        assert!(rm_pos < scp_pos, "rm must come before scp");
     }
 
     #[test]
@@ -495,5 +574,64 @@ mod tests {
     fn stack_hash_errors_on_missing_file() {
         let result = stack_hash(Path::new("/nonexistent/file.sh"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_stack_uses_custom_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code_dir = tmp.path().join("code");
+        let stacks = tmp.path().join("stacks");
+        fs::create_dir_all(&code_dir).unwrap();
+        fs::create_dir_all(&stacks).unwrap();
+        fs::write(code_dir.join("psht-stack.sh"), "#!/bin/sh\ncustom setup").unwrap();
+
+        let (name, path) = resolve_stack_in("myapp", &code_dir, "bun", &stacks).unwrap();
+        assert_eq!(name, "myapp");
+        assert_eq!(path, stacks.join("myapp.sh"));
+    }
+
+    #[test]
+    fn resolve_stack_falls_back_to_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code_dir = tmp.path().join("code");
+        let stacks = tmp.path().join("stacks");
+        fs::create_dir_all(&code_dir).unwrap();
+        fs::create_dir_all(&stacks).unwrap();
+
+        let (name, path) = resolve_stack_in("myapp", &code_dir, "bun", &stacks).unwrap();
+        assert_eq!(name, "bun");
+        assert_eq!(path, stacks.join("bun.sh"));
+    }
+
+    #[test]
+    fn resolve_stack_saves_custom_to_stacks_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code_dir = tmp.path().join("code");
+        let stacks = tmp.path().join("stacks");
+        fs::create_dir_all(&code_dir).unwrap();
+        fs::create_dir_all(&stacks).unwrap();
+        let content = "#!/bin/sh\napt install ffmpeg";
+        fs::write(code_dir.join("psht-stack.sh"), content).unwrap();
+
+        resolve_stack_in("myapp", &code_dir, "bun", &stacks).unwrap();
+
+        let saved = fs::read_to_string(stacks.join("myapp.sh")).unwrap();
+        assert_eq!(saved, content);
+    }
+
+    #[test]
+    fn start_cmd_mkdir_runs_before_background() {
+        // The start command must use { } grouping so mkdir && cd run synchronously
+        // before the nohup is backgrounded. Without grouping, & backgrounds the
+        // entire && chain, causing a race where echo runs before mkdir completes.
+        let cmd = format!(
+            "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
+            port = 3737,
+            cmd = "bun run index.ts"
+        );
+        // mkdir and cd must be outside the { } group
+        assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && {"));
+        // The background & and echo must be inside { }
+        assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
     }
 }

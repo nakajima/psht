@@ -54,7 +54,13 @@ fn container_ip(app: &str) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(output) = exec_output(app, "hostname -I") {
-            let ip = output.split_whitespace().next().unwrap_or("").to_string();
+            // Prefer IPv4; fall back to first address
+            let ip = output
+                .split_whitespace()
+                .find(|s| s.contains('.'))
+                .or_else(|| output.split_whitespace().next())
+                .unwrap_or("")
+                .to_string();
             if !ip.is_empty() {
                 return Ok(ip);
             }
@@ -64,11 +70,22 @@ fn container_ip(app: &str) -> Result<String, String> {
     Err(format!("could not get container IP for {app}"))
 }
 
+fn debug_info(app: &str) -> String {
+    let log = exec_output(app, "cat /var/psht/app.log 2>/dev/null").unwrap_or_default();
+    let ps = exec_output(app, "ps aux 2>/dev/null").unwrap_or_default();
+    format!("app.log:\n{log}\n\nps aux:\n{ps}")
+}
+
 fn wait_for_http(addr: &str, port: u16, timeout: Duration) -> Result<String, String> {
     let deadline = Instant::now() + timeout;
     let mut last_err = String::new();
+    let connect_addr = if addr.contains(':') {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    };
     while Instant::now() < deadline {
-        if let Ok(mut stream) = std::net::TcpStream::connect(format!("{addr}:{port}")) {
+        if let Ok(mut stream) = std::net::TcpStream::connect(&connect_addr) {
             stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
             stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
             let request = format!("GET / HTTP/1.0\r\nHost: {addr}\r\n\r\n");
@@ -262,23 +279,33 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
     // Start the app
     let start_cmd = match stack {
         "static" => format!(
-            "cd /app && PORT={APP_PORT} nohup python3 -m http.server {APP_PORT} > /app/app.log 2>&1 &"
+            "cd /app && PORT={APP_PORT} nohup python3 -m http.server {APP_PORT} > /var/psht/app.log 2>&1 &"
         ),
         "python" => format!(
-            "cd /app && PORT={APP_PORT} nohup python3 app.py > /app/app.log 2>&1 &"
+            "cd /app && PORT={APP_PORT} nohup python3 app.py > /var/psht/app.log 2>&1 &"
         ),
         "node" => format!(
-            "cd /app && PORT={APP_PORT} nohup node server.js > /app/app.log 2>&1 &"
+            "cd /app && PORT={APP_PORT} nohup node server.js > /var/psht/app.log 2>&1 &"
         ),
         "go" => format!(
-            "cd /app && PORT={APP_PORT} nohup ./app > /app/app.log 2>&1 &"
+            "cd /app && PORT={APP_PORT} nohup ./app > /var/psht/app.log 2>&1 &"
         ),
         "rust" => format!(
-            "cd /app && PORT={APP_PORT} nohup ./target/release/app > /app/app.log 2>&1 &"
+            "cd /app && PORT={APP_PORT} nohup ./target/release/app > /var/psht/app.log 2>&1 &"
         ),
         _ => unreachable!(),
     };
     container::exec_cmd(app, &start_cmd)?;
+
+    // Brief pause to let the app bind its port
+    thread::sleep(Duration::from_secs(2));
+
+    // Dump app log for debugging if app fails to start
+    if let Ok(log) = exec_output(app, "cat /var/psht/app.log 2>/dev/null") {
+        if !log.is_empty() {
+            eprintln!("--- app.log for {app} ---\n{log}\n---");
+        }
+    }
 
     let ip = container_ip(app)?;
     Ok((guard, ip))
@@ -288,8 +315,8 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
 fn integration_static() {
     let app = "inttest-static";
     let (_guard, ip) = deploy_stack(app, "static").expect("deploy static failed");
-    let resp =
-        wait_for_http(&ip, APP_PORT, Duration::from_secs(30)).expect("static app not reachable");
+    let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
+        .unwrap_or_else(|e| panic!("static app not reachable: {e}\n{}", debug_info(app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
@@ -297,8 +324,8 @@ fn integration_static() {
 fn integration_python() {
     let app = "inttest-python";
     let (_guard, ip) = deploy_stack(app, "python").expect("deploy python failed");
-    let resp =
-        wait_for_http(&ip, APP_PORT, Duration::from_secs(30)).expect("python app not reachable");
+    let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
+        .unwrap_or_else(|e| panic!("python app not reachable: {e}\n{}", debug_info(app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
@@ -306,8 +333,8 @@ fn integration_python() {
 fn integration_node() {
     let app = "inttest-node";
     let (_guard, ip) = deploy_stack(app, "node").expect("deploy node failed");
-    let resp =
-        wait_for_http(&ip, APP_PORT, Duration::from_secs(60)).expect("node app not reachable");
+    let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("node app not reachable: {e}\n{}", debug_info(app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
@@ -315,8 +342,8 @@ fn integration_node() {
 fn integration_go() {
     let app = "inttest-go";
     let (_guard, ip) = deploy_stack(app, "go").expect("deploy go failed");
-    let resp =
-        wait_for_http(&ip, APP_PORT, Duration::from_secs(60)).expect("go app not reachable");
+    let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("go app not reachable: {e}\n{}", debug_info(app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
@@ -324,7 +351,7 @@ fn integration_go() {
 fn integration_rust() {
     let app = "inttest-rust";
     let (_guard, ip) = deploy_stack(app, "rust").expect("deploy rust failed");
-    let resp =
-        wait_for_http(&ip, APP_PORT, Duration::from_secs(120)).expect("rust app not reachable");
+    let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(120))
+        .unwrap_or_else(|e| panic!("rust app not reachable: {e}\n{}", debug_info(app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }

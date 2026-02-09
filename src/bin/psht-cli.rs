@@ -29,8 +29,10 @@ enum CliCommand {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Stop and remove an app
+    /// Stop an app
     Stop { app: String },
+    /// Stop and remove an app
+    Destroy { app: String },
     /// Set up project for deployment
     Setup,
     /// Update the psht CLI
@@ -203,6 +205,10 @@ fn run() -> Result<(), String> {
         CliCommand::Stop { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             ssh_cmd(&host, &["stop", &app])
+        }
+        CliCommand::Destroy { app } => {
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            ssh_cmd(&host, &["destroy", &app])
         }
         CliCommand::Update => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;

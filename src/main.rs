@@ -2,6 +2,7 @@ mod commands;
 mod container;
 mod detect;
 mod git;
+mod tailscale;
 
 #[cfg(all(test, feature = "integration"))]
 mod integration_tests;
@@ -33,8 +34,12 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Stop and remove an app
+    /// Stop an app
     Stop { app: String },
+    /// Start a stopped app
+    Start { app: String },
+    /// Stop and remove an app
+    Destroy { app: String },
     #[command(hide = true)]
     Deploy { app: String },
     #[command(hide = true)]
@@ -48,6 +53,7 @@ enum Command {
 fn strip_git_suffix(name: &str) -> String {
     name.strip_suffix(".git").unwrap_or(name).to_string()
 }
+
 
 fn cli_from_env() -> Result<Cli, String> {
     let args: Vec<String> = env::args().collect();
@@ -93,6 +99,8 @@ fn run() -> Result<(), String> {
         Command::Ps => commands::ps(),
         Command::Logs { app, follow } => commands::logs(&app, follow),
         Command::Stop { app } => commands::stop(&app),
+        Command::Start { app } => commands::start(&app),
+        Command::Destroy { app } => commands::destroy(&app),
         Command::Setup => commands::setup(),
         Command::Update => commands::update(),
     }
@@ -200,6 +208,28 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Stop {
+                app: "myapp".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_start() {
+        let cli = parse_cli(&["psht", "start", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Start {
+                app: "myapp".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_destroy() {
+        let cli = parse_cli(&["psht", "destroy", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Destroy {
                 app: "myapp".to_string()
             })
         );

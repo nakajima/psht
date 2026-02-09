@@ -60,6 +60,52 @@ fi
 
 log "Tailscale SSH is active"
 
+# --- Tailscale OAuth for container networking ---
+OAUTH_CONFIG="$PSHT_HOME/.config/tailscale-oauth"
+if [[ -f "$OAUTH_CONFIG" ]]; then
+    log "Tailscale OAuth already configured"
+elif [[ -n "${TS_OAUTH_CLIENT_ID:-}" && -n "${TS_OAUTH_CLIENT_SECRET:-}" ]]; then
+    log "Setting up Tailscale OAuth from environment"
+    mkdir -p "$PSHT_HOME/.config"
+    cat > "$OAUTH_CONFIG" <<EOF
+TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
+TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
+EOF
+    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
+    chmod 600 "$OAUTH_CONFIG"
+else
+    echo ""
+    log "Setting up Tailscale OAuth for container networking"
+    echo ""
+    echo "       1. Ensure tag:psht exists in your ACL:"
+    echo "          https://login.tailscale.com/admin/acls/visual/tags/add"
+    echo ""
+    echo "       2. Create a credential at:"
+    echo "          https://login.tailscale.com/admin/settings/oauth"
+    echo "          Under Scopes > Keys, check Write and select tag:psht."
+    echo ""
+    printf "       Have you completed the steps above? (y/n) "
+    read -r CONFIRM < /dev/tty
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        err "Complete the steps above and re-run bootstrap.sh"
+    fi
+    echo ""
+    printf "OAuth client ID: "
+    read -r TS_OAUTH_CLIENT_ID < /dev/tty
+    printf "OAuth client secret: "
+    read -r TS_OAUTH_CLIENT_SECRET < /dev/tty
+    if [[ -z "$TS_OAUTH_CLIENT_ID" || -z "$TS_OAUTH_CLIENT_SECRET" ]]; then
+        err "OAuth client ID and secret are required"
+    fi
+    mkdir -p "$PSHT_HOME/.config"
+    cat > "$OAUTH_CONFIG" <<EOF
+TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
+TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
+EOF
+    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
+    chmod 600 "$OAUTH_CONFIG"
+fi
+
 # --- Build psht ---
 log "Building psht"
 cd "$SCRIPT_DIR"
@@ -111,6 +157,7 @@ TS_HOSTNAME=$(tailscale status --json | grep -o '"DNSName":"[^"]*"' | head -1 | 
 
 echo ""
 echo "=====> psht is ready!"
+echo "       Containers will join your tailnet as psht-<app>"
 echo ""
 echo "Usage:"
 echo ""

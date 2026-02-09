@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::io::BufRead;
 use std::process::{Command, Stdio};
 
 fn container_name(app: &str) -> String {
@@ -58,10 +59,104 @@ impl IncusCommand {
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+
+    fn run_rolling(self, window: usize) -> Result<(), String> {
+        let args_display = self.args.join(" ");
+        let mut child = self.build()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to run incus {args_display}: {e}"))?;
+
+        let stdout = child.stdout.take()
+            .ok_or_else(|| "failed to capture stdout".to_string())?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| "failed to capture stderr".to_string())?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tx2 = tx.clone();
+
+        let stdout_thread = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if let Ok(line) = line {
+                    let _ = tx.send(line);
+                }
+            }
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines() {
+                if let Ok(line) = line {
+                    let _ = tx2.send(line);
+                }
+            }
+        });
+
+        let term_width = 80;
+        let mut ring: Vec<String> = Vec::new();
+        let mut drawn_lines = 0usize;
+
+        for line in rx {
+            update_ring(&mut ring, line, window);
+
+            // Move cursor up to erase previous window
+            if drawn_lines > 0 {
+                eprint!("\x1b[{}A", drawn_lines);
+            }
+
+            // Redraw each line in the window
+            for entry in &ring {
+                let display = truncate_line(entry, term_width);
+                eprint!("\x1b[2K  \x1b[2m{display}\x1b[0m\r\n");
+            }
+            drawn_lines = ring.len();
+        }
+
+        stdout_thread.join().map_err(|_| "stdout reader panicked".to_string())?;
+        stderr_thread.join().map_err(|_| "stderr reader panicked".to_string())?;
+
+        let status = child.wait()
+            .map_err(|e| format!("failed to wait for incus {args_display}: {e}"))?;
+
+        if status.success() {
+            // Erase the window on success
+            if drawn_lines > 0 {
+                eprint!("\x1b[{}A", drawn_lines);
+                for _ in 0..drawn_lines {
+                    eprint!("\x1b[2K\r\n");
+                }
+                eprint!("\x1b[{}A", drawn_lines);
+            }
+        }
+        // On failure, leave the last lines visible for debugging
+
+        if !status.success() {
+            return Err(format!("incus {args_display} failed"));
+        }
+        Ok(())
+    }
 }
 
 fn incus() -> IncusCommand {
     IncusCommand::new()
+}
+
+fn update_ring(ring: &mut Vec<String>, line: String, capacity: usize) {
+    if ring.len() >= capacity {
+        ring.remove(0);
+    }
+    ring.push(line);
+}
+
+fn truncate_line(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_string()
 }
 
 pub fn create(app: &str) -> Result<(), String> {
@@ -102,6 +197,14 @@ pub fn exec_cmd(app: &str, cmd: &str) -> Result<(), String> {
         .run()
 }
 
+pub fn exec_cmd_rolling(app: &str, cmd: &str, window: usize) -> Result<(), String> {
+    incus()
+        .arg("exec")
+        .arg(container_name(app))
+        .args(&["--", "sh", "-c", cmd])
+        .run_rolling(window)
+}
+
 pub fn exec_output(app: &str, cmd: &str) -> Result<String, String> {
     incus()
         .arg("exec")
@@ -133,12 +236,16 @@ pub fn stop(app: &str) -> Result<(), String> {
     incus().arg("stop").arg(container_name(app)).run()
 }
 
+pub fn start(app: &str) -> Result<(), String> {
+    incus().arg("start").arg(container_name(app)).run()
+}
+
 pub fn delete(app: &str) -> Result<(), String> {
     incus().arg("delete").arg(container_name(app)).run()
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
-    let cmd = if follow { "tail -f /app/app.log" } else { "cat /app/app.log" };
+    let cmd = if follow { "tail -f /var/psht/app.log" } else { "cat /var/psht/app.log" };
     incus()
         .arg("exec")
         .arg(container_name(app))
@@ -154,6 +261,43 @@ pub fn list() -> Result<Vec<ContainerInfo>, String> {
         .into_iter()
         .filter(|c| c.name.starts_with("psht-"))
         .collect())
+}
+
+fn stack_image_alias(stack: &str, hash: &str) -> String {
+    format!("psht-stack-{stack}-{hash}")
+}
+
+pub fn image_exists(stack: &str, hash: &str) -> bool {
+    let alias = stack_image_alias(stack, hash);
+    incus()
+        .args(&["image", "info"])
+        .arg(alias)
+        .build()
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
+    let alias = stack_image_alias(stack, hash);
+    incus()
+        .arg("launch")
+        .arg(alias)
+        .arg(container_name(app))
+        .run()
+}
+
+pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
+    let alias = stack_image_alias(stack, hash);
+    let name = container_name(app);
+    incus().arg("stop").arg(&name).run()?;
+    incus()
+        .arg("publish")
+        .arg(&name)
+        .arg("--alias")
+        .arg(alias)
+        .run()?;
+    incus().arg("start").arg(&name).run()
 }
 
 pub fn exists(app: &str) -> bool {
@@ -182,12 +326,12 @@ mod tests {
         let cmd = incus()
             .arg("exec")
             .arg(&name)
-            .args(&["--", "sh", "-c", "cat /app/app.log"])
+            .args(&["--", "sh", "-c", "cat /var/psht/app.log"])
             .build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec!["exec", "psht-myapp", "--", "sh", "-c", "cat /app/app.log"]
+            vec!["exec", "psht-myapp", "--", "sh", "-c", "cat /var/psht/app.log"]
         );
     }
 
@@ -197,12 +341,12 @@ mod tests {
         let cmd = incus()
             .arg("exec")
             .arg(&name)
-            .args(&["--", "sh", "-c", "tail -f /app/app.log"])
+            .args(&["--", "sh", "-c", "tail -f /var/psht/app.log"])
             .build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec!["exec", "psht-myapp", "--", "sh", "-c", "tail -f /app/app.log"]
+            vec!["exec", "psht-myapp", "--", "sh", "-c", "tail -f /var/psht/app.log"]
         );
     }
 
@@ -312,6 +456,134 @@ mod tests {
                 "psht-myapp/tmp/setup.sh"
             ]
         );
+    }
+
+    #[test]
+    fn ring_buffer_fills_up() {
+        let mut ring = Vec::new();
+        update_ring(&mut ring, "a".into(), 3);
+        update_ring(&mut ring, "b".into(), 3);
+        update_ring(&mut ring, "c".into(), 3);
+        assert_eq!(ring, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn ring_buffer_rotates_when_full() {
+        let mut ring = Vec::new();
+        for line in ["a", "b", "c", "d", "e"] {
+            update_ring(&mut ring, line.into(), 3);
+        }
+        assert_eq!(ring, vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn truncate_line_short_unchanged() {
+        assert_eq!(truncate_line("hello", 80), "hello");
+    }
+
+    #[test]
+    fn truncate_line_long_truncated() {
+        let long = "a".repeat(100);
+        let result = truncate_line(&long, 10);
+        assert_eq!(result.len(), 10);
+        assert_eq!(result, "a".repeat(10));
+    }
+
+    #[test]
+    fn stack_image_alias_format() {
+        assert_eq!(
+            stack_image_alias("node", "abc123"),
+            "psht-stack-node-abc123"
+        );
+        assert_eq!(
+            stack_image_alias("rust", "deadbeef01234567"),
+            "psht-stack-rust-deadbeef01234567"
+        );
+    }
+
+    #[test]
+    fn image_exists_command_builds_correctly() {
+        let alias = stack_image_alias("node", "abc123");
+        let cmd = incus()
+            .args(&["image", "info"])
+            .arg(&alias)
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec!["image", "info", "psht-stack-node-abc123"]);
+    }
+
+    #[test]
+    fn create_from_image_command_builds_correctly() {
+        let alias = stack_image_alias("node", "abc123");
+        let name = container_name("myapp");
+        let cmd = incus()
+            .arg("launch")
+            .arg(&alias)
+            .arg(&name)
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["launch", "psht-stack-node-abc123", "psht-myapp"]
+        );
+    }
+
+    #[test]
+    fn publish_image_stop_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus().arg("stop").arg(&name).build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec!["stop", "psht-myapp"]);
+    }
+
+    #[test]
+    fn publish_image_publish_command_builds_correctly() {
+        let name = container_name("myapp");
+        let alias = stack_image_alias("node", "abc123");
+        let cmd = incus()
+            .arg("publish")
+            .arg(&name)
+            .arg("--alias")
+            .arg(&alias)
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["publish", "psht-myapp", "--alias", "psht-stack-node-abc123"]
+        );
+    }
+
+    #[test]
+    fn publish_image_start_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus().arg("start").arg(&name).build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec!["start", "psht-myapp"]);
+    }
+
+    #[test]
+    fn exec_rolling_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .arg("exec")
+            .arg(&name)
+            .args(&["--", "sh", "-c", "npm install"])
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["exec", "psht-myapp", "--", "sh", "-c", "npm install"]
+        );
+    }
+
+    #[test]
+    fn incus_start_command_builds_correctly() {
+        let cmd = incus()
+            .arg("start")
+            .arg(container_name("myapp"))
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec!["start", "psht-myapp"]);
     }
 
     #[test]
