@@ -40,6 +40,10 @@ enum Command {
     Start { app: String },
     /// Stop and remove an app
     Destroy { app: String },
+    /// Set up this server as a psht host
+    Bootstrap,
+    #[command(name = "init-stacks", hide = true)]
+    InitStacks,
     #[command(hide = true)]
     Deploy { app: String },
     #[command(hide = true)]
@@ -103,6 +107,8 @@ fn run() -> Result<(), String> {
         Command::Destroy { app } => commands::destroy(&app),
         Command::Setup => commands::setup(),
         Command::Update => commands::update(),
+        Command::Bootstrap => commands::bootstrap(),
+        Command::InitStacks => commands::init_stacks(),
     }
 }
 
@@ -250,6 +256,18 @@ mod tests {
     fn parse_setup() {
         let cli = parse_cli(&["psht", "setup"]).unwrap();
         assert_eq!(cli.command, Some(Command::Setup));
+    }
+
+    #[test]
+    fn parse_init_stacks() {
+        let cli = parse_cli(&["psht", "init-stacks"]).unwrap();
+        assert_eq!(cli.command, Some(Command::InitStacks));
+    }
+
+    #[test]
+    fn parse_bootstrap() {
+        let cli = parse_cli(&["psht", "bootstrap"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Bootstrap));
     }
 
     #[test]

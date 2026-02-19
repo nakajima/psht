@@ -252,6 +252,7 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
     wait_for_container_network(app)?;
 
     install_runtime(app, stack)?;
+    container::exec_cmd(app, "mkdir -p /var/psht")?;
 
     match stack {
         "static" => scaffold_static(app)?,
@@ -354,4 +355,114 @@ fn integration_rust() {
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(120))
         .unwrap_or_else(|e| panic!("rust app not reachable: {e}\n{}", debug_info(app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
+}
+
+// RAII guard: launches an Incus VM; force-stops + deletes on drop.
+struct VmGuard {
+    name: String,
+}
+
+impl VmGuard {
+    fn new(name: &str) -> Result<Self, String> {
+        let status = Command::new("incus")
+            .args(["launch", "images:ubuntu/24.04", name, "--vm"])
+            .status()
+            .map_err(|e| format!("failed to launch VM: {e}"))?;
+        if !status.success() {
+            return Err(format!("incus launch --vm failed for {name}"));
+        }
+        Ok(Self { name: name.to_string() })
+    }
+}
+
+impl Drop for VmGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("incus").args(["stop", "--force", &self.name]).status();
+        let _ = Command::new("incus").args(["delete", &self.name]).status();
+    }
+}
+
+fn wait_for_vm_agent(name: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let output = Command::new("incus")
+            .args(["exec", name, "--", "echo", "ready"])
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    Err(format!("VM agent for {name} not ready after {timeout:?}"))
+}
+
+fn vm_exec(name: &str, cmd: &str) -> Result<String, String> {
+    let output = Command::new("incus")
+        .args(["exec", name, "--", "sh", "-c", cmd])
+        .output()
+        .map_err(|e| format!("vm exec failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("vm exec `{cmd}` failed: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[test]
+fn integration_bootstrap() {
+    let vm_name = "inttest-bootstrap";
+    let _guard = VmGuard::new(vm_name).expect("failed to launch VM");
+
+    // Wait for the VM agent to be ready (VMs take longer than containers)
+    wait_for_vm_agent(vm_name, Duration::from_secs(120))
+        .expect("VM agent not ready");
+
+    // Push the pre-built psht binary into the VM
+    let psht_bin = format!("{}/target/debug/psht", env!("CARGO_MANIFEST_DIR"));
+    let status = Command::new("incus")
+        .args(["file", "push", &psht_bin, &format!("{vm_name}/usr/local/bin/psht")])
+        .status()
+        .expect("failed to push binary");
+    assert!(status.success(), "incus file push failed");
+
+    // Make it executable
+    vm_exec(vm_name, "chmod 755 /usr/local/bin/psht")
+        .expect("failed to chmod psht");
+
+    // Run bootstrap with Tailscale skipped
+    let output = Command::new("incus")
+        .args(["exec", vm_name, "--", "sh", "-c",
+            "PSHT_SKIP_TAILSCALE=1 /usr/local/bin/psht bootstrap"])
+        .output()
+        .expect("failed to run bootstrap");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "bootstrap failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Verify: user psht exists
+    vm_exec(vm_name, "id psht").expect("user psht should exist");
+
+    // Verify: stacks directory has 6 .sh files
+    let count = vm_exec(vm_name, "ls /home/psht/stacks/*.sh | wc -l")
+        .expect("failed to count stacks");
+    assert_eq!(count.trim(), "6", "expected 6 stack scripts, got {count}");
+
+    // Verify: repos and builds directories exist
+    vm_exec(vm_name, "test -d /home/psht/repos")
+        .expect("/home/psht/repos should exist");
+    vm_exec(vm_name, "test -d /home/psht/builds")
+        .expect("/home/psht/builds should exist");
+
+    // Verify: psht is in /etc/shells
+    vm_exec(vm_name, "grep -qx /usr/local/bin/psht /etc/shells")
+        .expect("/usr/local/bin/psht should be in /etc/shells");
+
+    // Verify: incus is installed
+    vm_exec(vm_name, "command -v incus")
+        .expect("incus should be installed");
 }

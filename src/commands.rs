@@ -9,6 +9,15 @@ use crate::container;
 use crate::detect;
 use crate::tailscale;
 
+const STACKS: &[(&str, &str)] = &[
+    ("bun", include_str!("../stacks/bun.sh")),
+    ("go", include_str!("../stacks/go.sh")),
+    ("node", include_str!("../stacks/node.sh")),
+    ("python", include_str!("../stacks/python.sh")),
+    ("rust", include_str!("../stacks/rust.sh")),
+    ("static", include_str!("../stacks/static.sh")),
+];
+
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
@@ -190,7 +199,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
     let start_cmd = format!(
-        "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
+        "cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
         cmd = config.start_command
     );
     container::exec_cmd(app, &start_cmd)?;
@@ -315,6 +324,224 @@ echo "psht {version} (updated)" >&2"#
 
 pub fn update() -> Result<(), String> {
     println!("{}", update_script(&hostname()));
+    Ok(())
+}
+
+fn init_stacks_in(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir)
+        .map_err(|e| format!("failed to create stacks dir: {e}"))?;
+    for (name, content) in STACKS {
+        fs::write(dir.join(format!("{name}.sh")), content)
+            .map_err(|e| format!("failed to write {name}.sh: {e}"))?;
+    }
+    Ok(())
+}
+
+pub fn init_stacks() -> Result<(), String> {
+    init_stacks_in(&stacks_dir())
+}
+
+fn bootstrap_script() -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+PSHT_USER="psht"
+PSHT_HOME="/home/$PSHT_USER"
+
+log() {{ echo "-----> $*"; }}
+err() {{ echo "ERROR: $*" >&2; exit 1; }}
+
+[[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht bootstrap"
+
+# --- Verify psht is in PATH ---
+PSHT_BIN=$(command -v psht) || err "psht not found in PATH. Install the binary first."
+PSHT_DIR=$(dirname "$PSHT_BIN")
+
+# --- Install Incus if missing ---
+if ! command -v incus &>/dev/null; then
+    log "Installing Incus"
+    if ! command -v curl &>/dev/null; then
+        apt-get update && apt-get install -y curl
+    fi
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+    cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources <<EOF
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/stable
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF
+    apt-get update
+    apt-get install -y incus
+fi
+
+# --- Initialize Incus if needed ---
+# Ensure sockets are active after fresh install
+systemctl start incus.socket incus-user.socket 2>/dev/null || true
+if ! incus profile show default &>/dev/null 2>&1; then
+    log "Initializing Incus"
+    incus admin init --minimal
+fi
+
+# --- Tailscale SSH ---
+if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
+if ! command -v tailscale &>/dev/null; then
+    err "Tailscale is not installed. Install it first: https://tailscale.com/download/linux"
+fi
+
+if ! tailscale status &>/dev/null; then
+    err "Tailscale is not connected. Run: sudo tailscale up --ssh"
+fi
+
+if ! tailscale status --json | grep -q '"SSH":true'; then
+    log "Enabling Tailscale SSH"
+    tailscale up --ssh
+fi
+
+log "Tailscale SSH is active"
+fi
+
+# --- Tailscale OAuth for container networking ---
+if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
+OAUTH_CONFIG="$PSHT_HOME/.config/tailscale-oauth"
+if [[ -f "$OAUTH_CONFIG" ]]; then
+    log "Tailscale OAuth already configured"
+elif [[ -n "${{TS_OAUTH_CLIENT_ID:-}}" && -n "${{TS_OAUTH_CLIENT_SECRET:-}}" ]]; then
+    log "Setting up Tailscale OAuth from environment"
+    mkdir -p "$PSHT_HOME/.config"
+    cat > "$OAUTH_CONFIG" <<EOF
+TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
+TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
+EOF
+    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
+    chmod 600 "$OAUTH_CONFIG"
+else
+    echo ""
+    log "Setting up Tailscale OAuth for container networking"
+    echo ""
+    echo "       1. Ensure tag:psht exists in your ACL:"
+    echo "          https://login.tailscale.com/admin/acls/visual/tags/add"
+    echo ""
+    echo "       2. Create a credential at:"
+    echo "          https://login.tailscale.com/admin/settings/oauth"
+    echo "          Under Scopes > Keys, check Write and select tag:psht."
+    echo ""
+    printf "       Have you completed the steps above? (y/n) "
+    read -r CONFIRM < /dev/tty
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        err "Complete the steps above and re-run: sudo psht bootstrap"
+    fi
+    echo ""
+    printf "OAuth client ID: "
+    read -r TS_OAUTH_CLIENT_ID < /dev/tty
+    printf "OAuth client secret: "
+    read -r TS_OAUTH_CLIENT_SECRET < /dev/tty
+    if [[ -z "$TS_OAUTH_CLIENT_ID" || -z "$TS_OAUTH_CLIENT_SECRET" ]]; then
+        err "OAuth client ID and secret are required"
+    fi
+    mkdir -p "$PSHT_HOME/.config"
+    cat > "$OAUTH_CONFIG" <<EOF
+TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
+TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
+EOF
+    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
+    chmod 600 "$OAUTH_CONFIG"
+fi
+fi
+
+# --- Install psht ---
+INSTALLED_BIN="/usr/local/bin/psht"
+if [[ "$(realpath "$PSHT_BIN")" != "$(realpath "$INSTALLED_BIN")" ]]; then
+    cp "$PSHT_BIN" "$INSTALLED_BIN"
+fi
+chmod 755 "$INSTALLED_BIN"
+
+# Install client CLI binary for scp distribution
+mkdir -p "$PSHT_HOME/bin"
+if [[ -f "$PSHT_DIR/psht-cli" ]]; then
+    cp "$PSHT_DIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
+    chmod 755 "$PSHT_HOME/bin/psht-cli"
+    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
+fi
+
+if ! grep -qx "$INSTALLED_BIN" /etc/shells; then
+    log "Adding $INSTALLED_BIN to /etc/shells"
+    echo "$INSTALLED_BIN" >> /etc/shells
+fi
+
+# --- Create psht user ---
+if ! id "$PSHT_USER" &>/dev/null; then
+    log "Creating user $PSHT_USER"
+    useradd -m -s "$INSTALLED_BIN" "$PSHT_USER"
+else
+    log "User $PSHT_USER exists, updating shell"
+    chsh -s "$INSTALLED_BIN" "$PSHT_USER"
+fi
+
+# --- Grant Incus access ---
+log "Adding $PSHT_USER to incus group"
+usermod -aG incus "$PSHT_USER"
+
+# Wait for incus socket to be ready after fresh install
+for i in $(seq 1 30); do
+    incus info &>/dev/null && break
+    sleep 1
+done
+
+# Create user project and allow proxy devices
+PSHT_UID=$(id -u "$PSHT_USER")
+PSHT_PROJECT="user-${{PSHT_UID}}"
+incus project create "$PSHT_PROJECT" 2>/dev/null || true
+incus project set "$PSHT_PROJECT" restricted=true 2>/dev/null || true
+incus project set "$PSHT_PROJECT" restricted.devices.proxy=allow
+
+# --- Create directories and write stacks ---
+log "Setting up directories"
+mkdir -p "$PSHT_HOME/repos" "$PSHT_HOME/builds" "$PSHT_HOME/stacks"
+chown -R "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/repos" "$PSHT_HOME/builds" "$PSHT_HOME/stacks"
+sudo -u "$PSHT_USER" psht init-stacks
+
+# --- Done ---
+if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
+TS_HOSTNAME=$(tailscale status --json | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\.$//')
+else
+TS_HOSTNAME=$(hostname)
+fi
+
+echo ""
+echo "=====> psht is ready!"
+echo "       Containers will join your tailnet as psht-<app>"
+echo ""
+echo "Usage:"
+echo ""
+echo "  cd your-app/"
+echo "  psht deploy"
+echo ""
+echo "Commands:"
+echo "  ssh $PSHT_USER@$TS_HOSTNAME ps"
+echo "  ssh $PSHT_USER@$TS_HOSTNAME logs <app>"
+echo "  ssh $PSHT_USER@$TS_HOSTNAME stop <app>"
+"#
+    )
+}
+
+pub fn bootstrap() -> Result<(), String> {
+    let script = bootstrap_script();
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run bootstrap: {e}"))?;
+    if !status.success() {
+        return Err("bootstrap failed".to_string());
+    }
     Ok(())
 }
 
@@ -620,18 +847,110 @@ mod tests {
     }
 
     #[test]
-    fn start_cmd_mkdir_runs_before_background() {
-        // The start command must use { } grouping so mkdir && cd run synchronously
-        // before the nohup is backgrounded. Without grouping, & backgrounds the
-        // entire && chain, causing a race where echo runs before mkdir completes.
+    fn init_stacks_writes_all_scripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stacks");
+        init_stacks_in(&dir).unwrap();
+        for (name, _) in STACKS {
+            assert!(dir.join(format!("{name}.sh")).exists(), "missing {name}.sh");
+        }
+    }
+
+    #[test]
+    fn init_stacks_content_matches_embedded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stacks");
+        init_stacks_in(&dir).unwrap();
+        for (name, content) in STACKS {
+            let written = fs::read_to_string(dir.join(format!("{name}.sh"))).unwrap();
+            assert_eq!(&written, *content, "content mismatch for {name}.sh");
+        }
+    }
+
+    #[test]
+    fn init_stacks_creates_dir_if_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("deep").join("nested").join("stacks");
+        assert!(!dir.exists());
+        init_stacks_in(&dir).unwrap();
+        assert!(dir.exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), STACKS.len());
+    }
+
+    #[test]
+    fn init_stacks_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stacks");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bun.sh"), "stale content").unwrap();
+        init_stacks_in(&dir).unwrap();
+        let content = fs::read_to_string(dir.join("bun.sh")).unwrap();
+        assert_ne!(content, "stale content");
+        assert_eq!(content, STACKS.iter().find(|(n, _)| *n == "bun").unwrap().1);
+    }
+
+    #[test]
+    fn bootstrap_script_checks_root() {
+        let script = bootstrap_script();
+        assert!(script.contains("EUID -eq 0"), "should check for root");
+    }
+
+    #[test]
+    fn bootstrap_script_does_not_install_rust() {
+        let script = bootstrap_script();
+        assert!(!script.contains("rustup"), "should not install rustup");
+        assert!(!script.contains("cargo build"), "should not run cargo build");
+    }
+
+    #[test]
+    fn bootstrap_script_calls_init_stacks() {
+        let script = bootstrap_script();
+        assert!(script.contains("psht init-stacks"), "should call psht init-stacks");
+    }
+
+    #[test]
+    fn bootstrap_script_verifies_psht_in_path() {
+        let script = bootstrap_script();
+        assert!(script.contains("command -v psht"), "should check psht is in PATH");
+        assert!(script.contains("psht not found"), "should error if psht not found");
+    }
+
+    #[test]
+    fn bootstrap_script_supports_skip_tailscale() {
+        let script = bootstrap_script();
+        assert!(
+            script.contains("PSHT_SKIP_TAILSCALE"),
+            "should reference PSHT_SKIP_TAILSCALE env var"
+        );
+        // Tailscale SSH block is guarded
+        assert!(
+            script.contains(r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
+if ! command -v tailscale"#),
+            "Tailscale SSH checks should be guarded"
+        );
+        // Tailscale OAuth block is guarded
+        assert!(
+            script.contains(r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
+OAUTH_CONFIG"#),
+            "Tailscale OAuth block should be guarded"
+        );
+        // Done banner falls back to hostname when skipped
+        assert!(
+            script.contains("TS_HOSTNAME=$(hostname)"),
+            "should fall back to $(hostname) when Tailscale is skipped"
+        );
+    }
+
+    #[test]
+    fn start_cmd_backgrounds_with_pid_file() {
+        // The start command must use { } grouping so only nohup is backgrounded,
+        // and echo writes the pid synchronously before the group exits.
         let cmd = format!(
-            "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
+            "cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
             port = 3737,
             cmd = "bun run index.ts"
         );
-        // mkdir and cd must be outside the { } group
-        assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && {"));
-        // The background & and echo must be inside { }
+        assert!(cmd.starts_with("cd /app && {"));
         assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
     }
 }
