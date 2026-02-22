@@ -902,6 +902,12 @@ fn allocate_port(app: &str) -> u16 {
     3001 + (hash % 1000) as u16
 }
 
+fn start_cmd(port: u16, cmd: &str) -> String {
+    format!(
+        "mkdir -p /var/psht && cd /app && export PORT={port} && {{ nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}"
+    )
+}
+
 pub fn deploy(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
@@ -1022,10 +1028,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
-    let start_cmd = format!(
-        "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
-        cmd = config.start_command
-    );
+    let start_cmd = start_cmd(port, &config.start_command);
     container::exec_cmd(app, &start_cmd)?;
 
     tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
@@ -2516,12 +2519,9 @@ devices:
     fn start_cmd_backgrounds_with_pid_file() {
         // The start command must use { } grouping so only nohup is backgrounded,
         // and echo writes the pid synchronously before the group exits.
-        let cmd = format!(
-            "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
-            port = 3737,
-            cmd = "bun run index.ts"
-        );
-        assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && {"));
+        let cmd = start_cmd(3737, "bun run index.ts");
+        assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && export PORT=3737 && {"));
+        assert!(cmd.contains("export PORT=3737 &&"));
         assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
     }
 }
