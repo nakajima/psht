@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "psht-server",
     about = "psht server commands",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (server)"),
     arg_required_else_help = true
 )]
 struct Cli {

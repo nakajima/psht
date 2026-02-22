@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 mod app_name;
 
 #[derive(Parser)]
-#[command(name = "psht", about = "deploy apps with psht", version)]
+#[command(
+    name = "psht",
+    about = "deploy apps with psht",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (cli)")
+)]
 struct Cli {
     #[command(subcommand)]
     command: CliCommand,

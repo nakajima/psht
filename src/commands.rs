@@ -205,6 +205,27 @@ fn current_psht_binary() -> Result<PathBuf, String> {
     }
 }
 
+fn binary_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    let version = line.split_whitespace().nth(1)?;
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+fn binary_matches_version(path: &Path, expected: &str) -> bool {
+    binary_version(path).as_deref() == Some(expected)
+}
+
 fn detect_release_target() -> Result<&'static str, String> {
     let arch = run_cmd_capture("uname", &["-m"])?;
     match arch.trim() {
@@ -712,21 +733,30 @@ fn build_cli_from_source(dst: &Path) -> Result<bool, String> {
 }
 
 fn ensure_cli_binary() -> Result<PathBuf, String> {
+    let expected_version = env!("CARGO_PKG_VERSION");
     let home_cli = home_dir().join("bin/psht");
-    if home_cli.is_file() {
+    if home_cli.is_file() && binary_matches_version(&home_cli, expected_version) {
         return Ok(home_cli);
     }
 
     let current_bin = current_psht_binary()?;
     if let Some(parent) = current_bin.parent() {
         let sibling = parent.join("psht");
-        if sibling.is_file() {
+        if sibling.is_file() && binary_matches_version(&sibling, expected_version) {
             return Ok(sibling);
         }
     }
 
     let build_err = match build_cli_from_source(&home_cli) {
-        Ok(true) => return Ok(home_cli),
+        Ok(true) => {
+            if binary_matches_version(&home_cli, expected_version) {
+                return Ok(home_cli);
+            }
+            let installed = binary_version(&home_cli).unwrap_or_else(|| "unknown".to_string());
+            return Err(format!(
+                "failed to provide psht {expected_version}: built version was {installed}"
+            ));
+        }
         Ok(false) => None,
         Err(e) => Some(e),
     };
@@ -739,7 +769,14 @@ fn ensure_cli_binary() -> Result<PathBuf, String> {
         }
         return Err(format!("failed to provide psht: {download_err}"));
     }
-    Ok(home_cli)
+
+    if binary_matches_version(&home_cli, expected_version) {
+        return Ok(home_cli);
+    }
+    let installed = binary_version(&home_cli).unwrap_or_else(|| "unknown".to_string());
+    Err(format!(
+        "failed to provide psht {expected_version}: installed version was {installed}"
+    ))
 }
 
 fn path_is_world_executable(path: &Path) -> Result<bool, String> {
@@ -1074,7 +1111,12 @@ fi
 rm -f "$PSHT_BIN"
 ssh "psht@{hostname}" print-cli > "$PSHT_BIN"
 chmod +x "$PSHT_BIN"
-echo "psht {version} (updated)" >&2"#
+installed=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || installed=""
+if [ "$installed" != "{version}" ]; then
+  echo "error: installed psht ${{installed:-unknown}}, expected {version}" >&2
+  exit 1
+fi
+echo "psht $installed (updated)" >&2"#
     )
 }
 
@@ -1768,6 +1810,35 @@ mod tests {
             script.contains(env!("CARGO_PKG_VERSION")),
             "should embed the current version"
         );
+    }
+
+    #[test]
+    fn update_script_verifies_installed_version() {
+        let script = update_script("example.com");
+        assert!(
+            script.contains("installed=$(\"$PSHT_BIN\" --version"),
+            "should read installed version after downloading"
+        );
+        assert!(
+            script.contains("installed psht ${installed:-unknown}, expected"),
+            "should fail when installed version does not match server version"
+        );
+        assert!(
+            script.contains("psht $installed (updated)"),
+            "should report the installed version on success"
+        );
+    }
+
+    #[test]
+    fn binary_version_parses_cli_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("psht");
+        fs::write(&bin, "#!/bin/sh\necho 'psht 9.9.9'\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(binary_version(&bin).as_deref(), Some("9.9.9"));
+        assert!(binary_matches_version(&bin, "9.9.9"));
+        assert!(!binary_matches_version(&bin, "0.0.1"));
     }
 
     #[test]
