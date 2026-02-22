@@ -24,6 +24,8 @@ const STACKS: &[(&str, &str)] = &[
     ("static", include_str!("../stacks/static.sh")),
 ];
 
+const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
+
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
@@ -224,6 +226,29 @@ fn binary_version(path: &Path) -> Option<String> {
 
 fn binary_matches_version(path: &Path, expected: &str) -> bool {
     binary_version(path).as_deref() == Some(expected)
+}
+
+fn configured_forge_url() -> String {
+    env::var("PSHT_FORGE_URL")
+        .ok()
+        .map(|raw| raw.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_FORGE_URL.to_string())
+}
+
+fn parse_latest_release_version_url(url: &str) -> Option<String> {
+    let no_fragment = url.trim().split('#').next()?;
+    let no_query = no_fragment.split('?').next()?;
+    let trimmed = no_query.trim_end_matches('/');
+    let tag = trimmed.rsplit('/').next()?;
+    if tag.is_empty() || tag.eq_ignore_ascii_case("latest") {
+        return None;
+    }
+    let version = tag.trim_start_matches('v').trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
 }
 
 fn detect_release_target() -> Result<&'static str, String> {
@@ -566,24 +591,20 @@ fn ensure_project_default_profile(project: &str) -> Result<(), String> {
 }
 
 fn latest_release_version() -> Result<String, String> {
-    let json = run_cmd_capture(
+    let forge_url = configured_forge_url();
+    let latest_url = run_cmd_capture(
         "curl",
         &[
             "-fsSL",
-            "https://api.github.com/repos/nakajima/psht/releases/latest",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            &format!("{forge_url}/releases/latest"),
         ],
     )?;
-    let value: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| format!("failed to parse latest release: {e}"))?;
-    let tag = value
-        .get("tag_name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "latest release response missing tag_name".to_string())?;
-    let version = tag.trim_start_matches('v').trim();
-    if version.is_empty() {
-        return Err("latest release tag_name was empty".to_string());
-    }
-    Ok(version.to_string())
+    parse_latest_release_version_url(&latest_url)
+        .ok_or_else(|| format!("failed to parse latest release version from URL: {latest_url}"))
 }
 
 fn release_version_candidates(current: &str, latest: Option<&str>) -> Vec<String> {
@@ -597,21 +618,15 @@ fn release_version_candidates(current: &str, latest: Option<&str>) -> Vec<String
     versions
 }
 
-fn cli_release_urls(version: &str, target: &str) -> [String; 2] {
-    [
-        format!(
-            "https://github.com/nakajima/psht/releases/download/v{version}/psht-{version}-{target}.tar.gz"
-        ),
-        format!(
-            "https://github.com/nakajima/psht/releases/download/v{version}/psht-cli-{version}-{target}.tar.gz"
-        ),
-    ]
+fn cli_release_url(forge_url: &str, version: &str, target: &str) -> String {
+    format!("{forge_url}/releases/download/v{version}/psht-{version}-{target}.tar.gz")
 }
 
 fn install_cli_from_release(dst: &Path) -> Result<(), String> {
     let current_version = env!("CARGO_PKG_VERSION");
     let latest_version = latest_release_version().ok();
     let versions = release_version_candidates(current_version, latest_version.as_deref());
+    let forge_url = configured_forge_url();
     let target = detect_release_target()?;
     let tmpdir = run_cmd_capture("mktemp", &["-d"])?;
     let tmpdir_path = PathBuf::from(tmpdir);
@@ -622,40 +637,22 @@ fn install_cli_from_release(dst: &Path) -> Result<(), String> {
     let result = (|| {
         let mut errors = Vec::new();
         for (idx, version) in versions.iter().enumerate() {
-            let mut download_error = String::new();
-            let mut downloaded = false;
-            for url in cli_release_urls(version, target) {
-                match run_cmd_quiet("curl", &["-fsSL", &url, "-o", &tarball_s]) {
-                    Ok(()) => {
-                        downloaded = true;
-                        break;
-                    }
-                    Err(e) => {
-                        download_error = e;
-                    }
-                }
-            }
-            if !downloaded {
-                errors.push(format!("{version}: {download_error}"));
+            let url = cli_release_url(&forge_url, version, target);
+            if let Err(e) = run_cmd_quiet("curl", &["-fsSL", &url, "-o", &tarball_s]) {
+                errors.push(format!("{version}: {url}: {e}"));
                 continue;
             }
             let _ = fs::remove_file(tmpdir_path.join("psht"));
-            let _ = fs::remove_file(tmpdir_path.join("psht-cli"));
             if let Err(e) = run_cmd_quiet("tar", &["xzf", &tarball_s, "-C", &tmpdir_s]) {
                 errors.push(format!("{version}: {e}"));
                 continue;
             }
 
-            let extracted = ["psht", "psht-cli"]
-                .into_iter()
-                .map(|name| tmpdir_path.join(name))
-                .find(|path| path.is_file());
-            let Some(extracted) = extracted else {
-                errors.push(format!(
-                    "{version}: release tarball did not contain psht or psht-cli"
-                ));
+            let extracted = tmpdir_path.join("psht");
+            if !extracted.is_file() {
+                errors.push(format!("{version}: release tarball did not contain psht"));
                 continue;
-            };
+            }
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -1056,9 +1053,35 @@ pub fn logs(app: &str, follow: bool) -> Result<(), String> {
 }
 
 fn setup_script(hostname: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let forge_url = configured_forge_url();
     format!(
         r#"#!/bin/sh
 set -e
+
+VERSION="{version}"
+FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
+FORGE_URL="${{FORGE_URL%/}}"
+
+detect_target() {{
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+  esac
+}}
+
+install_cli() {{
+  install_dir="$1"
+  target=$(detect_target)
+  asset_url="$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz"
+  tmpdir=$(mktemp -d)
+  curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"
+  tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
+  install -m 755 "$tmpdir/psht" "$install_dir/psht"
+  rm -rf "$tmpdir"
+}}
 
 # Find or install psht CLI
 # The server binary also has a `setup` command that prints this script.
@@ -1070,8 +1093,7 @@ else
   read -r install_dir < /dev/tty
   install_dir="${{install_dir:-$HOME/.local/bin}}"
   mkdir -p "$install_dir"
-  ssh "psht@{hostname}" print-cli > "$install_dir/psht"
-  chmod +x "$install_dir/psht"
+  install_cli "$install_dir"
   PSHT_BIN="$install_dir/psht"
   case ":$PATH:" in
     *":$install_dir:"*) ;;
@@ -1099,18 +1121,37 @@ pub fn setup() -> Result<(), String> {
 
 fn update_script(hostname: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
+    let forge_url = configured_forge_url();
     format!(
         r#"#!/bin/sh
 set -e
 PSHT_BIN=$(command -v psht) || {{ echo "psht not found. Run: ssh psht@{hostname} setup | sh" >&2; exit 1; }}
+FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
+FORGE_URL="${{FORGE_URL%/}}"
+
+detect_target() {{
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+  esac
+}}
+
 current=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || current=""
 if [ "$current" = "{version}" ]; then
   echo "psht {version} (up to date)" >&2
   exit 0
 fi
+
+target=$(detect_target)
+asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz"
+tmpdir=$(mktemp -d)
 rm -f "$PSHT_BIN"
-ssh "psht@{hostname}" print-cli > "$PSHT_BIN"
-chmod +x "$PSHT_BIN"
+curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"
+tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
+install -m 755 "$tmpdir/psht" "$PSHT_BIN"
+rm -rf "$tmpdir"
 installed=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || installed=""
 if [ "$installed" != "{version}" ]; then
   echo "error: installed psht ${{installed:-unknown}}, expected {version}" >&2
@@ -1418,12 +1459,15 @@ pub fn bootstrap() -> Result<(), String> {
 
 fn upgrade_script() -> String {
     let version = env!("CARGO_PKG_VERSION");
+    let forge_url = configured_forge_url();
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 
 PSHT_USER="psht"
 PSHT_HOME="/home/$PSHT_USER"
+FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
+FORGE_URL="${{FORGE_URL%/}}"
 
 log() {{ echo "-----> $*"; }}
 err() {{ echo "ERROR: $*" >&2; exit 1; }}
@@ -1447,9 +1491,13 @@ case "$ARCH" in
     *)       err "Unsupported architecture: $ARCH" ;;
 esac
 
-# Fetch latest version from GitHub
+# Fetch latest version from forge releases page redirect.
 log "Checking for updates"
-LATEST=$(curl -fsSL https://api.github.com/repos/nakajima/psht/releases/latest | grep -o '"tag_name":"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+LATEST_URL=$(curl -fsSL -o /dev/null -w '%{{url_effective}}' "$FORGE_URL/releases/latest")
+LATEST_TAG="${{LATEST_URL##*/}}"
+LATEST_TAG="${{LATEST_TAG%%\?*}}"
+LATEST="${{LATEST_TAG#v}}"
+[[ -n "$LATEST" && "$LATEST" != "latest" ]] || err "Failed to resolve latest release from $LATEST_URL"
 
 if [[ "$CURRENT_VERSION" == "$LATEST" ]]; then
     echo "psht $CURRENT_VERSION (up to date)"
@@ -1463,7 +1511,7 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # Download both tarballs
-BASE_URL="https://github.com/nakajima/psht/releases/download/v$LATEST"
+BASE_URL="$FORGE_URL/releases/download/v$LATEST"
 log "Downloading psht $LATEST"
 curl -fsSL "$BASE_URL/psht-server-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht-server.tar.gz"
 curl -fsSL "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht.tar.gz"
@@ -1751,12 +1799,26 @@ mod tests {
             "script should install the CLI"
         );
         assert!(
-            script.contains("ssh \"psht@example.com\" print-cli > \"$install_dir/psht\""),
-            "script should download CLI via ssh print-cli"
+            script.contains("PSHT_FORGE_URL"),
+            "script should support overriding forge URL via PSHT_FORGE_URL"
         );
         assert!(
-            script.contains("chmod +x"),
-            "script should make CLI executable"
+            script.contains(
+                "asset_url=\"$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz\""
+            ),
+            "script should download CLI tarball from forge releases"
+        );
+        assert!(
+            script.contains("curl -fsSL \"$asset_url\""),
+            "script should fetch CLI with curl"
+        );
+        assert!(
+            script.contains("tar xzf \"$tmpdir/psht.tar.gz\""),
+            "script should extract downloaded CLI tarball"
+        );
+        assert!(
+            script.contains("install -m 755 \"$tmpdir/psht\" \"$install_dir/psht\""),
+            "script should install CLI binary"
         );
     }
 
@@ -1770,24 +1832,32 @@ mod tests {
     }
 
     #[test]
-    fn update_script_fetches_binary_via_ssh() {
+    fn update_script_downloads_binary_from_forge() {
         let script = update_script("example.com");
         assert!(
-            script.contains("ssh \"psht@example.com\" print-cli > \"$PSHT_BIN\""),
-            "should fetch the binary over ssh"
+            script.contains("PSHT_FORGE_URL"),
+            "should support overriding forge URL via PSHT_FORGE_URL"
+        );
+        assert!(
+            script.contains("asset_url=\"$FORGE_URL/releases/download/v"),
+            "should build release asset URL from forge"
+        );
+        assert!(
+            script.contains("curl -fsSL \"$asset_url\""),
+            "should download CLI tarball from forge"
         );
     }
 
     #[test]
-    fn update_script_removes_before_fetch() {
+    fn update_script_removes_before_install() {
         let script = update_script("example.com");
         let rm_pos = script
             .find("rm -f \"$PSHT_BIN\"")
             .expect("should rm the old binary to avoid ETXTBSY");
-        let fetch_pos = script
-            .find("ssh \"psht@example.com\" print-cli")
-            .expect("should fetch the new binary");
-        assert!(rm_pos < fetch_pos, "rm must come before fetch");
+        let install_pos = script
+            .find("install -m 755 \"$tmpdir/psht\" \"$PSHT_BIN\"")
+            .expect("should install the new binary");
+        assert!(rm_pos < install_pos, "rm must come before install");
     }
 
     #[test]
@@ -2133,6 +2203,21 @@ devices:
     }
 
     #[test]
+    fn parse_latest_release_version_url_parses_tag_url() {
+        let url = "https://example.com/org/repo/releases/tag/v1.2.3";
+        assert_eq!(
+            parse_latest_release_version_url(url).as_deref(),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn parse_latest_release_version_url_rejects_latest_path() {
+        let url = "https://example.com/org/repo/releases/latest";
+        assert!(parse_latest_release_version_url(url).is_none());
+    }
+
+    #[test]
     fn upgrade_script_checks_root() {
         let script = upgrade_script();
         assert!(script.contains("EUID -eq 0"), "should check for root");
@@ -2165,8 +2250,8 @@ devices:
     fn upgrade_script_fetches_latest_version() {
         let script = upgrade_script();
         assert!(
-            script.contains("api.github.com/repos/nakajima/psht/releases/latest"),
-            "should fetch latest release from GitHub"
+            script.contains("LATEST_URL=$(curl -fsSL -o /dev/null -w '%{url_effective}' \"$FORGE_URL/releases/latest\")"),
+            "should resolve latest release via forge latest redirect"
         );
     }
 

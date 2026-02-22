@@ -287,13 +287,7 @@ if ! rg -q "returned error: 409|HTTP.*409|\\b409\\b" "$log_file"; then
   exit 1
 fi
 
-echo "-----> release conflict for version $version; recreating release object and retrying once" >&2
-delete_release_if_exists "$api_base" "$token" "$version"
-if run_releasor "$log_file" "$@"; then
-  mapfile -t succeeded_targets < <(parse_succeeded_targets "$log_file")
-  upload_cli_assets "$api_base" "$token" "$version" "${succeeded_targets[@]}"
-  exit 0
-fi
-
-cat "$log_file" >&2
-err "release retry failed"
+echo "-----> release conflict for version $version; using existing release to upload CLI assets" >&2
+mapfile -t succeeded_targets < <(parse_succeeded_targets "$log_file")
+upload_cli_assets "$api_base" "$token" "$version" "${succeeded_targets[@]}"
+exit 0
