@@ -722,7 +722,7 @@ fn integration_bootstrap() {
     vm_exec(vm_name, "command -v incus").expect("incus should be installed");
     vm_exec(
         vm_name,
-        "su -s /bin/sh -c 'incus launch images:ubuntu/24.04 psht-bootstrap-check && incus delete -f psht-bootstrap-check' psht",
+        "su -s /bin/sh -c 'incus launch images:ubuntu/24.04 psht-bootstrap-check && incus exec psht-bootstrap-check -- sh -c \"ip link show eth0 >/dev/null 2>&1\" && incus delete -f psht-bootstrap-check' psht",
     )
-    .expect("psht should be able to launch and delete a container");
+    .expect("psht should be able to launch a container with a network device");
 }

@@ -251,6 +251,74 @@ fn default_storage_pool() -> Result<String, String> {
     Ok("default".to_string())
 }
 
+fn first_managed_network_name() -> Result<Option<String>, String> {
+    let json = run_cmd_capture("incus", &["network", "list", "--format=json"])?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| format!("failed to parse incus network list: {e}"))?;
+    let networks = value
+        .as_array()
+        .ok_or_else(|| "unexpected incus network list response".to_string())?;
+
+    let mut fallback = None;
+    for network in networks {
+        let Some(name) = network.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if name.is_empty() || name == "lo" {
+            continue;
+        }
+        let managed = network
+            .get("managed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !managed {
+            continue;
+        }
+        let ty = network
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if ty == "bridge" {
+            return Ok(Some(name.to_string()));
+        }
+        if fallback.is_none() {
+            fallback = Some(name.to_string());
+        }
+    }
+    Ok(fallback)
+}
+
+fn default_network_name() -> Result<String, String> {
+    for candidate in ["incusbr0", "default"] {
+        if command_succeeds("incus", &["network", "show", candidate]) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    if let Some(existing) = first_managed_network_name()? {
+        return Ok(existing);
+    }
+
+    let candidate = "incusbr0";
+    if let Err(create_err) = run_cmd(
+        "incus",
+        &[
+            "network",
+            "create",
+            candidate,
+            "ipv4.address=auto",
+            "ipv6.address=none",
+        ],
+    ) {
+        if !command_succeeds("incus", &["network", "show", candidate]) {
+            return Err(format!(
+                "failed to create fallback incus network {candidate}: {create_err}"
+            ));
+        }
+    }
+    Ok(candidate.to_string())
+}
+
 fn project_uses_profiles(project: &str) -> Result<bool, String> {
     let value = run_cmd_capture("incus", &["project", "get", project, "features.profiles"])?;
     Ok(value.trim().eq_ignore_ascii_case("true"))
@@ -329,12 +397,88 @@ fn profile_has_root_disk(profile: &str) -> bool {
     current_is_disk && current_is_root_path
 }
 
+fn profile_has_nic(profile: &str) -> bool {
+    let mut in_devices = false;
+    let mut current_device_indent = None;
+    let mut current_is_nic = false;
+
+    for raw_line in profile.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        let indent = line
+            .chars()
+            .take_while(|ch| ch.is_ascii_whitespace())
+            .count();
+
+        if !in_devices {
+            if trimmed == "devices:" {
+                in_devices = true;
+            }
+            continue;
+        }
+
+        if indent == 0 {
+            if current_is_nic {
+                return true;
+            }
+            break;
+        }
+
+        if indent == 2 && trimmed.ends_with(':') {
+            if current_is_nic {
+                return true;
+            }
+            current_device_indent = Some(indent);
+            current_is_nic = false;
+            continue;
+        }
+
+        let Some(device_indent) = current_device_indent else {
+            continue;
+        };
+
+        if indent <= device_indent {
+            if current_is_nic {
+                return true;
+            }
+            current_device_indent = None;
+            continue;
+        }
+
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if key == "type" && value == "nic" {
+                current_is_nic = true;
+            }
+        }
+    }
+
+    current_is_nic
+}
+
 fn project_profile_has_root_disk(project: &str) -> Result<bool, String> {
     let profile = run_cmd_capture(
         "incus",
         &["--project", project, "profile", "show", "default"],
     )?;
     Ok(profile_has_root_disk(&profile))
+}
+
+fn project_profile_has_nic(project: &str) -> Result<bool, String> {
+    let profile = run_cmd_capture(
+        "incus",
+        &["--project", project, "profile", "show", "default"],
+    )?;
+    Ok(profile_has_nic(&profile))
 }
 
 fn ensure_project_default_profile(project: &str) -> Result<(), String> {
@@ -352,28 +496,51 @@ fn ensure_project_default_profile(project: &str) -> Result<(), String> {
         )?;
     }
 
-    if project_profile_has_root_disk(project)? {
+    let needs_root_disk = !project_profile_has_root_disk(project)?;
+    let needs_nic = !project_profile_has_nic(project)?;
+    if !needs_root_disk && !needs_nic {
         return Ok(());
     }
 
-    let pool = default_storage_pool()?;
-    let path_arg = "path=/".to_string();
-    let pool_arg = format!("pool={pool}");
-    run_cmd(
-        "incus",
-        &[
-            "--project",
-            project,
-            "profile",
-            "device",
-            "add",
-            "default",
-            "root",
-            "disk",
-            &path_arg,
-            &pool_arg,
-        ],
-    )?;
+    if needs_root_disk {
+        let pool = default_storage_pool()?;
+        let path_arg = "path=/".to_string();
+        let pool_arg = format!("pool={pool}");
+        run_cmd(
+            "incus",
+            &[
+                "--project",
+                project,
+                "profile",
+                "device",
+                "add",
+                "default",
+                "root",
+                "disk",
+                &path_arg,
+                &pool_arg,
+            ],
+        )?;
+    }
+
+    if needs_nic {
+        let network = default_network_name()?;
+        let network_arg = format!("network={network}");
+        run_cmd(
+            "incus",
+            &[
+                "--project",
+                project,
+                "profile",
+                "device",
+                "add",
+                "default",
+                "psht-net0",
+                "nic",
+                &network_arg,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -737,6 +904,12 @@ pub fn push(app: &str) -> Result<(), String> {
 }
 
 fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
+    let current_uid = run_cmd_capture("id", &["-u"])?;
+    let current_project = format!("user-{}", current_uid.trim());
+    if command_succeeds("incus", &["project", "show", &current_project]) {
+        ensure_project_default_profile(&current_project)?;
+    }
+
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
     eprintln!("       Detected: {:?}", config.app_type);
@@ -1807,6 +1980,33 @@ devices:
     type: disk
 "#;
         assert!(!profile_has_root_disk(profile));
+    }
+
+    #[test]
+    fn profile_has_nic_detects_nic_device() {
+        let profile = r#"name: default
+devices:
+  eth0:
+    type: nic
+    network: incusbr0
+  root:
+    path: /
+    pool: default
+    type: disk
+"#;
+        assert!(profile_has_nic(profile));
+    }
+
+    #[test]
+    fn profile_has_nic_returns_false_without_nic() {
+        let profile = r#"name: default
+devices:
+  root:
+    path: /
+    pool: default
+    type: disk
+"#;
+        assert!(!profile_has_nic(profile));
     }
 
     #[test]

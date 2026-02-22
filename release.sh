@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RELEASOR_BIN="${RELEASOR_BIN:-$SCRIPT_DIR/releasor2000}"
+RELEASOR_BIN="${RELEASOR_BIN:-$HOME/.local/bin/releasor2000}"
 CONFIG_PATH="${RELEASOR_CONFIG:-$SCRIPT_DIR/releasor2000.toml}"
 
 err() {
