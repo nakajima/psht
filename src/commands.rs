@@ -2,8 +2,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use crate::app_name;
 use crate::caddy;
@@ -34,6 +37,150 @@ fn repos_dir() -> PathBuf {
 
 fn stacks_dir() -> PathBuf {
     home_dir().join("stacks")
+}
+
+fn command_exists(name: &str) -> bool {
+    env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path).any(|dir| {
+                let candidate = dir.join(name);
+                candidate.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn command_succeeds(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    if !status.success() {
+        let pretty = if args.is_empty() {
+            program.to_string()
+        } else {
+            format!("{program} {}", args.join(" "))
+        };
+        return Err(format!("command failed: {pretty}"));
+    }
+    Ok(())
+}
+
+fn run_cmd_capture(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let pretty = if args.is_empty() {
+            program.to_string()
+        } else {
+            format!("{program} {}", args.join(" "))
+        };
+        if stderr.is_empty() {
+            return Err(format!("command failed: {pretty}"));
+        }
+        return Err(format!("command failed: {pretty}: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_version_codename(os_release: &str) -> Option<String> {
+    os_release.lines().find_map(|line| {
+        line.strip_prefix("VERSION_CODENAME=")
+            .map(|value| value.trim_matches('"').to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn os_release_codename() -> Result<String, String> {
+    let contents = fs::read_to_string("/etc/os-release")
+        .map_err(|e| format!("failed to read /etc/os-release: {e}"))?;
+    parse_version_codename(&contents)
+        .ok_or_else(|| "VERSION_CODENAME missing in /etc/os-release".to_string())
+}
+
+fn ensure_line_in_file(path: &Path, line: &str) -> Result<(), String> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == line) {
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        file.write_all(b"\n")
+            .map_err(|e| format!("failed to update {}: {e}", path.display()))?;
+    }
+    writeln!(file, "{line}").map_err(|e| format!("failed to update {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn prompt_tty(prompt: &str) -> Result<String, String> {
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("failed to open /dev/tty: {e}"))?;
+    tty.write_all(prompt.as_bytes())
+        .map_err(|e| format!("failed to write prompt: {e}"))?;
+    tty.flush()
+        .map_err(|e| format!("failed to flush prompt: {e}"))?;
+
+    let mut input = String::new();
+    let mut reader = BufReader::new(tty);
+    reader
+        .read_line(&mut input)
+        .map_err(|e| format!("failed to read from /dev/tty: {e}"))?;
+    Ok(input.trim().to_string())
+}
+
+fn parse_tailscale_dns_name(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let name = value.pointer("/Self/DNSName")?.as_str()?;
+    Some(name.trim_end_matches('.').to_string())
+}
+
+fn tailscale_ssh_enabled() -> Result<bool, String> {
+    let json = run_cmd_capture("tailscale", &["status", "--json"])?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
+
+    if value
+        .pointer("/Self/SSH")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+
+    Ok(json.contains("\"SSH\":true"))
+}
+
+fn current_psht_binary() -> Result<PathBuf, String> {
+    let exe = env::current_exe().map_err(|e| format!("failed to locate current binary: {e}"))?;
+    match fs::canonicalize(&exe) {
+        Ok(path) => Ok(path),
+        Err(_) => Ok(exe),
+    }
 }
 
 fn stack_hash(path: &Path) -> Result<String, String> {
@@ -245,44 +392,6 @@ pub fn logs(app: &str, follow: bool) -> Result<(), String> {
     container::logs(app, follow)
 }
 
-fn help_text(hostname: &str) -> String {
-    let dim = "\x1b[2m";
-    let reset = "\x1b[0m";
-    let prefix = format!("ssh psht@{hostname} ");
-    let commands: &[(&str, &str, &str)] = &[
-        ("setup", " | sh", "Set up project and install CLI"),
-        ("update", " | sh", "Update CLI to latest version"),
-        ("ps", "", "List running apps"),
-        ("logs", " [-f] <app>", "Show app logs"),
-        ("stop", " <app>", "Stop an app"),
-        ("start", " <app>", "Start a stopped app"),
-        ("destroy", " <app>", "Stop and remove an app"),
-    ];
-
-    let mut lines = vec![
-        "psht - deploy apps with psht deploy".to_string(),
-        String::new(),
-        "Commands:".to_string(),
-    ];
-    for (name, suffix, desc) in commands {
-        let visible_len = name.len() + suffix.len();
-        let pad = 14_usize.saturating_sub(visible_len);
-        lines.push(format!(
-            "  {dim}{prefix}{reset}{name}{dim}{suffix}{reset}{:pad$}  {desc}",
-            "",
-        ));
-    }
-    lines.push(String::new());
-    lines.push("Deploy:".to_string());
-    lines.push(format!("  psht deploy{:>21}  Deploy current directory", ""));
-    lines.join("\n")
-}
-
-pub fn help() -> Result<(), String> {
-    eprintln!("{}", help_text(&hostname()));
-    Ok(())
-}
-
 fn setup_script(hostname: &str) -> String {
     format!(
         r#"#!/bin/sh
@@ -359,209 +468,243 @@ pub fn init_stacks() -> Result<(), String> {
     init_stacks_in(&stacks_dir())
 }
 
-fn bootstrap_script() -> String {
-    format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-
-PSHT_USER="psht"
-PSHT_HOME="/home/$PSHT_USER"
-
-log() {{ echo "-----> $*"; }}
-err() {{ echo "ERROR: $*" >&2; exit 1; }}
-
-[[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht bootstrap"
-
-# --- Verify psht is in PATH ---
-PSHT_BIN=$(command -v psht) || err "psht not found in PATH. Install the binary first."
-PSHT_DIR=$(dirname "$PSHT_BIN")
-
-# --- Install Incus if missing ---
-if ! command -v incus &>/dev/null; then
-    log "Installing Incus"
-    if ! command -v curl &>/dev/null; then
-        apt-get update && apt-get install -y curl
-    fi
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
-    cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources <<EOF
-Enabled: yes
-Types: deb
-URIs: https://pkgs.zabbly.com/incus/stable
-Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
-Components: main
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/zabbly.asc
-EOF
-    apt-get update
-    apt-get install -y incus
-fi
-
-# --- Initialize Incus if needed ---
-# Ensure sockets are active after fresh install
-systemctl start incus.socket incus-user.socket 2>/dev/null || true
-if ! incus profile show default &>/dev/null 2>&1; then
-    log "Initializing Incus"
-    incus admin init --minimal
-fi
-
-# --- Tailscale SSH ---
-if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
-if ! command -v tailscale &>/dev/null; then
-    err "Tailscale is not installed. Install it first: https://tailscale.com/download/linux"
-fi
-
-if ! tailscale status &>/dev/null; then
-    err "Tailscale is not connected. Run: sudo tailscale up --ssh"
-fi
-
-if ! tailscale status --json | grep -q '"SSH":true'; then
-    log "Enabling Tailscale SSH"
-    tailscale up --ssh
-fi
-
-log "Tailscale SSH is active"
-fi
-
-# --- Tailscale OAuth for container networking ---
-if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
-OAUTH_CONFIG="$PSHT_HOME/.config/tailscale-oauth"
-if [[ -f "$OAUTH_CONFIG" ]]; then
-    log "Tailscale OAuth already configured"
-elif [[ -n "${{TS_OAUTH_CLIENT_ID:-}}" && -n "${{TS_OAUTH_CLIENT_SECRET:-}}" ]]; then
-    log "Setting up Tailscale OAuth from environment"
-    mkdir -p "$PSHT_HOME/.config"
-    cat > "$OAUTH_CONFIG" <<EOF
-TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
-TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
-EOF
-else
-    echo ""
-    log "Setting up Tailscale OAuth for container networking"
-    echo ""
-    echo "       1. Ensure tag:psht exists in your ACL:"
-    echo "          https://login.tailscale.com/admin/acls/visual/tags/add"
-    echo ""
-    echo "       2. Create a credential at:"
-    echo "          https://login.tailscale.com/admin/settings/oauth"
-    echo "          Under Scopes > Keys, check Write and select tag:psht."
-    echo ""
-    printf "       Have you completed the steps above? (y/n) "
-    read -r CONFIRM < /dev/tty
-    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-        err "Complete the steps above and re-run: sudo psht bootstrap"
-    fi
-    echo ""
-    printf "OAuth client ID: "
-    read -r TS_OAUTH_CLIENT_ID < /dev/tty
-    printf "OAuth client secret: "
-    read -r TS_OAUTH_CLIENT_SECRET < /dev/tty
-    if [[ -z "$TS_OAUTH_CLIENT_ID" || -z "$TS_OAUTH_CLIENT_SECRET" ]]; then
-        err "OAuth client ID and secret are required"
-    fi
-    mkdir -p "$PSHT_HOME/.config"
-    cat > "$OAUTH_CONFIG" <<EOF
-TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
-TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
-EOF
-fi
-fi
-
-# --- Install psht ---
-INSTALLED_BIN="/usr/local/bin/psht"
-if [[ "$(realpath "$PSHT_BIN")" != "$(realpath "$INSTALLED_BIN")" ]]; then
-    cp "$PSHT_BIN" "$INSTALLED_BIN"
-fi
-chmod 755 "$INSTALLED_BIN"
-
-if ! grep -qx "$INSTALLED_BIN" /etc/shells; then
-    log "Adding $INSTALLED_BIN to /etc/shells"
-    echo "$INSTALLED_BIN" >> /etc/shells
-fi
-
-# --- Create psht user ---
-if ! id "$PSHT_USER" &>/dev/null; then
-    log "Creating user $PSHT_USER"
-    useradd -m -s "$INSTALLED_BIN" "$PSHT_USER"
-else
-    log "User $PSHT_USER exists, updating shell"
-    chsh -s "$INSTALLED_BIN" "$PSHT_USER"
-fi
-
-# Apply secure ownership once user exists
-if [[ -f "$PSHT_HOME/.config/tailscale-oauth" ]]; then
-    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/.config/tailscale-oauth"
-    chmod 600 "$PSHT_HOME/.config/tailscale-oauth"
-fi
-
-# Install client CLI binary for scp distribution
-mkdir -p "$PSHT_HOME/bin"
-if [[ -f "$PSHT_DIR/psht-cli" ]]; then
-    cp "$PSHT_DIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
-    chmod 755 "$PSHT_HOME/bin/psht-cli"
-    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
-fi
-
-# --- Grant Incus access ---
-log "Adding $PSHT_USER to incus group"
-usermod -aG incus "$PSHT_USER"
-
-# Wait for incus socket to be ready after fresh install
-for i in $(seq 1 30); do
-    incus info &>/dev/null && break
-    sleep 1
-done
-
-# Create user project and allow proxy devices
-PSHT_UID=$(id -u "$PSHT_USER")
-PSHT_PROJECT="user-${{PSHT_UID}}"
-incus project create "$PSHT_PROJECT" 2>/dev/null || true
-incus project set "$PSHT_PROJECT" restricted=true 2>/dev/null || true
-incus project set "$PSHT_PROJECT" restricted.devices.proxy=allow
-
-# --- Create directories and write stacks ---
-log "Setting up directories"
-mkdir -p "$PSHT_HOME/repos" "$PSHT_HOME/builds" "$PSHT_HOME/stacks"
-chown -R "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/repos" "$PSHT_HOME/builds" "$PSHT_HOME/stacks"
-sudo -u "$PSHT_USER" psht init-stacks
-
-# --- Done ---
-if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
-TS_HOSTNAME=$(tailscale status --json | grep -o '"DNSName":"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/\.$//')
-else
-TS_HOSTNAME=$(hostname)
-fi
-
-echo ""
-echo "=====> psht is ready!"
-echo "       Containers will join your tailnet as psht-<app>"
-echo ""
-echo "Usage:"
-echo ""
-echo "  cd your-app/"
-echo "  psht deploy"
-echo ""
-echo "Commands:"
-echo "  ssh $PSHT_USER@$TS_HOSTNAME ps"
-echo "  ssh $PSHT_USER@$TS_HOSTNAME logs <app>"
-echo "  ssh $PSHT_USER@$TS_HOSTNAME stop <app>"
-"#
-    )
+fn write_oauth_config(path: &Path, client_id: &str, client_secret: &str) -> Result<(), String> {
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err("OAuth client ID and secret are required".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = format!(
+        "TS_OAUTH_CLIENT_ID={client_id}\nTS_OAUTH_CLIENT_SECRET={client_secret}\n"
+    );
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(())
 }
 
 pub fn bootstrap() -> Result<(), String> {
-    let script = bootstrap_script();
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to run bootstrap: {e}"))?;
-    if !status.success() {
-        return Err("bootstrap failed".to_string());
+    if run_cmd_capture("id", &["-u"])? != "0" {
+        return Err("Run this command as root: sudo psht bootstrap".to_string());
     }
+
+    let psht_user = "psht";
+    let psht_home = PathBuf::from(format!("/home/{psht_user}"));
+    let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
+
+    let psht_bin = current_psht_binary()?;
+    let psht_bin_str = psht_bin.to_string_lossy().to_string();
+    let psht_dir = psht_bin
+        .parent()
+        .ok_or_else(|| "failed to determine psht binary directory".to_string())?;
+
+    if !command_exists("incus") {
+        eprintln!("-----> Installing Incus");
+        if !command_exists("curl") {
+            run_cmd("apt-get", &["update"])?;
+            run_cmd("apt-get", &["install", "-y", "curl"])?;
+        }
+
+        fs::create_dir_all("/etc/apt/keyrings")
+            .map_err(|e| format!("failed to create /etc/apt/keyrings: {e}"))?;
+        run_cmd(
+            "curl",
+            &[
+                "-fsSL",
+                "https://pkgs.zabbly.com/key.asc",
+                "-o",
+                "/etc/apt/keyrings/zabbly.asc",
+            ],
+        )?;
+
+        let codename = os_release_codename()?;
+        let arch = run_cmd_capture("dpkg", &["--print-architecture"])?;
+        let source = format!(
+            "Enabled: yes\nTypes: deb\nURIs: https://pkgs.zabbly.com/incus/stable\nSuites: {codename}\nComponents: main\nArchitectures: {arch}\nSigned-By: /etc/apt/keyrings/zabbly.asc\n"
+        );
+        fs::write("/etc/apt/sources.list.d/zabbly-incus-stable.sources", source).map_err(
+            |e| {
+                format!("failed to write /etc/apt/sources.list.d/zabbly-incus-stable.sources: {e}")
+            },
+        )?;
+
+        run_cmd("apt-get", &["update"])?;
+        run_cmd("apt-get", &["install", "-y", "incus"])?;
+    }
+
+    let _ = Command::new("systemctl")
+        .args(["start", "incus.socket", "incus-user.socket"])
+        .status();
+
+    if !command_succeeds("incus", &["profile", "show", "default"]) {
+        eprintln!("-----> Initializing Incus");
+        run_cmd("incus", &["admin", "init", "--minimal"])?;
+    }
+
+    if !skip_tailscale {
+        if !command_exists("tailscale") {
+            return Err(
+                "Tailscale is not installed. Install it first: https://tailscale.com/download/linux"
+                    .to_string(),
+            );
+        }
+        if !command_succeeds("tailscale", &["status"]) {
+            return Err("Tailscale is not connected. Run: sudo tailscale up --ssh".to_string());
+        }
+        if !tailscale_ssh_enabled()? {
+            eprintln!("-----> Enabling Tailscale SSH");
+            run_cmd("tailscale", &["up", "--ssh"])?;
+        }
+        eprintln!("-----> Tailscale SSH is active");
+    }
+
+    let oauth_config = psht_home.join(".config/tailscale-oauth");
+    if !skip_tailscale {
+        if oauth_config.exists() {
+            eprintln!("-----> Tailscale OAuth already configured");
+        } else if let (Some(client_id), Some(client_secret)) = (
+            env::var("TS_OAUTH_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            env::var("TS_OAUTH_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+        ) {
+            eprintln!("-----> Setting up Tailscale OAuth from environment");
+            write_oauth_config(&oauth_config, client_id.trim(), client_secret.trim())?;
+        } else {
+            println!();
+            eprintln!("-----> Setting up Tailscale OAuth for container networking");
+            println!();
+            println!("       1. Ensure tag:psht exists in your ACL:");
+            println!("          https://login.tailscale.com/admin/acls/visual/tags/add");
+            println!();
+            println!("       2. Create a credential at:");
+            println!("          https://login.tailscale.com/admin/settings/oauth");
+            println!("          Under Scopes > Keys, check Write and select tag:psht.");
+            println!();
+
+            let confirm = prompt_tty("       Have you completed the steps above? (y/n) ")?;
+            if confirm != "y" && confirm != "Y" {
+                return Err("Complete the steps above and re-run: sudo psht bootstrap".to_string());
+            }
+
+            println!();
+            let client_id = prompt_tty("OAuth client ID: ")?;
+            let client_secret = prompt_tty("OAuth client secret: ")?;
+            write_oauth_config(&oauth_config, client_id.trim(), client_secret.trim())?;
+        }
+    }
+
+    ensure_line_in_file(Path::new("/etc/shells"), &psht_bin_str)?;
+
+    if !command_succeeds("id", &[psht_user]) {
+        eprintln!("-----> Creating user {psht_user}");
+        run_cmd("useradd", &["-m", "-s", &psht_bin_str, psht_user])?;
+    } else {
+        eprintln!("-----> User {psht_user} exists, updating shell");
+        run_cmd("chsh", &["-s", &psht_bin_str, psht_user])?;
+    }
+
+    if oauth_config.exists() {
+        let oauth = oauth_config.to_string_lossy().to_string();
+        let owner = format!("{psht_user}:{psht_user}");
+        run_cmd("chown", &[&owner, &oauth])?;
+        run_cmd("chmod", &["600", &oauth])?;
+    }
+
+    let psht_cli_src = psht_dir.join("psht-cli");
+    let psht_bin_dir = psht_home.join("bin");
+    fs::create_dir_all(&psht_bin_dir)
+        .map_err(|e| format!("failed to create {}: {e}", psht_bin_dir.display()))?;
+    if psht_cli_src.exists() {
+        let psht_cli_dst = psht_bin_dir.join("psht-cli");
+        fs::copy(&psht_cli_src, &psht_cli_dst).map_err(|e| {
+            format!(
+                "failed to copy {} to {}: {e}",
+                psht_cli_src.display(),
+                psht_cli_dst.display()
+            )
+        })?;
+        let cli_path = psht_cli_dst.to_string_lossy().to_string();
+        let cli_dir = psht_bin_dir.to_string_lossy().to_string();
+        let owner = format!("{psht_user}:{psht_user}");
+        run_cmd("chmod", &["755", &cli_path])?;
+        run_cmd("chown", &[&owner, &cli_dir, &cli_path])?;
+    }
+
+    eprintln!("-----> Adding {psht_user} to incus group");
+    run_cmd("usermod", &["-aG", "incus", psht_user])?;
+
+    let mut incus_ready = false;
+    for _ in 0..30 {
+        if command_succeeds("incus", &["info"]) {
+            incus_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    if !incus_ready {
+        return Err("incus did not become ready after 30 seconds".to_string());
+    }
+
+    let psht_uid = run_cmd_capture("id", &["-u", psht_user])?;
+    let psht_project = format!("user-{}", psht_uid.trim());
+    let _ = Command::new("incus")
+        .args(["project", "create", &psht_project])
+        .status();
+    let _ = Command::new("incus")
+        .args(["project", "set", &psht_project, "restricted=true"])
+        .status();
+    run_cmd(
+        "incus",
+        &[
+            "project",
+            "set",
+            &psht_project,
+            "restricted.devices.proxy=allow",
+        ],
+    )?;
+
+    eprintln!("-----> Setting up directories");
+    let repos = psht_home.join("repos");
+    let builds = psht_home.join("builds");
+    let stacks = psht_home.join("stacks");
+    fs::create_dir_all(&repos).map_err(|e| format!("failed to create {}: {e}", repos.display()))?;
+    fs::create_dir_all(&builds)
+        .map_err(|e| format!("failed to create {}: {e}", builds.display()))?;
+    fs::create_dir_all(&stacks)
+        .map_err(|e| format!("failed to create {}: {e}", stacks.display()))?;
+
+    let repos_s = repos.to_string_lossy().to_string();
+    let builds_s = builds.to_string_lossy().to_string();
+    let stacks_s = stacks.to_string_lossy().to_string();
+    let owner = format!("{psht_user}:{psht_user}");
+    run_cmd("chown", &["-R", &owner, &repos_s, &builds_s, &stacks_s])?;
+    run_cmd("sudo", &["-u", psht_user, &psht_bin_str, "init-stacks"])?;
+
+    let ts_hostname = if skip_tailscale {
+        hostname()
+    } else {
+        run_cmd_capture("tailscale", &["status", "--json"])
+            .ok()
+            .and_then(|json| parse_tailscale_dns_name(&json))
+            .unwrap_or_else(hostname)
+    };
+
+    println!();
+    println!("=====> psht is ready!");
+    println!("       Containers will join your tailnet as psht-<app>");
+    println!();
+    println!("Usage:");
+    println!();
+    println!("  cd your-app/");
+    println!("  psht deploy");
+    println!();
+    println!("Commands:");
+    println!("  ssh {psht_user}@{ts_hostname} ps");
+    println!("  ssh {psht_user}@{ts_hostname} logs <app>");
+    println!("  ssh {psht_user}@{ts_hostname} stop <app>");
     Ok(())
 }
 
@@ -573,6 +716,8 @@ set -euo pipefail
 
 PSHT_USER="psht"
 PSHT_HOME="/home/$PSHT_USER"
+PSHT_BIN=$(command -v psht) || err "psht not found in PATH"
+PSHT_BIN=$(realpath "$PSHT_BIN")
 
 log() {{ echo "-----> $*"; }}
 err() {{ echo "ERROR: $*" >&2; exit 1; }}
@@ -615,7 +760,8 @@ tar xzf "$TMPDIR/psht.tar.gz" -C "$TMPDIR"
 tar xzf "$TMPDIR/psht-cli.tar.gz" -C "$TMPDIR"
 
 log "Installing binaries"
-install -m 755 "$TMPDIR/psht" /usr/local/bin/psht
+install -m 755 "$TMPDIR/psht" "$PSHT_BIN"
+mkdir -p "$PSHT_HOME/bin"
 install -m 755 "$TMPDIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
 chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin/psht-cli"
 
@@ -625,7 +771,7 @@ apt-get update -qq && apt-get install -y -qq incus
 
 # Refresh stacks
 log "Refreshing stacks"
-sudo -u "$PSHT_USER" /usr/local/bin/psht init-stacks
+sudo -u "$PSHT_USER" "$PSHT_BIN" init-stacks
 
 echo "=====> psht upgraded to $LATEST"
 "#
@@ -656,6 +802,7 @@ set -uo pipefail
 
 PSHT_USER="psht"
 PSHT_HOME="/home/$PSHT_USER"
+PSHT_BIN=$(command -v psht 2>/dev/null || true)
 FAILED=0
 
 pass() {{ echo "  [ok] $*"; }}
@@ -671,9 +818,17 @@ check() {{
 }}
 
 echo "Installation:"
-check "psht binary at /usr/local/bin/psht" test -x /usr/local/bin/psht
+if [[ -n "$PSHT_BIN" ]]; then
+    check "psht binary at $PSHT_BIN" test -x "$PSHT_BIN"
+else
+    fail "psht binary is not in PATH"
+fi
 check "psht-cli binary at \$PSHT_HOME/bin/psht-cli" test -x "$PSHT_HOME/bin/psht-cli"
-INSTALLED_VERSION=$(/usr/local/bin/psht --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
+if [[ -n "$PSHT_BIN" ]]; then
+    INSTALLED_VERSION=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
+else
+    INSTALLED_VERSION=""
+fi
 if [[ "$INSTALLED_VERSION" == "{version}" ]]; then
     pass "psht version {version}"
 else
@@ -683,15 +838,15 @@ fi
 echo ""
 echo "System:"
 check "psht user exists" id psht
-if getent passwd psht | grep -q ":/usr/local/bin/psht$"; then
-    pass "psht user shell is /usr/local/bin/psht"
+if [[ -n "$PSHT_BIN" ]] && getent passwd psht | grep -q ":$PSHT_BIN$"; then
+    pass "psht user shell is $PSHT_BIN"
 else
-    fail "psht user shell is not /usr/local/bin/psht"
+    fail "psht user shell is not $PSHT_BIN"
 fi
-if grep -qx "/usr/local/bin/psht" /etc/shells 2>/dev/null; then
-    pass "/usr/local/bin/psht listed in /etc/shells"
+if [[ -n "$PSHT_BIN" ]] && grep -qx "$PSHT_BIN" /etc/shells 2>/dev/null; then
+    pass "$PSHT_BIN listed in /etc/shells"
 else
-    fail "/usr/local/bin/psht not listed in /etc/shells"
+    fail "$PSHT_BIN not listed in /etc/shells"
 fi
 if id -nG psht 2>/dev/null | grep -qw incus; then
     pass "psht user in incus group"
@@ -898,45 +1053,6 @@ mod tests {
     }
 
     #[test]
-    fn help_text_contains_all_commands() {
-        let text = help_text("example.com");
-        let plain: String = text.replace("\x1b[2m", "").replace("\x1b[0m", "");
-        assert!(
-            plain.contains("ssh psht@example.com setup"),
-            "missing setup"
-        );
-        assert!(
-            plain.contains("ssh psht@example.com update"),
-            "missing update"
-        );
-        assert!(plain.contains("ssh psht@example.com ps"), "missing ps");
-        assert!(
-            plain.contains("ssh psht@example.com logs [-f] <app>"),
-            "missing logs"
-        );
-        assert!(
-            plain.contains("ssh psht@example.com stop <app>"),
-            "missing stop"
-        );
-        assert!(
-            plain.contains("ssh psht@example.com start <app>"),
-            "missing start"
-        );
-        assert!(
-            plain.contains("ssh psht@example.com destroy <app>"),
-            "missing destroy"
-        );
-    }
-
-    #[test]
-    fn help_text_mentions_deploy() {
-        let text = help_text("example.com");
-        let plain: String = text.replace("\x1b[2m", "").replace("\x1b[0m", "");
-        assert!(plain.contains("psht deploy"), "missing deploy method");
-        assert!(!plain.contains("git push"), "should not mention git push");
-    }
-
-    #[test]
     fn update_script_scps_binary() {
         let script = update_script("example.com");
         assert!(
@@ -1125,85 +1241,50 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_script_checks_root() {
-        let script = bootstrap_script();
-        assert!(script.contains("EUID -eq 0"), "should check for root");
+    fn parse_version_codename_from_os_release() {
+        let os_release = "NAME=Ubuntu\nVERSION_CODENAME=noble\n";
+        assert_eq!(parse_version_codename(os_release), Some("noble".to_string()));
     }
 
     #[test]
-    fn bootstrap_script_does_not_install_rust() {
-        let script = bootstrap_script();
-        assert!(!script.contains("rustup"), "should not install rustup");
-        assert!(
-            !script.contains("cargo build"),
-            "should not run cargo build"
-        );
+    fn parse_version_codename_handles_quotes() {
+        let os_release = "NAME=Ubuntu\nVERSION_CODENAME=\"jammy\"\n";
+        assert_eq!(parse_version_codename(os_release), Some("jammy".to_string()));
     }
 
     #[test]
-    fn bootstrap_script_calls_init_stacks() {
-        let script = bootstrap_script();
-        assert!(
-            script.contains("psht init-stacks"),
-            "should call psht init-stacks"
-        );
+    fn ensure_line_in_file_appends_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shells");
+        fs::write(&path, "/bin/sh\n").unwrap();
+
+        ensure_line_in_file(&path, "/opt/psht/bin/psht").unwrap();
+        ensure_line_in_file(&path, "/opt/psht/bin/psht").unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let count = contents
+            .lines()
+            .filter(|line| *line == "/opt/psht/bin/psht")
+            .count();
+        assert_eq!(count, 1, "line should only be written once");
     }
 
     #[test]
-    fn bootstrap_script_verifies_psht_in_path() {
-        let script = bootstrap_script();
-        assert!(
-            script.contains("command -v psht"),
-            "should check psht is in PATH"
-        );
-        assert!(
-            script.contains("psht not found"),
-            "should error if psht not found"
-        );
+    fn write_oauth_config_writes_expected_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tailscale-oauth");
+        write_oauth_config(&path, "cid", "secret").unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("TS_OAUTH_CLIENT_ID=cid"));
+        assert!(contents.contains("TS_OAUTH_CLIENT_SECRET=secret"));
     }
 
     #[test]
-    fn bootstrap_script_supports_skip_tailscale() {
-        let script = bootstrap_script();
-        assert!(
-            script.contains("PSHT_SKIP_TAILSCALE"),
-            "should reference PSHT_SKIP_TAILSCALE env var"
-        );
-        // Tailscale SSH block is guarded
-        assert!(
-            script.contains(
-                r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
-if ! command -v tailscale"#
-            ),
-            "Tailscale SSH checks should be guarded"
-        );
-        // Tailscale OAuth block is guarded
-        assert!(
-            script.contains(
-                r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
-OAUTH_CONFIG"#
-            ),
-            "Tailscale OAuth block should be guarded"
-        );
-        // Done banner falls back to hostname when skipped
-        assert!(
-            script.contains("TS_HOSTNAME=$(hostname)"),
-            "should fall back to $(hostname) when Tailscale is skipped"
-        );
-    }
-
-    #[test]
-    fn bootstrap_script_creates_user_before_first_chown() {
-        let script = bootstrap_script();
-        let create_user_pos = script
-            .find("# --- Create psht user ---")
-            .expect("should have user creation block");
-        let first_chown_pos = script
-            .find("chown \"$PSHT_USER:$PSHT_USER\"")
-            .expect("should have at least one chown");
-        assert!(
-            create_user_pos < first_chown_pos,
-            "user creation must happen before any chown"
+    fn parse_tailscale_dns_name_trims_trailing_dot() {
+        let json = r#"{"Self":{"DNSName":"psht.tailnet.ts.net."}}"#;
+        assert_eq!(
+            parse_tailscale_dns_name(json),
+            Some("psht.tailnet.ts.net".to_string())
         );
     }
 
@@ -1270,8 +1351,12 @@ OAUTH_CONFIG"#
     fn upgrade_script_installs_to_correct_paths() {
         let script = upgrade_script();
         assert!(
-            script.contains("/usr/local/bin/psht"),
-            "should install psht to /usr/local/bin/psht"
+            script.contains("PSHT_BIN=$(command -v psht)"),
+            "should resolve active psht binary path"
+        );
+        assert!(
+            script.contains("install -m 755 \"$TMPDIR/psht\" \"$PSHT_BIN\""),
+            "should install psht to active binary path"
         );
         assert!(
             script.contains("$PSHT_HOME/bin/psht-cli"),
@@ -1291,7 +1376,10 @@ OAUTH_CONFIG"#
     #[test]
     fn upgrade_script_refreshes_stacks() {
         let script = upgrade_script();
-        assert!(script.contains("psht init-stacks"), "should refresh stacks");
+        assert!(
+            script.contains("\"$PSHT_BIN\" init-stacks"),
+            "should refresh stacks with the active psht binary"
+        );
     }
 
     #[test]
@@ -1320,8 +1408,12 @@ OAUTH_CONFIG"#
     fn doctor_script_checks_psht_binary() {
         let script = doctor_script();
         assert!(
-            script.contains("/usr/local/bin/psht"),
-            "should check psht binary"
+            script.contains("PSHT_BIN=$(command -v psht"),
+            "should resolve psht binary from PATH"
+        );
+        assert!(
+            script.contains("test -x \"$PSHT_BIN\""),
+            "should check psht binary executable path"
         );
     }
 
@@ -1350,7 +1442,7 @@ OAUTH_CONFIG"#
     fn doctor_script_checks_user_shell() {
         let script = doctor_script();
         assert!(
-            script.contains("getent passwd psht"),
+            script.contains("getent passwd psht | grep -q \":$PSHT_BIN$\""),
             "should check psht user shell"
         );
     }

@@ -1,0 +1,35 @@
+[project]
+name = "psht"
+binary = "psht"
+repo = "nakajima/psht"
+# version_command = "git describe --tags --abbrev=0"
+
+[build]
+command = "cargo build --release --bin {binary} --target {target}"
+artifact = "target/{target}/release/{binary}"
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[git]
+type = "gitea"                  # defaults to "github"
+base_url = "https://git.fishmt.net"
+# token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
+
+[channels.git]
+enabled = true
+
+# [channels.homebrew]
+# tap = "owner/homebrew-tap"
+# formula_name = "psht"
+
+# [channels.cargo]
+# crate_name = "psht"
+
+# [channels.curl]
+
+# [channels.nix]
+# flake_repo = "owner/nix-repo"  # defaults to project repo

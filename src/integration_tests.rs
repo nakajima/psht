@@ -641,21 +641,28 @@ fn integration_bootstrap() {
     // Wait for the VM agent to be ready (VMs take longer than containers)
     wait_for_vm_agent(vm_name, Duration::from_secs(120)).expect("VM agent not ready");
 
-    // Push the pre-built psht binary into the VM
+    // Build and push the latest psht binary into the VM at a non-standard path.
+    let build_status = Command::new("cargo")
+        .args(["build", "--bin", "psht"])
+        .status()
+        .expect("failed to build psht binary");
+    assert!(build_status.success(), "cargo build --bin psht failed");
+
     let psht_bin = format!("{}/target/debug/psht", env!("CARGO_MANIFEST_DIR"));
+    vm_exec(vm_name, "mkdir -p /opt/psht/bin").expect("failed to create /opt/psht/bin");
     let status = Command::new("incus")
         .args([
             "file",
             "push",
             &psht_bin,
-            &format!("{vm_name}/usr/local/bin/psht"),
+            &format!("{vm_name}/opt/psht/bin/psht"),
         ])
         .status()
         .expect("failed to push binary");
     assert!(status.success(), "incus file push failed");
 
     // Make it executable
-    vm_exec(vm_name, "chmod 755 /usr/local/bin/psht").expect("failed to chmod psht");
+    vm_exec(vm_name, "chmod 755 /opt/psht/bin/psht").expect("failed to chmod psht");
 
     // Run bootstrap with Tailscale skipped
     let output = Command::new("incus")
@@ -665,7 +672,7 @@ fn integration_bootstrap() {
             "--",
             "sh",
             "-c",
-            "PSHT_SKIP_TAILSCALE=1 /usr/local/bin/psht bootstrap",
+            "PSHT_SKIP_TAILSCALE=1 /opt/psht/bin/psht bootstrap",
         ])
         .output()
         .expect("failed to run bootstrap");
@@ -688,9 +695,11 @@ fn integration_bootstrap() {
     vm_exec(vm_name, "test -d /home/psht/repos").expect("/home/psht/repos should exist");
     vm_exec(vm_name, "test -d /home/psht/builds").expect("/home/psht/builds should exist");
 
-    // Verify: psht is in /etc/shells
-    vm_exec(vm_name, "grep -qx /usr/local/bin/psht /etc/shells")
-        .expect("/usr/local/bin/psht should be in /etc/shells");
+    // Verify: psht shell path is the dropped binary path.
+    vm_exec(vm_name, "getent passwd psht | grep -q ':/opt/psht/bin/psht$'")
+        .expect("psht user shell should be /opt/psht/bin/psht");
+    vm_exec(vm_name, "grep -qx /opt/psht/bin/psht /etc/shells")
+        .expect("/opt/psht/bin/psht should be in /etc/shells");
 
     // Verify: incus is installed
     vm_exec(vm_name, "command -v incus").expect("incus should be installed");

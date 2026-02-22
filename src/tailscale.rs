@@ -12,7 +12,7 @@ fn credentials_path() -> PathBuf {
 
 fn read_credentials_from(path: &std::path::Path) -> Result<(String, String), String> {
     let contents = fs::read_to_string(path)
-        .map_err(|_| "tailscale OAuth not configured — run bootstrap.sh".to_string())?;
+        .map_err(|_| "tailscale OAuth not configured — run `psht bootstrap`".to_string())?;
 
     let mut client_id = None;
     let mut client_secret = None;
