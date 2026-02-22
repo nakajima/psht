@@ -40,6 +40,8 @@ enum CliCommand {
     Setup,
     /// Update the psht CLI
     Update,
+    #[command(name = "__is-cli", hide = true)]
+    IsCli,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -234,6 +236,7 @@ fn run() -> Result<(), String> {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             update(&host)
         }
+        CliCommand::IsCli => Ok(()),
     }
 }
 
@@ -345,6 +348,12 @@ mod tests {
     fn config_path_at_uses_home() {
         let path = config_path_at(Path::new("/home/user"));
         assert_eq!(path, PathBuf::from("/home/user/.psht/config.toml"));
+    }
+
+    #[test]
+    fn is_cli_probe_command_parses() {
+        let cli = Cli::try_parse_from(["psht", "__is-cli"]).expect("probe command should parse");
+        assert!(matches!(cli.command, CliCommand::IsCli));
     }
 
     #[test]

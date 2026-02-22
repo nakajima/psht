@@ -685,6 +685,13 @@ fn integration_bootstrap() {
 
     // Verify: user psht exists
     vm_exec(vm_name, "id psht").expect("user psht should exist");
+    vm_exec(vm_name, "stat -c '%U:%G' /home/psht | grep -q '^psht:psht$'")
+        .expect("/home/psht should be owned by psht");
+    vm_exec(
+        vm_name,
+        "su -s /bin/sh -c 'mkdir -p /home/psht/.config/incus && test -w /home/psht/.config/incus' psht",
+    )
+    .expect("psht should be able to create ~/.config/incus");
 
     // Verify: stacks directory has 6 .sh files
     let count =
@@ -694,6 +701,7 @@ fn integration_bootstrap() {
     // Verify: repos and builds directories exist
     vm_exec(vm_name, "test -d /home/psht/repos").expect("/home/psht/repos should exist");
     vm_exec(vm_name, "test -d /home/psht/builds").expect("/home/psht/builds should exist");
+    vm_exec(vm_name, "test -f /home/psht/.hushlogin").expect("/home/psht/.hushlogin should exist");
 
     // Verify: psht shell path is the dropped binary path.
     vm_exec(vm_name, "getent passwd psht | grep -q ':/opt/psht/bin/psht$'")

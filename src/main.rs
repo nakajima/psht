@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "psht",
     about = "psht server commands",
+    version,
     arg_required_else_help = true
 )]
 struct Cli {
@@ -54,6 +55,8 @@ enum Command {
     Doctor,
     #[command(name = "init-stacks", hide = true)]
     InitStacks,
+    #[command(name = "print-cli", hide = true)]
+    PrintCli,
     #[command(hide = true)]
     Deploy { app: String },
     #[command(hide = true)]
@@ -141,6 +144,7 @@ fn run() -> Result<(), String> {
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
         Command::InitStacks => commands::init_stacks(),
+        Command::PrintCli => commands::print_cli(),
     }
 }
 
@@ -294,6 +298,12 @@ mod tests {
     fn parse_init_stacks() {
         let cli = parse_cli(&["psht", "init-stacks"]).unwrap();
         assert_eq!(cli.command, Command::InitStacks);
+    }
+
+    #[test]
+    fn parse_print_cli() {
+        let cli = parse_cli(&["psht", "print-cli"]).unwrap();
+        assert_eq!(cli.command, Command::PrintCli);
     }
 
     #[test]

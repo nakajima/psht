@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -99,6 +100,27 @@ fn run_cmd_capture(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn run_cmd_quiet(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let pretty = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        return Err(format!("command failed: {pretty}"));
+    }
+    Err(format!("command failed: {pretty}: {stderr}"))
+}
+
 fn parse_version_codename(os_release: &str) -> Option<String> {
     os_release.lines().find_map(|line| {
         line.strip_prefix("VERSION_CODENAME=")
@@ -181,6 +203,186 @@ fn current_psht_binary() -> Result<PathBuf, String> {
         Ok(path) => Ok(path),
         Err(_) => Ok(exe),
     }
+}
+
+fn detect_release_target() -> Result<&'static str, String> {
+    let arch = run_cmd_capture("uname", &["-m"])?;
+    match arch.trim() {
+        "x86_64" => Ok("x86_64-unknown-linux-gnu"),
+        "aarch64" => Ok("aarch64-unknown-linux-gnu"),
+        other => Err(format!("unsupported architecture: {other}")),
+    }
+}
+
+fn install_cli_from_release(dst: &Path) -> Result<(), String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let target = detect_release_target()?;
+    let tmpdir = run_cmd_capture("mktemp", &["-d"])?;
+    let tmpdir_path = PathBuf::from(tmpdir);
+    let tmpdir_s = tmpdir_path.to_string_lossy().to_string();
+    let tarball = tmpdir_path.join("psht-cli.tar.gz");
+    let tarball_s = tarball.to_string_lossy().to_string();
+    let url = format!(
+        "https://github.com/nakajima/psht/releases/download/v{version}/psht-cli-{version}-{target}.tar.gz"
+    );
+
+    let result = (|| {
+        run_cmd_quiet("curl", &["-fsSL", &url, "-o", &tarball_s])?;
+        run_cmd_quiet("tar", &["xzf", &tarball_s, "-C", &tmpdir_s])?;
+
+        let extracted = tmpdir_path.join("psht-cli");
+        if !extracted.is_file() {
+            return Err(format!(
+                "release tarball did not contain {}",
+                extracted.display()
+            ));
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        fs::copy(&extracted, dst)
+            .map_err(|e| format!("failed to copy {} to {}: {e}", extracted.display(), dst.display()))?;
+        fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("failed to chmod {}: {e}", dst.display()))?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&tmpdir_path);
+    result
+}
+
+fn build_cli_from_source(dst: &Path) -> Result<bool, String> {
+    let current_bin = current_psht_binary()?;
+    let mut cursor = current_bin.parent().map(|p| p.to_path_buf());
+    while let Some(dir) = cursor {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() {
+            let output = Command::new("cargo")
+                .args(["build", "--release", "--bin", "psht-cli"])
+                .current_dir(&dir)
+                .output()
+                .map_err(|e| format!("failed to run cargo in {}: {e}", dir.display()))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if stderr.is_empty() {
+                    return Err(format!("cargo build failed in {}", dir.display()));
+                }
+                return Err(format!("cargo build failed in {}: {stderr}", dir.display()));
+            }
+
+            let built = dir.join("target/release/psht-cli");
+            if !built.is_file() {
+                return Err(format!(
+                    "cargo build succeeded but {} was not created",
+                    built.display()
+                ));
+            }
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            }
+            fs::copy(&built, dst)
+                .map_err(|e| format!("failed to copy {} to {}: {e}", built.display(), dst.display()))?;
+            fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("failed to chmod {}: {e}", dst.display()))?;
+            return Ok(true);
+        }
+        cursor = dir.parent().map(|p| p.to_path_buf());
+    }
+    Ok(false)
+}
+
+fn ensure_cli_binary() -> Result<PathBuf, String> {
+    let home_cli = home_dir().join("bin/psht-cli");
+    if home_cli.is_file() {
+        return Ok(home_cli);
+    }
+
+    let current_bin = current_psht_binary()?;
+    if let Some(parent) = current_bin.parent() {
+        let sibling = parent.join("psht-cli");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+
+    let build_err = match build_cli_from_source(&home_cli) {
+        Ok(true) => return Ok(home_cli),
+        Ok(false) => None,
+        Err(e) => Some(e),
+    };
+
+    if let Err(download_err) = install_cli_from_release(&home_cli) {
+        if let Some(build_err) = build_err {
+            return Err(format!(
+                "failed to provide psht-cli (build failed: {build_err}; release download failed: {download_err})"
+            ));
+        }
+        return Err(format!("failed to provide psht-cli: {download_err}"));
+    }
+    Ok(home_cli)
+}
+
+fn path_is_world_executable(path: &Path) -> Result<bool, String> {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let mut dirs = Vec::new();
+    let mut cursor = resolved.parent();
+    while let Some(dir) = cursor {
+        if dir == Path::new("/") {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        cursor = dir.parent();
+    }
+    dirs.reverse();
+
+    for dir in dirs {
+        let meta =
+            fs::metadata(&dir).map_err(|e| format!("failed to stat {}: {e}", dir.display()))?;
+        if !meta.is_dir() {
+            return Ok(false);
+        }
+        if meta.permissions().mode() & 0o001 == 0 {
+            return Ok(false);
+        }
+    }
+
+    let file_meta =
+        fs::metadata(&resolved).map_err(|e| format!("failed to stat {}: {e}", resolved.display()))?;
+    Ok(file_meta.permissions().mode() & 0o001 != 0)
+}
+
+fn prepare_server_binary(current_bin: &Path) -> Result<PathBuf, String> {
+    let resolved = fs::canonicalize(current_bin).unwrap_or_else(|_| current_bin.to_path_buf());
+    if path_is_world_executable(&resolved)? {
+        return Ok(resolved);
+    }
+
+    let fallback = PathBuf::from("/usr/local/bin/psht");
+    eprintln!(
+        "-----> Binary path {} is not accessible to other users; installing to {}",
+        resolved.display(),
+        fallback.display()
+    );
+
+    if resolved != fallback {
+        if let Some(parent) = fallback.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        fs::copy(&resolved, &fallback).map_err(|e| {
+            format!(
+                "failed to copy {} to {}: {e}",
+                resolved.display(),
+                fallback.display()
+            )
+        })?;
+    }
+    let fallback_str = fallback.to_string_lossy().to_string();
+    run_cmd("chmod", &["755", &fallback_str])?;
+    Ok(fallback)
 }
 
 fn stack_hash(path: &Path) -> Result<String, String> {
@@ -398,14 +600,16 @@ fn setup_script(hostname: &str) -> String {
 set -e
 
 # Find or install psht CLI
-if command -v psht >/dev/null 2>&1; then
+# The server binary also has a `setup` command that prints this script.
+# Reusing it here would recurse and only print the script again.
+if command -v psht >/dev/null 2>&1 && psht __is-cli >/dev/null 2>&1; then
   PSHT_BIN=$(command -v psht)
 else
   printf "Install psht CLI to (default: ~/.local/bin): " >&2
   read -r install_dir < /dev/tty
   install_dir="${{install_dir:-$HOME/.local/bin}}"
   mkdir -p "$install_dir"
-  scp "psht@{hostname}:bin/psht-cli" "$install_dir/psht"
+  ssh "psht@{hostname}" print-cli > "$install_dir/psht"
   chmod +x "$install_dir/psht"
   PSHT_BIN="$install_dir/psht"
   case ":$PATH:" in
@@ -444,7 +648,7 @@ if [ "$current" = "{version}" ]; then
   exit 0
 fi
 rm -f "$PSHT_BIN"
-scp "psht@{hostname}:bin/psht-cli" "$PSHT_BIN"
+ssh "psht@{hostname}" print-cli > "$PSHT_BIN"
 chmod +x "$PSHT_BIN"
 echo "psht {version} (updated)" >&2"#
     )
@@ -452,6 +656,19 @@ echo "psht {version} (updated)" >&2"#
 
 pub fn update() -> Result<(), String> {
     println!("{}", update_script(&hostname()));
+    Ok(())
+}
+
+pub fn print_cli() -> Result<(), String> {
+    let cli = ensure_cli_binary()?;
+    let mut file =
+        fs::File::open(&cli).map_err(|e| format!("failed to open {}: {e}", cli.display()))?;
+    let mut stdout = std::io::stdout().lock();
+    std::io::copy(&mut file, &mut stdout)
+        .map_err(|e| format!("failed to stream {}: {e}", cli.display()))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("failed to flush stdout: {e}"))?;
     Ok(())
 }
 
@@ -492,9 +709,10 @@ pub fn bootstrap() -> Result<(), String> {
     let psht_home = PathBuf::from(format!("/home/{psht_user}"));
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
 
-    let psht_bin = current_psht_binary()?;
+    let current_bin = current_psht_binary()?;
+    let psht_bin = prepare_server_binary(&current_bin)?;
     let psht_bin_str = psht_bin.to_string_lossy().to_string();
-    let psht_dir = psht_bin
+    let psht_dir = current_bin
         .parent()
         .ok_or_else(|| "failed to determine psht binary directory".to_string())?;
 
@@ -606,9 +824,30 @@ pub fn bootstrap() -> Result<(), String> {
         run_cmd("chsh", &["-s", &psht_bin_str, psht_user])?;
     }
 
+    let owner = format!("{psht_user}:{psht_user}");
+    // Ensure the service user can create runtime config (for example ~/.config/incus).
+    fs::create_dir_all(&psht_home)
+        .map_err(|e| format!("failed to create {}: {e}", psht_home.display()))?;
+    let psht_config_dir = psht_home.join(".config");
+    fs::create_dir_all(&psht_config_dir)
+        .map_err(|e| format!("failed to create {}: {e}", psht_config_dir.display()))?;
+    let psht_home_s = psht_home.to_string_lossy().to_string();
+    let psht_config_dir_s = psht_config_dir.to_string_lossy().to_string();
+    run_cmd("chown", &[&owner, &psht_home_s])?;
+    run_cmd("chown", &["-R", &owner, &psht_config_dir_s])?;
+
+    // Suppress MOTD/noise on SSH login for the psht service user.
+    let hushlogin = psht_home.join(".hushlogin");
+    if !hushlogin.exists() {
+        fs::write(&hushlogin, "")
+            .map_err(|e| format!("failed to write {}: {e}", hushlogin.display()))?;
+    }
+    let hushlogin_s = hushlogin.to_string_lossy().to_string();
+    run_cmd("chown", &[&owner, &hushlogin_s])?;
+    run_cmd("chmod", &["644", &hushlogin_s])?;
+
     if oauth_config.exists() {
         let oauth = oauth_config.to_string_lossy().to_string();
-        let owner = format!("{psht_user}:{psht_user}");
         run_cmd("chown", &[&owner, &oauth])?;
         run_cmd("chmod", &["600", &oauth])?;
     }
@@ -628,7 +867,6 @@ pub fn bootstrap() -> Result<(), String> {
         })?;
         let cli_path = psht_cli_dst.to_string_lossy().to_string();
         let cli_dir = psht_bin_dir.to_string_lossy().to_string();
-        let owner = format!("{psht_user}:{psht_user}");
         run_cmd("chmod", &["755", &cli_path])?;
         run_cmd("chown", &[&owner, &cli_dir, &cli_path])?;
     }
@@ -650,12 +888,10 @@ pub fn bootstrap() -> Result<(), String> {
 
     let psht_uid = run_cmd_capture("id", &["-u", psht_user])?;
     let psht_project = format!("user-{}", psht_uid.trim());
-    let _ = Command::new("incus")
-        .args(["project", "create", &psht_project])
-        .status();
-    let _ = Command::new("incus")
-        .args(["project", "set", &psht_project, "restricted=true"])
-        .status();
+    if !command_succeeds("incus", &["project", "show", &psht_project]) {
+        run_cmd("incus", &["project", "create", &psht_project])?;
+    }
+    run_cmd("incus", &["project", "set", &psht_project, "restricted=true"])?;
     run_cmd(
         "incus",
         &[
@@ -679,9 +915,8 @@ pub fn bootstrap() -> Result<(), String> {
     let repos_s = repos.to_string_lossy().to_string();
     let builds_s = builds.to_string_lossy().to_string();
     let stacks_s = stacks.to_string_lossy().to_string();
-    let owner = format!("{psht_user}:{psht_user}");
+    init_stacks_in(&stacks)?;
     run_cmd("chown", &["-R", &owner, &repos_s, &builds_s, &stacks_s])?;
-    run_cmd("sudo", &["-u", psht_user, &psht_bin_str, "init-stacks"])?;
 
     let ts_hostname = if skip_tailscale {
         hostname()
@@ -716,11 +951,16 @@ set -euo pipefail
 
 PSHT_USER="psht"
 PSHT_HOME="/home/$PSHT_USER"
-PSHT_BIN=$(command -v psht) || err "psht not found in PATH"
-PSHT_BIN=$(realpath "$PSHT_BIN")
 
 log() {{ echo "-----> $*"; }}
 err() {{ echo "ERROR: $*" >&2; exit 1; }}
+
+PSHT_BIN=$(getent passwd "$PSHT_USER" | cut -d: -f7 || true)
+if [[ -z "$PSHT_BIN" ]]; then
+    PSHT_BIN=$(command -v psht) || err "psht not found in PATH"
+fi
+PSHT_BIN=$(realpath "$PSHT_BIN")
+[[ -x "$PSHT_BIN" ]] || err "psht binary is not executable: $PSHT_BIN"
 
 [[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht upgrade"
 
@@ -802,7 +1042,7 @@ set -uo pipefail
 
 PSHT_USER="psht"
 PSHT_HOME="/home/$PSHT_USER"
-PSHT_BIN=$(command -v psht 2>/dev/null || true)
+PSHT_USER_SHELL=$(getent passwd "$PSHT_USER" 2>/dev/null | cut -d: -f7 || true)
 FAILED=0
 
 pass() {{ echo "  [ok] $*"; }}
@@ -818,14 +1058,14 @@ check() {{
 }}
 
 echo "Installation:"
-if [[ -n "$PSHT_BIN" ]]; then
-    check "psht binary at $PSHT_BIN" test -x "$PSHT_BIN"
+if [[ -n "$PSHT_USER_SHELL" ]]; then
+    check "psht binary at $PSHT_USER_SHELL" test -x "$PSHT_USER_SHELL"
 else
-    fail "psht binary is not in PATH"
+    fail "psht user shell path missing"
 fi
 check "psht-cli binary at \$PSHT_HOME/bin/psht-cli" test -x "$PSHT_HOME/bin/psht-cli"
-if [[ -n "$PSHT_BIN" ]]; then
-    INSTALLED_VERSION=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
+if [[ -n "$PSHT_USER_SHELL" ]]; then
+    INSTALLED_VERSION=$("$PSHT_USER_SHELL" --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
 else
     INSTALLED_VERSION=""
 fi
@@ -838,15 +1078,15 @@ fi
 echo ""
 echo "System:"
 check "psht user exists" id psht
-if [[ -n "$PSHT_BIN" ]] && getent passwd psht | grep -q ":$PSHT_BIN$"; then
-    pass "psht user shell is $PSHT_BIN"
+if [[ -n "$PSHT_USER_SHELL" ]] && getent passwd psht | grep -q ":$PSHT_USER_SHELL$"; then
+    pass "psht user shell is $PSHT_USER_SHELL"
 else
-    fail "psht user shell is not $PSHT_BIN"
+    fail "psht user shell is not $PSHT_USER_SHELL"
 fi
-if [[ -n "$PSHT_BIN" ]] && grep -qx "$PSHT_BIN" /etc/shells 2>/dev/null; then
-    pass "$PSHT_BIN listed in /etc/shells"
+if [[ -n "$PSHT_USER_SHELL" ]] && grep -qx "$PSHT_USER_SHELL" /etc/shells 2>/dev/null; then
+    pass "$PSHT_USER_SHELL listed in /etc/shells"
 else
-    fail "$PSHT_BIN not listed in /etc/shells"
+    fail "$PSHT_USER_SHELL not listed in /etc/shells"
 fi
 if id -nG psht 2>/dev/null | grep -qw incus; then
     pass "psht user in incus group"
@@ -1012,6 +1252,10 @@ mod tests {
             "should capture existing binary path"
         );
         assert!(
+            script.contains("psht __is-cli >/dev/null 2>&1"),
+            "should verify existing binary is the local CLI"
+        );
+        assert!(
             script.contains("PSHT_BIN=\"$install_dir/psht\""),
             "should capture newly installed binary path"
         );
@@ -1034,8 +1278,8 @@ mod tests {
             "script should install the CLI"
         );
         assert!(
-            script.contains("scp \"psht@example.com:bin/psht-cli\""),
-            "script should download CLI via scp"
+            script.contains("ssh \"psht@example.com\" print-cli > \"$install_dir/psht\""),
+            "script should download CLI via ssh print-cli"
         );
         assert!(
             script.contains("chmod +x"),
@@ -1053,22 +1297,24 @@ mod tests {
     }
 
     #[test]
-    fn update_script_scps_binary() {
+    fn update_script_fetches_binary_via_ssh() {
         let script = update_script("example.com");
         assert!(
-            script.contains("scp \"psht@example.com:bin/psht-cli\" \"$PSHT_BIN\""),
-            "should scp the binary to the existing install path"
+            script.contains("ssh \"psht@example.com\" print-cli > \"$PSHT_BIN\""),
+            "should fetch the binary over ssh"
         );
     }
 
     #[test]
-    fn update_script_removes_before_scp() {
+    fn update_script_removes_before_fetch() {
         let script = update_script("example.com");
         let rm_pos = script
             .find("rm -f \"$PSHT_BIN\"")
             .expect("should rm the old binary to avoid ETXTBSY");
-        let scp_pos = script.find("scp ").expect("should scp the new binary");
-        assert!(rm_pos < scp_pos, "rm must come before scp");
+        let fetch_pos = script
+            .find("ssh \"psht@example.com\" print-cli")
+            .expect("should fetch the new binary");
+        assert!(rm_pos < fetch_pos, "rm must come before fetch");
     }
 
     #[test]
@@ -1270,6 +1516,22 @@ mod tests {
     }
 
     #[test]
+    fn path_is_world_executable_checks_parent_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("psht");
+        fs::write(&file, "#!/bin/sh\necho ok\n").unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(path_is_world_executable(&file).unwrap());
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!path_is_world_executable(&file).unwrap());
+    }
+
+    #[test]
     fn write_oauth_config_writes_expected_contents() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tailscale-oauth");
@@ -1351,8 +1613,12 @@ mod tests {
     fn upgrade_script_installs_to_correct_paths() {
         let script = upgrade_script();
         assert!(
+            script.contains("PSHT_BIN=$(getent passwd \"$PSHT_USER\""),
+            "should resolve psht binary path from user shell"
+        );
+        assert!(
             script.contains("PSHT_BIN=$(command -v psht)"),
-            "should resolve active psht binary path"
+            "should fall back to command -v psht"
         );
         assert!(
             script.contains("install -m 755 \"$TMPDIR/psht\" \"$PSHT_BIN\""),
@@ -1408,11 +1674,11 @@ mod tests {
     fn doctor_script_checks_psht_binary() {
         let script = doctor_script();
         assert!(
-            script.contains("PSHT_BIN=$(command -v psht"),
-            "should resolve psht binary from PATH"
+            script.contains("PSHT_USER_SHELL=$(getent passwd \"$PSHT_USER\""),
+            "should resolve psht binary from psht user's shell"
         );
         assert!(
-            script.contains("test -x \"$PSHT_BIN\""),
+            script.contains("test -x \"$PSHT_USER_SHELL\""),
             "should check psht binary executable path"
         );
     }
@@ -1442,7 +1708,7 @@ mod tests {
     fn doctor_script_checks_user_shell() {
         let script = doctor_script();
         assert!(
-            script.contains("getent passwd psht | grep -q \":$PSHT_BIN$\""),
+            script.contains("getent passwd psht | grep -q \":$PSHT_USER_SHELL$\""),
             "should check psht user shell"
         );
     }
