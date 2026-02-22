@@ -1,8 +1,11 @@
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
+use crate::caddy;
 use crate::container;
 
 // RAII guard: stops + deletes the container on drop, even on panic.
@@ -106,10 +109,7 @@ fn wait_for_http(addr: &str, port: u16, timeout: Duration) -> Result<String, Str
 
 fn install_runtime(app: &str, stack: &str) -> Result<(), String> {
     match stack {
-        "node" => container::exec_cmd(
-            app,
-            "apt-get update && apt-get install -y nodejs npm",
-        ),
+        "node" => container::exec_cmd(app, "apt-get update && apt-get install -y nodejs npm"),
         "go" => container::exec_cmd(
             app,
             "apt-get update && apt-get install -y curl && curl -fsSL https://go.dev/dl/go1.23.6.linux-amd64.tar.gz | tar -C /usr/local -xzf -",
@@ -282,15 +282,13 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
         "static" => format!(
             "cd /app && PORT={APP_PORT} nohup python3 -m http.server {APP_PORT} > /var/psht/app.log 2>&1 &"
         ),
-        "python" => format!(
-            "cd /app && PORT={APP_PORT} nohup python3 app.py > /var/psht/app.log 2>&1 &"
-        ),
-        "node" => format!(
-            "cd /app && PORT={APP_PORT} nohup node server.js > /var/psht/app.log 2>&1 &"
-        ),
-        "go" => format!(
-            "cd /app && PORT={APP_PORT} nohup ./app > /var/psht/app.log 2>&1 &"
-        ),
+        "python" => {
+            format!("cd /app && PORT={APP_PORT} nohup python3 app.py > /var/psht/app.log 2>&1 &")
+        }
+        "node" => {
+            format!("cd /app && PORT={APP_PORT} nohup node server.js > /var/psht/app.log 2>&1 &")
+        }
+        "go" => format!("cd /app && PORT={APP_PORT} nohup ./app > /var/psht/app.log 2>&1 &"),
         "rust" => format!(
             "cd /app && PORT={APP_PORT} nohup ./target/release/app > /var/psht/app.log 2>&1 &"
         ),
@@ -310,6 +308,227 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
 
     let ip = container_ip(app)?;
     Ok((guard, ip))
+}
+
+fn caddy_debug_info(app: &str) -> String {
+    let log = exec_output(app, "cat /var/psht/caddy.log 2>/dev/null").unwrap_or_default();
+    let ps = exec_output(app, "ps aux | grep [c]addy 2>/dev/null").unwrap_or_default();
+    format!("caddy.log:\n{log}\n\ncaddy ps:\n{ps}")
+}
+
+fn wait_for_tcp(addr: &str, port: u16, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let connect_addr = if addr.contains(':') {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    };
+    while Instant::now() < deadline {
+        if TcpStream::connect(&connect_addr).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!(
+        "TCP port did not open on {addr}:{port} within {timeout:?}"
+    ))
+}
+
+fn wait_for_http_with_host(
+    connect_addr: &str,
+    port: u16,
+    host_header: &str,
+    path: &str,
+    expected_body: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_err = String::new();
+    let dial = if connect_addr.contains(':') {
+        format!("[{connect_addr}]:{port}")
+    } else {
+        format!("{connect_addr}:{port}")
+    };
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect(&dial) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut response = String::new();
+                if stream.read_to_string(&mut response).is_ok() && response.contains(expected_body)
+                {
+                    return Ok(response);
+                }
+                last_err = response;
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "no matching HTTP response on {connect_addr}:{port} with Host {host_header} within {timeout:?}; last response: {last_err}"
+    ))
+}
+
+fn setup_caddy_container(
+    caddy_app: &str,
+    upstream_name: &str,
+    upstream_ip: &str,
+) -> Result<(ContainerGuard, String), String> {
+    let guard = ContainerGuard::new(caddy_app)?;
+    wait_for_container_network(caddy_app)?;
+
+    container::exec_cmd(caddy_app, "apt-get update && apt-get install -y caddy")?;
+    container::exec_cmd(caddy_app, "mkdir -p /var/psht /etc/caddy")?;
+
+    let caddyfile = concat!(
+        "{\n",
+        "    admin 0.0.0.0:2019\n",
+        "    auto_https off\n",
+        "}\n",
+        "\n",
+        ":80 {\n",
+        "}\n",
+    );
+    write_file(caddy_app, "/etc/caddy/Caddyfile", caddyfile)?;
+    container::exec_cmd(
+        caddy_app,
+        &format!(
+            "grep -q ' {upstream_name}$' /etc/hosts || echo '{upstream_ip} {upstream_name}' >> /etc/hosts"
+        ),
+    )?;
+    container::exec_cmd(
+        caddy_app,
+        "pkill caddy 2>/dev/null || true; nohup caddy run --config /etc/caddy/Caddyfile --adapter caddyfile > /var/psht/caddy.log 2>&1 &",
+    )?;
+
+    let caddy_ip = container_ip(caddy_app)?;
+    wait_for_tcp(&caddy_ip, 2019, Duration::from_secs(30))?;
+    wait_for_http_with_host(
+        &caddy_ip,
+        80,
+        "bootstrap.example.com",
+        "/",
+        "HTTP/1.1 200 OK",
+        Duration::from_secs(30),
+    )?;
+
+    Ok((guard, caddy_ip))
+}
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct CaddyEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    old_api_url: Option<String>,
+    old_domain: Option<String>,
+}
+
+impl CaddyEnvGuard {
+    fn set(api_url: &str, domain: Option<&str>) -> Self {
+        let lock = env_lock().lock().expect("env lock poisoned");
+        let old_api_url = std::env::var("CADDY_API_URL").ok();
+        let old_domain = std::env::var("CADDY_DOMAIN").ok();
+
+        // SAFETY: environment mutation is serialized by a global mutex for these tests.
+        unsafe {
+            std::env::set_var("CADDY_API_URL", api_url);
+            match domain {
+                Some(value) => std::env::set_var("CADDY_DOMAIN", value),
+                None => std::env::remove_var("CADDY_DOMAIN"),
+            }
+        }
+
+        Self {
+            _lock: lock,
+            old_api_url,
+            old_domain,
+        }
+    }
+}
+
+impl Drop for CaddyEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: environment mutation is serialized by a global mutex for these tests.
+        unsafe {
+            match &self.old_api_url {
+                Some(value) => std::env::set_var("CADDY_API_URL", value),
+                None => std::env::remove_var("CADDY_API_URL"),
+            }
+            match &self.old_domain {
+                Some(value) => std::env::set_var("CADDY_DOMAIN", value),
+                None => std::env::remove_var("CADDY_DOMAIN"),
+            }
+        }
+    }
+}
+
+#[test]
+fn integration_caddy_end_to_end_with_real_container() {
+    let app = "inttest-caddy-app";
+    let caddy_app = "inttest-caddy";
+
+    let (_app_guard, app_ip) = deploy_stack(app, "static").expect("deploy app failed");
+    let (_caddy_guard, caddy_ip) =
+        setup_caddy_container(caddy_app, app, &app_ip).expect("setup caddy failed");
+
+    let api_url = format!("http://{caddy_ip}:2019");
+    let route_host = format!("{app}.example.com");
+
+    {
+        let _env = CaddyEnvGuard::set(&api_url, Some("example.com"));
+        if let Err(e) = caddy::add(app, APP_PORT) {
+            panic!(
+                "caddy add failed: {e}\ncaddy debug:\n{}",
+                caddy_debug_info(caddy_app)
+            );
+        }
+    }
+
+    let resp = wait_for_http_with_host(
+        &caddy_ip,
+        80,
+        &route_host,
+        "/",
+        "ok",
+        Duration::from_secs(30),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "caddy route did not proxy app: {e}\napp debug:\n{}\ncaddy debug:\n{}",
+            debug_info(app),
+            caddy_debug_info(caddy_app)
+        )
+    });
+    assert!(resp.contains("ok"), "expected proxied app response: {resp}");
+
+    {
+        let _env = CaddyEnvGuard::set(&api_url, None);
+        caddy::remove(app).expect("caddy remove failed");
+    }
+
+    let removed = wait_for_http_with_host(
+        &caddy_ip,
+        80,
+        &route_host,
+        "/",
+        "Content-Length: 0",
+        Duration::from_secs(30),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "caddy route was not removed: {e}\ncaddy debug:\n{}",
+            caddy_debug_info(caddy_app)
+        )
+    });
+    assert!(
+        removed.contains("Content-Length: 0"),
+        "expected fallback response after remove: {removed}"
+    );
 }
 
 #[test]
@@ -371,13 +590,17 @@ impl VmGuard {
         if !status.success() {
             return Err(format!("incus launch --vm failed for {name}"));
         }
-        Ok(Self { name: name.to_string() })
+        Ok(Self {
+            name: name.to_string(),
+        })
     }
 }
 
 impl Drop for VmGuard {
     fn drop(&mut self) {
-        let _ = Command::new("incus").args(["stop", "--force", &self.name]).status();
+        let _ = Command::new("incus")
+            .args(["stop", "--force", &self.name])
+            .status();
         let _ = Command::new("incus").args(["delete", &self.name]).status();
     }
 }
@@ -416,25 +639,34 @@ fn integration_bootstrap() {
     let _guard = VmGuard::new(vm_name).expect("failed to launch VM");
 
     // Wait for the VM agent to be ready (VMs take longer than containers)
-    wait_for_vm_agent(vm_name, Duration::from_secs(120))
-        .expect("VM agent not ready");
+    wait_for_vm_agent(vm_name, Duration::from_secs(120)).expect("VM agent not ready");
 
     // Push the pre-built psht binary into the VM
     let psht_bin = format!("{}/target/debug/psht", env!("CARGO_MANIFEST_DIR"));
     let status = Command::new("incus")
-        .args(["file", "push", &psht_bin, &format!("{vm_name}/usr/local/bin/psht")])
+        .args([
+            "file",
+            "push",
+            &psht_bin,
+            &format!("{vm_name}/usr/local/bin/psht"),
+        ])
         .status()
         .expect("failed to push binary");
     assert!(status.success(), "incus file push failed");
 
     // Make it executable
-    vm_exec(vm_name, "chmod 755 /usr/local/bin/psht")
-        .expect("failed to chmod psht");
+    vm_exec(vm_name, "chmod 755 /usr/local/bin/psht").expect("failed to chmod psht");
 
     // Run bootstrap with Tailscale skipped
     let output = Command::new("incus")
-        .args(["exec", vm_name, "--", "sh", "-c",
-            "PSHT_SKIP_TAILSCALE=1 /usr/local/bin/psht bootstrap"])
+        .args([
+            "exec",
+            vm_name,
+            "--",
+            "sh",
+            "-c",
+            "PSHT_SKIP_TAILSCALE=1 /usr/local/bin/psht bootstrap",
+        ])
         .output()
         .expect("failed to run bootstrap");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -448,21 +680,18 @@ fn integration_bootstrap() {
     vm_exec(vm_name, "id psht").expect("user psht should exist");
 
     // Verify: stacks directory has 6 .sh files
-    let count = vm_exec(vm_name, "ls /home/psht/stacks/*.sh | wc -l")
-        .expect("failed to count stacks");
+    let count =
+        vm_exec(vm_name, "ls /home/psht/stacks/*.sh | wc -l").expect("failed to count stacks");
     assert_eq!(count.trim(), "6", "expected 6 stack scripts, got {count}");
 
     // Verify: repos and builds directories exist
-    vm_exec(vm_name, "test -d /home/psht/repos")
-        .expect("/home/psht/repos should exist");
-    vm_exec(vm_name, "test -d /home/psht/builds")
-        .expect("/home/psht/builds should exist");
+    vm_exec(vm_name, "test -d /home/psht/repos").expect("/home/psht/repos should exist");
+    vm_exec(vm_name, "test -d /home/psht/builds").expect("/home/psht/builds should exist");
 
     // Verify: psht is in /etc/shells
     vm_exec(vm_name, "grep -qx /usr/local/bin/psht /etc/shells")
         .expect("/usr/local/bin/psht should be in /etc/shells");
 
     // Verify: incus is installed
-    vm_exec(vm_name, "command -v incus")
-        .expect("incus should be installed");
+    vm_exec(vm_name, "command -v incus").expect("incus should be installed");
 }

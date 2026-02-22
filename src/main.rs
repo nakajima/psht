@@ -1,3 +1,5 @@
+mod app_name;
+mod caddy;
 mod commands;
 mod container;
 mod detect;
@@ -42,6 +44,10 @@ enum Command {
     Destroy { app: String },
     /// Set up this server as a psht host
     Bootstrap,
+    /// Upgrade psht server, incus, and stacks
+    Upgrade,
+    /// Check server health
+    Doctor,
     #[command(name = "init-stacks", hide = true)]
     InitStacks,
     #[command(hide = true)]
@@ -57,7 +63,6 @@ enum Command {
 fn strip_git_suffix(name: &str) -> String {
     name.strip_suffix(".git").unwrap_or(name).to_string()
 }
-
 
 fn cli_from_env() -> Result<Cli, String> {
     let args: Vec<String> = env::args().collect();
@@ -96,18 +101,46 @@ fn run() -> Result<(), String> {
     };
 
     match command {
-        Command::GitReceivePack { app } => git::handle_receive_pack(&strip_git_suffix(&app)),
-        Command::GitUploadPack { app } => git::handle_upload_pack(&strip_git_suffix(&app)),
-        Command::Deploy { app } => commands::deploy(&app),
-        Command::Push { app } => commands::push(&app),
+        Command::GitReceivePack { app } => {
+            let app = strip_git_suffix(&app);
+            app_name::validate_app_name(&app)?;
+            git::handle_receive_pack(&app)
+        }
+        Command::GitUploadPack { app } => {
+            let app = strip_git_suffix(&app);
+            app_name::validate_app_name(&app)?;
+            git::handle_upload_pack(&app)
+        }
+        Command::Deploy { app } => {
+            app_name::validate_app_name(&app)?;
+            commands::deploy(&app)
+        }
+        Command::Push { app } => {
+            app_name::validate_app_name(&app)?;
+            commands::push(&app)
+        }
         Command::Ps => commands::ps(),
-        Command::Logs { app, follow } => commands::logs(&app, follow),
-        Command::Stop { app } => commands::stop(&app),
-        Command::Start { app } => commands::start(&app),
-        Command::Destroy { app } => commands::destroy(&app),
+        Command::Logs { app, follow } => {
+            app_name::validate_app_name(&app)?;
+            commands::logs(&app, follow)
+        }
+        Command::Stop { app } => {
+            app_name::validate_app_name(&app)?;
+            commands::stop(&app)
+        }
+        Command::Start { app } => {
+            app_name::validate_app_name(&app)?;
+            commands::start(&app)
+        }
+        Command::Destroy { app } => {
+            app_name::validate_app_name(&app)?;
+            commands::destroy(&app)
+        }
         Command::Setup => commands::setup(),
         Command::Update => commands::update(),
         Command::Bootstrap => commands::bootstrap(),
+        Command::Upgrade => commands::upgrade_server(),
+        Command::Doctor => commands::doctor(),
         Command::InitStacks => commands::init_stacks(),
     }
 }
@@ -268,6 +301,18 @@ mod tests {
     fn parse_bootstrap() {
         let cli = parse_cli(&["psht", "bootstrap"]).unwrap();
         assert_eq!(cli.command, Some(Command::Bootstrap));
+    }
+
+    #[test]
+    fn parse_upgrade() {
+        let cli = parse_cli(&["psht", "upgrade"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Upgrade));
+    }
+
+    #[test]
+    fn parse_doctor() {
+        let cli = parse_cli(&["psht", "doctor"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Doctor));
     }
 
     #[test]

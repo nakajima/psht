@@ -5,6 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::app_name;
+use crate::caddy;
 use crate::container;
 use crate::detect;
 use crate::tailscale;
@@ -42,19 +44,30 @@ fn stack_hash(path: &Path) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn resolve_stack_in(app: &str, code_dir: &Path, detected_stack: &str, stacks: &Path) -> Result<(String, PathBuf), String> {
+fn resolve_stack_in(
+    app: &str,
+    code_dir: &Path,
+    detected_stack: &str,
+    stacks: &Path,
+) -> Result<(String, PathBuf), String> {
     let custom = code_dir.join("psht-stack.sh");
     if custom.exists() {
         let saved = stacks.join(format!("{app}.sh"));
-        fs::copy(&custom, &saved)
-            .map_err(|e| format!("failed to save custom stack: {e}"))?;
+        fs::copy(&custom, &saved).map_err(|e| format!("failed to save custom stack: {e}"))?;
         Ok((app.to_string(), saved))
     } else {
-        Ok((detected_stack.to_string(), stacks.join(format!("{detected_stack}.sh"))))
+        Ok((
+            detected_stack.to_string(),
+            stacks.join(format!("{detected_stack}.sh")),
+        ))
     }
 }
 
-fn resolve_stack(app: &str, code_dir: &Path, detected_stack: &str) -> Result<(String, PathBuf), String> {
+fn resolve_stack(
+    app: &str,
+    code_dir: &Path,
+    detected_stack: &str,
+) -> Result<(String, PathBuf), String> {
     resolve_stack_in(app, code_dir, detected_stack, &stacks_dir())
 }
 
@@ -63,11 +76,9 @@ fn checkout_code(app: &str) -> Result<PathBuf, String> {
     let repo_dir = repos_dir().join(format!("{app}.git"));
 
     if build_dir.exists() {
-        fs::remove_dir_all(&build_dir)
-            .map_err(|e| format!("failed to clean build dir: {e}"))?;
+        fs::remove_dir_all(&build_dir).map_err(|e| format!("failed to clean build dir: {e}"))?;
     }
-    fs::create_dir_all(&build_dir)
-        .map_err(|e| format!("failed to create build dir: {e}"))?;
+    fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build dir: {e}"))?;
 
     let status = Command::new("git")
         .args(["clone", "--depth", "1"])
@@ -84,11 +95,14 @@ fn checkout_code(app: &str) -> Result<PathBuf, String> {
 
 fn allocate_port(app: &str) -> u16 {
     // Simple deterministic port allocation based on app name hash
-    let hash: u32 = app.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let hash: u32 = app
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     3001 + (hash % 1000) as u16
 }
 
 pub fn deploy(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
 
     eprintln!("-----> Checking out code");
@@ -98,16 +112,15 @@ pub fn deploy(app: &str) -> Result<(), String> {
 }
 
 pub fn push(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
 
     let code_dir = home_dir().join(app);
 
     if code_dir.exists() {
-        fs::remove_dir_all(&code_dir)
-            .map_err(|e| format!("failed to clean code dir: {e}"))?;
+        fs::remove_dir_all(&code_dir).map_err(|e| format!("failed to clean code dir: {e}"))?;
     }
-    fs::create_dir_all(&code_dir)
-        .map_err(|e| format!("failed to create code dir: {e}"))?;
+    fs::create_dir_all(&code_dir).map_err(|e| format!("failed to create code dir: {e}"))?;
 
     eprintln!("-----> Receiving code");
     let status = Command::new("tar")
@@ -142,7 +155,10 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             .to_string();
         if remote_hash == hash {
             eprintln!("-----> Reusing container");
-            container::exec_cmd(app, "kill $(cat /var/psht/app.pid 2>/dev/null) 2>/dev/null || true")?;
+            container::exec_cmd(
+                app,
+                "kill $(cat /var/psht/app.pid 2>/dev/null) 2>/dev/null || true",
+            )?;
             false
         } else {
             eprintln!("-----> Rebuilding container");
@@ -199,10 +215,12 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
     let start_cmd = format!(
-        "cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
+        "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
         cmd = config.start_command
     );
     container::exec_cmd(app, &start_cmd)?;
+
+    caddy::add(app, port)?;
 
     eprintln!("=====> App {app} deployed on port {port}");
     Ok(())
@@ -223,6 +241,7 @@ pub fn ps() -> Result<(), String> {
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     container::logs(app, follow)
 }
 
@@ -328,8 +347,7 @@ pub fn update() -> Result<(), String> {
 }
 
 fn init_stacks_in(dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(dir)
-        .map_err(|e| format!("failed to create stacks dir: {e}"))?;
+    fs::create_dir_all(dir).map_err(|e| format!("failed to create stacks dir: {e}"))?;
     for (name, content) in STACKS {
         fs::write(dir.join(format!("{name}.sh")), content)
             .map_err(|e| format!("failed to write {name}.sh: {e}"))?;
@@ -417,8 +435,6 @@ elif [[ -n "${{TS_OAUTH_CLIENT_ID:-}}" && -n "${{TS_OAUTH_CLIENT_SECRET:-}}" ]];
 TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
 TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
 EOF
-    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
-    chmod 600 "$OAUTH_CONFIG"
 else
     echo ""
     log "Setting up Tailscale OAuth for container networking"
@@ -448,8 +464,6 @@ else
 TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
 TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
 EOF
-    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
-    chmod 600 "$OAUTH_CONFIG"
 fi
 fi
 
@@ -459,14 +473,6 @@ if [[ "$(realpath "$PSHT_BIN")" != "$(realpath "$INSTALLED_BIN")" ]]; then
     cp "$PSHT_BIN" "$INSTALLED_BIN"
 fi
 chmod 755 "$INSTALLED_BIN"
-
-# Install client CLI binary for scp distribution
-mkdir -p "$PSHT_HOME/bin"
-if [[ -f "$PSHT_DIR/psht-cli" ]]; then
-    cp "$PSHT_DIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
-    chmod 755 "$PSHT_HOME/bin/psht-cli"
-    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
-fi
 
 if ! grep -qx "$INSTALLED_BIN" /etc/shells; then
     log "Adding $INSTALLED_BIN to /etc/shells"
@@ -480,6 +486,20 @@ if ! id "$PSHT_USER" &>/dev/null; then
 else
     log "User $PSHT_USER exists, updating shell"
     chsh -s "$INSTALLED_BIN" "$PSHT_USER"
+fi
+
+# Apply secure ownership once user exists
+if [[ -f "$PSHT_HOME/.config/tailscale-oauth" ]]; then
+    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/.config/tailscale-oauth"
+    chmod 600 "$PSHT_HOME/.config/tailscale-oauth"
+fi
+
+# Install client CLI binary for scp distribution
+mkdir -p "$PSHT_HOME/bin"
+if [[ -f "$PSHT_DIR/psht-cli" ]]; then
+    cp "$PSHT_DIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
+    chmod 755 "$PSHT_HOME/bin/psht-cli"
+    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
 fi
 
 # --- Grant Incus access ---
@@ -545,6 +565,200 @@ pub fn bootstrap() -> Result<(), String> {
     Ok(())
 }
 
+fn upgrade_script() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+PSHT_USER="psht"
+PSHT_HOME="/home/$PSHT_USER"
+
+log() {{ echo "-----> $*"; }}
+err() {{ echo "ERROR: $*" >&2; exit 1; }}
+
+[[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht upgrade"
+
+CURRENT_VERSION="{version}"
+
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+    aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+    *)       err "Unsupported architecture: $ARCH" ;;
+esac
+
+# Fetch latest version from GitHub
+log "Checking for updates"
+LATEST=$(curl -fsSL https://api.github.com/repos/nakajima/psht/releases/latest | grep -o '"tag_name":"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+
+if [[ "$CURRENT_VERSION" == "$LATEST" ]]; then
+    echo "psht $CURRENT_VERSION (up to date)"
+    exit 0
+fi
+
+log "Upgrading psht $CURRENT_VERSION -> $LATEST"
+
+# Set up temp directory with cleanup
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Download both tarballs
+BASE_URL="https://github.com/nakajima/psht/releases/download/v$LATEST"
+log "Downloading psht $LATEST"
+curl -fsSL "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht.tar.gz"
+curl -fsSL "$BASE_URL/psht-cli-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht-cli.tar.gz"
+
+# Extract and install
+tar xzf "$TMPDIR/psht.tar.gz" -C "$TMPDIR"
+tar xzf "$TMPDIR/psht-cli.tar.gz" -C "$TMPDIR"
+
+log "Installing binaries"
+install -m 755 "$TMPDIR/psht" /usr/local/bin/psht
+install -m 755 "$TMPDIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
+chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin/psht-cli"
+
+# Update incus
+log "Updating incus"
+apt-get update -qq && apt-get install -y -qq incus
+
+# Refresh stacks
+log "Refreshing stacks"
+sudo -u "$PSHT_USER" /usr/local/bin/psht init-stacks
+
+echo "=====> psht upgraded to $LATEST"
+"#
+    )
+}
+
+pub fn upgrade_server() -> Result<(), String> {
+    let script = upgrade_script();
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run upgrade: {e}"))?;
+    if !status.success() {
+        return Err("upgrade failed".to_string());
+    }
+    Ok(())
+}
+
+fn doctor_script() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"#!/usr/bin/env bash
+set -uo pipefail
+
+PSHT_USER="psht"
+PSHT_HOME="/home/$PSHT_USER"
+FAILED=0
+
+pass() {{ echo "  [ok] $*"; }}
+fail() {{ echo "  [FAIL] $*"; FAILED=1; }}
+
+check() {{
+    local desc="$1"; shift
+    if "$@" &>/dev/null; then
+        pass "$desc"
+    else
+        fail "$desc"
+    fi
+}}
+
+echo "Installation:"
+check "psht binary at /usr/local/bin/psht" test -x /usr/local/bin/psht
+check "psht-cli binary at \$PSHT_HOME/bin/psht-cli" test -x "$PSHT_HOME/bin/psht-cli"
+INSTALLED_VERSION=$(/usr/local/bin/psht --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
+if [[ "$INSTALLED_VERSION" == "{version}" ]]; then
+    pass "psht version {version}"
+else
+    fail "psht version: expected {version}, got ${{INSTALLED_VERSION:-unknown}}"
+fi
+
+echo ""
+echo "System:"
+check "psht user exists" id psht
+if getent passwd psht | grep -q ":/usr/local/bin/psht$"; then
+    pass "psht user shell is /usr/local/bin/psht"
+else
+    fail "psht user shell is not /usr/local/bin/psht"
+fi
+if grep -qx "/usr/local/bin/psht" /etc/shells 2>/dev/null; then
+    pass "/usr/local/bin/psht listed in /etc/shells"
+else
+    fail "/usr/local/bin/psht not listed in /etc/shells"
+fi
+if id -nG psht 2>/dev/null | grep -qw incus; then
+    pass "psht user in incus group"
+else
+    fail "psht user not in incus group"
+fi
+
+echo ""
+echo "Incus:"
+check "incus installed" command -v incus
+check "incus responsive" incus info
+
+if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
+echo ""
+echo "Tailscale:"
+check "tailscale installed" command -v tailscale
+check "tailscale connected" tailscale status
+if tailscale status --json 2>/dev/null | grep -q '"SSH":true'; then
+    pass "tailscale SSH enabled"
+else
+    fail "tailscale SSH not enabled"
+fi
+if [[ -f "$PSHT_HOME/.config/tailscale-oauth" ]]; then
+    pass "OAuth config exists"
+else
+    fail "OAuth config missing at \$PSHT_HOME/.config/tailscale-oauth"
+fi
+fi
+
+echo ""
+echo "Directories & stacks:"
+check "\$PSHT_HOME/repos exists" test -d "$PSHT_HOME/repos"
+check "\$PSHT_HOME/builds exists" test -d "$PSHT_HOME/builds"
+check "\$PSHT_HOME/stacks exists" test -d "$PSHT_HOME/stacks"
+if ls "$PSHT_HOME/stacks"/*.sh &>/dev/null; then
+    pass "stacks populated"
+else
+    fail "no .sh files in \$PSHT_HOME/stacks"
+fi
+
+echo ""
+if [[ $FAILED -eq 0 ]]; then
+    echo "All checks passed."
+else
+    echo "Some checks failed."
+    exit 1
+fi
+"#
+    )
+}
+
+pub fn doctor() -> Result<(), String> {
+    let script = doctor_script();
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run doctor: {e}"))?;
+    if !status.success() {
+        return Err("doctor checks failed".to_string());
+    }
+    Ok(())
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
@@ -552,6 +766,7 @@ fn hostname() -> String {
 }
 
 pub fn stop(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     if !container::exists(app) {
         return Err(format!("app '{app}' not found"));
     }
@@ -562,6 +777,7 @@ pub fn stop(app: &str) -> Result<(), String> {
 }
 
 pub fn start(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     if !container::exists(app) {
         return Err(format!("app '{app}' not found"));
     }
@@ -572,10 +788,12 @@ pub fn start(app: &str) -> Result<(), String> {
 }
 
 pub fn destroy(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     if !container::exists(app) {
         return Err(format!("app '{app}' not found"));
     }
     eprintln!("-----> Destroying {app}");
+    caddy::remove(app)?;
     container::stop(app)?;
     container::delete(app)?;
     eprintln!("=====> {app} destroyed");
@@ -598,7 +816,10 @@ mod tests {
     fn allocate_port_in_valid_range() {
         for name in &["app1", "app2", "webapp", "api", "test-long-name"] {
             let port = allocate_port(name);
-            assert!(port >= 3001 && port < 4001, "port {port} out of range for {name}");
+            assert!(
+                port >= 3001 && port < 4001,
+                "port {port} out of range for {name}"
+            );
         }
     }
 
@@ -679,24 +900,38 @@ mod tests {
     #[test]
     fn help_text_contains_all_commands() {
         let text = help_text("example.com");
-        let plain: String = text
-            .replace("\x1b[2m", "")
-            .replace("\x1b[0m", "");
-        assert!(plain.contains("ssh psht@example.com setup"), "missing setup");
-        assert!(plain.contains("ssh psht@example.com update"), "missing update");
+        let plain: String = text.replace("\x1b[2m", "").replace("\x1b[0m", "");
+        assert!(
+            plain.contains("ssh psht@example.com setup"),
+            "missing setup"
+        );
+        assert!(
+            plain.contains("ssh psht@example.com update"),
+            "missing update"
+        );
         assert!(plain.contains("ssh psht@example.com ps"), "missing ps");
-        assert!(plain.contains("ssh psht@example.com logs [-f] <app>"), "missing logs");
-        assert!(plain.contains("ssh psht@example.com stop <app>"), "missing stop");
-        assert!(plain.contains("ssh psht@example.com start <app>"), "missing start");
-        assert!(plain.contains("ssh psht@example.com destroy <app>"), "missing destroy");
+        assert!(
+            plain.contains("ssh psht@example.com logs [-f] <app>"),
+            "missing logs"
+        );
+        assert!(
+            plain.contains("ssh psht@example.com stop <app>"),
+            "missing stop"
+        );
+        assert!(
+            plain.contains("ssh psht@example.com start <app>"),
+            "missing start"
+        );
+        assert!(
+            plain.contains("ssh psht@example.com destroy <app>"),
+            "missing destroy"
+        );
     }
 
     #[test]
     fn help_text_mentions_deploy() {
         let text = help_text("example.com");
-        let plain: String = text
-            .replace("\x1b[2m", "")
-            .replace("\x1b[0m", "");
+        let plain: String = text.replace("\x1b[2m", "").replace("\x1b[0m", "");
         assert!(plain.contains("psht deploy"), "missing deploy method");
         assert!(!plain.contains("git push"), "should not mention git push");
     }
@@ -713,10 +948,10 @@ mod tests {
     #[test]
     fn update_script_removes_before_scp() {
         let script = update_script("example.com");
-        let rm_pos = script.find("rm -f \"$PSHT_BIN\"")
+        let rm_pos = script
+            .find("rm -f \"$PSHT_BIN\"")
             .expect("should rm the old binary to avoid ETXTBSY");
-        let scp_pos = script.find("scp ")
-            .expect("should scp the new binary");
+        let scp_pos = script.find("scp ").expect("should scp the new binary");
         assert!(rm_pos < scp_pos, "rm must come before scp");
     }
 
@@ -899,20 +1134,32 @@ mod tests {
     fn bootstrap_script_does_not_install_rust() {
         let script = bootstrap_script();
         assert!(!script.contains("rustup"), "should not install rustup");
-        assert!(!script.contains("cargo build"), "should not run cargo build");
+        assert!(
+            !script.contains("cargo build"),
+            "should not run cargo build"
+        );
     }
 
     #[test]
     fn bootstrap_script_calls_init_stacks() {
         let script = bootstrap_script();
-        assert!(script.contains("psht init-stacks"), "should call psht init-stacks");
+        assert!(
+            script.contains("psht init-stacks"),
+            "should call psht init-stacks"
+        );
     }
 
     #[test]
     fn bootstrap_script_verifies_psht_in_path() {
         let script = bootstrap_script();
-        assert!(script.contains("command -v psht"), "should check psht is in PATH");
-        assert!(script.contains("psht not found"), "should error if psht not found");
+        assert!(
+            script.contains("command -v psht"),
+            "should check psht is in PATH"
+        );
+        assert!(
+            script.contains("psht not found"),
+            "should error if psht not found"
+        );
     }
 
     #[test]
@@ -924,14 +1171,18 @@ mod tests {
         );
         // Tailscale SSH block is guarded
         assert!(
-            script.contains(r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
-if ! command -v tailscale"#),
+            script.contains(
+                r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
+if ! command -v tailscale"#
+            ),
             "Tailscale SSH checks should be guarded"
         );
         // Tailscale OAuth block is guarded
         assert!(
-            script.contains(r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
-OAUTH_CONFIG"#),
+            script.contains(
+                r#"if [[ -z "${PSHT_SKIP_TAILSCALE:-}" ]]; then
+OAUTH_CONFIG"#
+            ),
             "Tailscale OAuth block should be guarded"
         );
         // Done banner falls back to hostname when skipped
@@ -942,15 +1193,275 @@ OAUTH_CONFIG"#),
     }
 
     #[test]
+    fn bootstrap_script_creates_user_before_first_chown() {
+        let script = bootstrap_script();
+        let create_user_pos = script
+            .find("# --- Create psht user ---")
+            .expect("should have user creation block");
+        let first_chown_pos = script
+            .find("chown \"$PSHT_USER:$PSHT_USER\"")
+            .expect("should have at least one chown");
+        assert!(
+            create_user_pos < first_chown_pos,
+            "user creation must happen before any chown"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_checks_root() {
+        let script = upgrade_script();
+        assert!(script.contains("EUID -eq 0"), "should check for root");
+    }
+
+    #[test]
+    fn upgrade_script_embeds_current_version() {
+        let script = upgrade_script();
+        assert!(
+            script.contains(env!("CARGO_PKG_VERSION")),
+            "should embed the current version"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_detects_architecture() {
+        let script = upgrade_script();
+        assert!(script.contains("uname -m"), "should detect architecture");
+        assert!(
+            script.contains("x86_64-unknown-linux-gnu"),
+            "should map x86_64"
+        );
+        assert!(
+            script.contains("aarch64-unknown-linux-gnu"),
+            "should map aarch64"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_fetches_latest_version() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("api.github.com/repos/nakajima/psht/releases/latest"),
+            "should fetch latest release from GitHub"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_skips_if_up_to_date() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("up to date"),
+            "should skip if already on latest version"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_downloads_both_binaries() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("psht-cli-"),
+            "should download psht-cli tarball"
+        );
+        // The psht tarball (not psht-cli) should also be downloaded
+        let has_psht_download = script.contains("psht-$") || script.contains("psht-${");
+        assert!(has_psht_download, "should download psht tarball");
+    }
+
+    #[test]
+    fn upgrade_script_installs_to_correct_paths() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("/usr/local/bin/psht"),
+            "should install psht to /usr/local/bin/psht"
+        );
+        assert!(
+            script.contains("$PSHT_HOME/bin/psht-cli"),
+            "should install psht-cli to $PSHT_HOME/bin/psht-cli"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_updates_incus() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("apt-get install") && script.contains("incus"),
+            "should update incus via apt"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_refreshes_stacks() {
+        let script = upgrade_script();
+        assert!(script.contains("psht init-stacks"), "should refresh stacks");
+    }
+
+    #[test]
+    fn upgrade_script_cleans_up_tempdir() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("mktemp -d"),
+            "should create a temp directory"
+        );
+        assert!(
+            script.contains("trap") && script.contains("rm -rf"),
+            "should clean up temp directory on exit"
+        );
+    }
+
+    #[test]
+    fn doctor_script_does_not_require_root() {
+        let script = doctor_script();
+        assert!(
+            !script.contains("EUID -eq 0"),
+            "doctor should not require root"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_psht_binary() {
+        let script = doctor_script();
+        assert!(
+            script.contains("/usr/local/bin/psht"),
+            "should check psht binary"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_psht_cli_binary() {
+        let script = doctor_script();
+        assert!(script.contains("psht-cli"), "should check psht-cli binary");
+    }
+
+    #[test]
+    fn doctor_script_embeds_current_version() {
+        let script = doctor_script();
+        assert!(
+            script.contains(env!("CARGO_PKG_VERSION")),
+            "should embed the current version"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_psht_user() {
+        let script = doctor_script();
+        assert!(script.contains("id psht"), "should check psht user exists");
+    }
+
+    #[test]
+    fn doctor_script_checks_user_shell() {
+        let script = doctor_script();
+        assert!(
+            script.contains("getent passwd psht"),
+            "should check psht user shell"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_etc_shells() {
+        let script = doctor_script();
+        assert!(script.contains("/etc/shells"), "should check /etc/shells");
+    }
+
+    #[test]
+    fn doctor_script_checks_incus_group() {
+        let script = doctor_script();
+        assert!(
+            script.contains("id -nG psht"),
+            "should check incus group membership"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_incus_installed() {
+        let script = doctor_script();
+        assert!(
+            script.contains("command -v incus"),
+            "should check incus is installed"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_incus_responsive() {
+        let script = doctor_script();
+        assert!(
+            script.contains("incus info"),
+            "should check incus is responsive"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_tailscale() {
+        let script = doctor_script();
+        assert!(
+            script.contains("PSHT_SKIP_TAILSCALE"),
+            "tailscale checks should be guarded by PSHT_SKIP_TAILSCALE"
+        );
+        assert!(
+            script.contains("command -v tailscale"),
+            "should check tailscale is installed"
+        );
+        assert!(
+            script.contains("tailscale status"),
+            "should check tailscale is connected"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_directories() {
+        let script = doctor_script();
+        assert!(
+            script.contains("$PSHT_HOME/repos"),
+            "should check repos dir"
+        );
+        assert!(
+            script.contains("$PSHT_HOME/builds"),
+            "should check builds dir"
+        );
+        assert!(
+            script.contains("$PSHT_HOME/stacks"),
+            "should check stacks dir"
+        );
+    }
+
+    #[test]
+    fn doctor_script_checks_stacks() {
+        let script = doctor_script();
+        assert!(script.contains(".sh"), "should check for stack scripts");
+    }
+
+    #[test]
+    fn doctor_script_exits_nonzero_on_failure() {
+        let script = doctor_script();
+        assert!(
+            script.contains("exit 1"),
+            "should exit non-zero when checks fail"
+        );
+    }
+
+    #[test]
+    fn command_entrypoints_reject_invalid_app_name() {
+        for result in [
+            deploy("bad/name"),
+            push("bad/name"),
+            logs("bad/name", false),
+            stop("bad/name"),
+            start("bad/name"),
+            destroy("bad/name"),
+        ] {
+            let err = result.expect_err("should reject invalid app name");
+            assert!(err.contains("invalid app name"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
     fn start_cmd_backgrounds_with_pid_file() {
         // The start command must use { } grouping so only nohup is backgrounded,
         // and echo writes the pid synchronously before the group exits.
         let cmd = format!(
-            "cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
+            "mkdir -p /var/psht && cd /app && {{ PORT={port} nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}",
             port = 3737,
             cmd = "bun run index.ts"
         );
-        assert!(cmd.starts_with("cd /app && {"));
+        assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && {"));
         assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
     }
 }

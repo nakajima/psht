@@ -74,8 +74,8 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
 
     for (file, app_type) in markers {
         if dir.join(file).exists() {
-            let start = start_command
-                .unwrap_or_else(|| app_type.default_start_command().to_string());
+            let start =
+                start_command.unwrap_or_else(|| app_type.default_start_command().to_string());
             let install = match app_type {
                 AppType::Bun if !dir.join("package.json").exists() => "",
                 _ => app_type.install_command(),
@@ -232,7 +232,10 @@ mod tests {
     fn install_command_for_each_type() {
         assert!(AppType::Bun.install_command().contains("bun install"));
         assert_eq!(AppType::Node.install_command(), "npm install");
-        assert_eq!(AppType::Python.install_command(), "pip install -r requirements.txt");
+        assert_eq!(
+            AppType::Python.install_command(),
+            "pip install -r requirements.txt"
+        );
         assert_eq!(AppType::Rust.install_command(), "cargo build --release");
         assert_eq!(AppType::Go.install_command(), "go build -o app .");
         assert_eq!(AppType::Static.install_command(), "");

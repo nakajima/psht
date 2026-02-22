@@ -71,8 +71,6 @@ elif [[ -n "${TS_OAUTH_CLIENT_ID:-}" && -n "${TS_OAUTH_CLIENT_SECRET:-}" ]]; the
 TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
 TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
 EOF
-    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
-    chmod 600 "$OAUTH_CONFIG"
 else
     echo ""
     log "Setting up Tailscale OAuth for container networking"
@@ -102,8 +100,6 @@ else
 TS_OAUTH_CLIENT_ID=$TS_OAUTH_CLIENT_ID
 TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
 EOF
-    chown "$PSHT_USER:$PSHT_USER" "$OAUTH_CONFIG"
-    chmod 600 "$OAUTH_CONFIG"
 fi
 
 # --- Build psht ---
@@ -116,12 +112,6 @@ PSHT_BIN="$SCRIPT_DIR/target/release/psht"
 INSTALLED_BIN="/usr/local/bin/psht"
 cp "$PSHT_BIN" "$INSTALLED_BIN"
 chmod 755 "$INSTALLED_BIN"
-
-# Install client CLI binary for scp distribution
-mkdir -p "$PSHT_HOME/bin"
-cp "$SCRIPT_DIR/target/release/psht-cli" "$PSHT_HOME/bin/psht-cli"
-chmod 755 "$PSHT_HOME/bin/psht-cli"
-chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
 
 if ! grep -qx "$INSTALLED_BIN" /etc/shells; then
     log "Adding $INSTALLED_BIN to /etc/shells"
@@ -136,6 +126,17 @@ else
     log "User $PSHT_USER exists, updating shell"
     chsh -s "$INSTALLED_BIN" "$PSHT_USER"
 fi
+
+if [[ -f "$PSHT_HOME/.config/tailscale-oauth" ]]; then
+    chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/.config/tailscale-oauth"
+    chmod 600 "$PSHT_HOME/.config/tailscale-oauth"
+fi
+
+# Install client CLI binary for scp distribution
+mkdir -p "$PSHT_HOME/bin"
+cp "$SCRIPT_DIR/target/release/psht-cli" "$PSHT_HOME/bin/psht-cli"
+chmod 755 "$PSHT_HOME/bin/psht-cli"
+chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
 
 # --- Grant Incus access ---
 log "Adding $PSHT_USER to incus group"

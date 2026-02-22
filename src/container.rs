@@ -39,7 +39,8 @@ impl IncusCommand {
 
     fn run(self) -> Result<(), String> {
         let args_display = self.args.join(" ");
-        let status = self.build()
+        let status = self
+            .build()
             .status()
             .map_err(|e| format!("failed to run incus {args_display}: {e}"))?;
         if !status.success() {
@@ -50,7 +51,8 @@ impl IncusCommand {
 
     fn output(self) -> Result<String, String> {
         let args_display = self.args.join(" ");
-        let output = self.build()
+        let output = self
+            .build()
             .output()
             .map_err(|e| format!("failed to run incus {args_display}: {e}"))?;
         if !output.status.success() {
@@ -62,15 +64,20 @@ impl IncusCommand {
 
     fn run_rolling(self, window: usize) -> Result<(), String> {
         let args_display = self.args.join(" ");
-        let mut child = self.build()
+        let mut child = self
+            .build()
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("failed to run incus {args_display}: {e}"))?;
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| "failed to capture stdout".to_string())?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| "failed to capture stderr".to_string())?;
 
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -112,10 +119,15 @@ impl IncusCommand {
             drawn_lines = ring.len();
         }
 
-        stdout_thread.join().map_err(|_| "stdout reader panicked".to_string())?;
-        stderr_thread.join().map_err(|_| "stderr reader panicked".to_string())?;
+        stdout_thread
+            .join()
+            .map_err(|_| "stdout reader panicked".to_string())?;
+        stderr_thread
+            .join()
+            .map_err(|_| "stderr reader panicked".to_string())?;
 
-        let status = child.wait()
+        let status = child
+            .wait()
             .map_err(|e| format!("failed to wait for incus {args_display}: {e}"))?;
 
         if status.success() {
@@ -173,7 +185,9 @@ pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to tar code: {e}"))?;
-    let stdin = tar.stdout.take()
+    let stdin = tar
+        .stdout
+        .take()
         .ok_or_else(|| "failed to capture tar stdout".to_string())?;
     let status = Command::new("incus")
         .arg("exec")
@@ -245,7 +259,11 @@ pub fn delete(app: &str) -> Result<(), String> {
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
-    let cmd = if follow { "tail -f /var/psht/app.log" } else { "cat /var/psht/app.log" };
+    let cmd = if follow {
+        "tail -f /var/psht/app.log"
+    } else {
+        "cat /var/psht/app.log"
+    };
     incus()
         .arg("exec")
         .arg(container_name(app))
@@ -331,7 +349,14 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec!["exec", "psht-myapp", "--", "sh", "-c", "cat /var/psht/app.log"]
+            vec![
+                "exec",
+                "psht-myapp",
+                "--",
+                "sh",
+                "-c",
+                "cat /var/psht/app.log"
+            ]
         );
     }
 
@@ -346,7 +371,14 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec!["exec", "psht-myapp", "--", "sh", "-c", "tail -f /var/psht/app.log"]
+            vec![
+                "exec",
+                "psht-myapp",
+                "--",
+                "sh",
+                "-c",
+                "tail -f /var/psht/app.log"
+            ]
         );
     }
 
@@ -357,10 +389,7 @@ mod tests {
             .arg("psht-myapp")
             .build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
-        assert_eq!(
-            args,
-            vec!["launch", "images:ubuntu/24.04", "psht-myapp"]
-        );
+        assert_eq!(args, vec!["launch", "images:ubuntu/24.04", "psht-myapp"]);
         assert_eq!(cmd.get_program(), "incus");
     }
 
@@ -434,7 +463,14 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec!["exec", "psht-myapp", "--", "sh", "-c", "cat /etc/psht-setup-hash"]
+            vec![
+                "exec",
+                "psht-myapp",
+                "--",
+                "sh",
+                "-c",
+                "cat /etc/psht-setup-hash"
+            ]
         );
     }
 
@@ -504,10 +540,7 @@ mod tests {
     #[test]
     fn image_exists_command_builds_correctly() {
         let alias = stack_image_alias("node", "abc123");
-        let cmd = incus()
-            .args(&["image", "info"])
-            .arg(&alias)
-            .build();
+        let cmd = incus().args(&["image", "info"]).arg(&alias).build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec!["image", "info", "psht-stack-node-abc123"]);
     }
@@ -516,16 +549,9 @@ mod tests {
     fn create_from_image_command_builds_correctly() {
         let alias = stack_image_alias("node", "abc123");
         let name = container_name("myapp");
-        let cmd = incus()
-            .arg("launch")
-            .arg(&alias)
-            .arg(&name)
-            .build();
+        let cmd = incus().arg("launch").arg(&alias).arg(&name).build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
-        assert_eq!(
-            args,
-            vec!["launch", "psht-stack-node-abc123", "psht-myapp"]
-        );
+        assert_eq!(args, vec!["launch", "psht-stack-node-abc123", "psht-myapp"]);
     }
 
     #[test]
@@ -578,10 +604,7 @@ mod tests {
 
     #[test]
     fn incus_start_command_builds_correctly() {
-        let cmd = incus()
-            .arg("start")
-            .arg(container_name("myapp"))
-            .build();
+        let cmd = incus().arg("start").arg(container_name("myapp")).build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec!["start", "psht-myapp"]);
     }

@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process;
 
+use crate::app_name;
+
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
@@ -17,6 +19,7 @@ pub fn ensure_repo(app: &str) -> Result<PathBuf, String> {
 }
 
 fn ensure_repo_in(app: &str, base: &PathBuf) -> Result<PathBuf, String> {
+    app_name::validate_app_name(app)?;
     let path = base.join(format!("{app}.git"));
     if !path.exists() {
         fs::create_dir_all(&path).map_err(|e| format!("failed to create repo dir: {e}"))?;
@@ -35,8 +38,7 @@ fn ensure_repo_in(app: &str, base: &PathBuf) -> Result<PathBuf, String> {
 
 fn install_hook_at(app: &str, repo: &PathBuf) -> Result<(), String> {
     let hook_dir = repo.join("hooks");
-    fs::create_dir_all(&hook_dir)
-        .map_err(|e| format!("failed to create hooks dir: {e}"))?;
+    fs::create_dir_all(&hook_dir).map_err(|e| format!("failed to create hooks dir: {e}"))?;
     let hook_path = hook_dir.join("post-receive");
     let current_exe = env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
@@ -50,8 +52,7 @@ fn install_hook_at(app: &str, repo: &PathBuf) -> Result<(), String> {
         }
     }
 
-    fs::write(&hook_path, &hook_content)
-        .map_err(|e| format!("failed to write hook: {e}"))?;
+    fs::write(&hook_path, &hook_content).map_err(|e| format!("failed to write hook: {e}"))?;
     fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("failed to set hook permissions: {e}"))?;
     Ok(())
@@ -113,5 +114,14 @@ mod tests {
         assert!(content.starts_with("#!/bin/sh"));
         let perms = fs::metadata(&hook_path).unwrap().permissions();
         assert_ne!(perms.mode() & 0o111, 0, "hook should be executable");
+    }
+
+    #[test]
+    fn ensure_repo_rejects_invalid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        fs::create_dir_all(&repos).unwrap();
+        let err = ensure_repo_in("bad/name", &repos).unwrap_err();
+        assert!(err.contains("invalid app name"));
     }
 }

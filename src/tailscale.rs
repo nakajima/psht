@@ -11,9 +11,8 @@ fn credentials_path() -> PathBuf {
 }
 
 fn read_credentials_from(path: &std::path::Path) -> Result<(String, String), String> {
-    let contents = fs::read_to_string(path).map_err(|_| {
-        "tailscale OAuth not configured — run bootstrap.sh".to_string()
-    })?;
+    let contents = fs::read_to_string(path)
+        .map_err(|_| "tailscale OAuth not configured — run bootstrap.sh".to_string())?;
 
     let mut client_id = None;
     let mut client_secret = None;
@@ -62,8 +61,8 @@ fn parse_self_dns_name(json: &str) -> Option<String> {
 }
 
 fn parse_auth_key(json: &str) -> Result<String, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("failed to parse auth key response: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("failed to parse auth key response: {e}"))?;
     value["key"]
         .as_str()
         .map(|s| s.to_string())
@@ -73,7 +72,10 @@ fn parse_auth_key(json: &str) -> Result<String, String> {
 pub fn oauth_token(client_id: &str, client_secret: &str) -> Result<String, String> {
     let output = Command::new("curl")
         .args(["-s", "-X", "POST"])
-        .args(["-d", &format!("client_id={client_id}&client_secret={client_secret}")])
+        .args([
+            "-d",
+            &format!("client_id={client_id}&client_secret={client_secret}"),
+        ])
         .arg("https://api.tailscale.com/api/v2/oauth/token")
         .output()
         .map_err(|e| format!("failed to request OAuth token: {e}"))?;
@@ -138,7 +140,10 @@ pub fn install_in_container(app: &str) -> Result<(), String> {
 pub fn join_in_container(app: &str) -> Result<(), String> {
     let key = auth_key()?;
     container::exec_cmd(app, "systemctl start tailscaled")?;
-    container::exec_cmd(app, &format!("tailscale up --auth-key {key} --hostname {app} --ssh"))?;
+    container::exec_cmd(
+        app,
+        &format!("tailscale up --auth-key {key} --hostname {app} --ssh"),
+    )?;
 
     let ts_hostname = container::exec_output(app, "tailscale status --json")
         .ok()
@@ -271,7 +276,8 @@ mod tests {
 
     #[test]
     fn parse_self_dns_name_from_status() {
-        let json = r#"{"Self":{"DNSName":"psht-test.tail1234.ts.net.","TailscaleIPs":["100.64.0.1"]}}"#;
+        let json =
+            r#"{"Self":{"DNSName":"psht-test.tail1234.ts.net.","TailscaleIPs":["100.64.0.1"]}}"#;
         let name = parse_self_dns_name(json).unwrap();
         assert_eq!(name, "psht-test.tail1234.ts.net");
     }

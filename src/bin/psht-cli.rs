@@ -6,6 +6,9 @@ use std::process::Command;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+#[path = "../app_name.rs"]
+mod app_name;
+
 #[derive(Parser)]
 #[command(name = "psht", about = "deploy apps with psht", version)]
 struct Cli {
@@ -116,8 +119,7 @@ fn deploy(host: &str, app: &str) -> Result<(), String> {
 
 fn save_config(config: &Config, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {e}"))?;
     }
     let content =
         toml::to_string_pretty(config).map_err(|e| format!("failed to serialize config: {e}"))?;
@@ -155,20 +157,34 @@ fn setup_project_in(host: &str, cwd: &Path, config_path: &Path) -> Result<(), St
 }
 
 fn update(host: &str) -> Result<(), String> {
-    let ssh = Command::new("ssh")
+    let mut ssh = Command::new("ssh")
         .arg(format!("psht@{host}"))
         .arg("update")
         .stdout(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run ssh: {e}"))?;
-    let stdin = ssh.stdout.ok_or_else(|| "failed to capture ssh stdout".to_string())?;
-    let status = Command::new("sh")
+    let stdin = ssh
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture ssh stdout".to_string())?;
+    let script_status = Command::new("sh")
         .stdin(stdin)
         .stderr(std::process::Stdio::inherit())
         .status()
         .map_err(|e| format!("failed to run update script: {e}"))?;
-    if !status.success() {
-        return Err("update failed".to_string());
+    let ssh_status = ssh
+        .wait()
+        .map_err(|e| format!("failed to wait for ssh: {e}"))?;
+
+    check_update_pipeline_status(script_status.success(), ssh_status.success())
+}
+
+fn check_update_pipeline_status(script_success: bool, ssh_success: bool) -> Result<(), String> {
+    if !script_success {
+        return Err("update failed while running installer script".to_string());
+    }
+    if !ssh_success {
+        return Err("update failed while fetching installer script over ssh".to_string());
     }
     Ok(())
 }
@@ -188,6 +204,7 @@ fn run() -> Result<(), String> {
         CliCommand::Deploy { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             let name = app_name(app.as_deref(), &cwd);
+            app_name::validate_app_name(&name)?;
             deploy(&host, &name)
         }
         CliCommand::Ps => {
@@ -196,6 +213,7 @@ fn run() -> Result<(), String> {
         }
         CliCommand::Logs { app, follow } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            app_name::validate_app_name(&app)?;
             if follow {
                 ssh_cmd(&host, &["logs", "-f", &app])
             } else {
@@ -204,10 +222,12 @@ fn run() -> Result<(), String> {
         }
         CliCommand::Stop { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            app_name::validate_app_name(&app)?;
             ssh_cmd(&host, &["stop", &app])
         }
         CliCommand::Destroy { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            app_name::validate_app_name(&app)?;
             ssh_cmd(&host, &["destroy", &app])
         }
         CliCommand::Update => {
@@ -290,6 +310,23 @@ mod tests {
         };
         let result = resolve_host_from(&config, "/some/dir");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_pipeline_status_ok_when_both_succeed() {
+        assert!(check_update_pipeline_status(true, true).is_ok());
+    }
+
+    #[test]
+    fn update_pipeline_status_fails_when_script_fails() {
+        let err = check_update_pipeline_status(false, true).unwrap_err();
+        assert!(err.contains("installer script"));
+    }
+
+    #[test]
+    fn update_pipeline_status_fails_when_ssh_fails() {
+        let err = check_update_pipeline_status(true, false).unwrap_err();
+        assert!(err.contains("over ssh"));
     }
 
     #[test]
