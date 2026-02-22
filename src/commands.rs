@@ -955,6 +955,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
     let hash = stack_hash(&script_path)?;
 
+    let mut tailnet_hostname = tailscale::dns_name_in_container(app);
     let needs_setup = if container::exists(app) {
         let remote_hash = container::exec_output(app, "cat /etc/psht-setup-hash 2>/dev/null")
             .unwrap_or_default()
@@ -1004,7 +1005,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
         container::exec_cmd(app, &format!("echo -n '{hash}' > /etc/psht-setup-hash"))?;
 
         eprintln!("-----> Connecting to tailnet");
-        tailscale::join_in_container(app)?;
+        tailnet_hostname = tailscale::join_in_container(app)?;
 
         let port = allocate_port(app);
         eprintln!("-----> Setting up port forwarding on :{port}");
@@ -1027,8 +1028,18 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     );
     container::exec_cmd(app, &start_cmd)?;
 
+    tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
+    if tailnet_hostname.is_some() {
+        if let Err(e) = tailscale::expose_http_in_container(app, port) {
+            eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+        }
+    }
+
     caddy::add(app, port)?;
 
+    if let Some(name) = tailnet_hostname {
+        eprintln!("       Tailnet: http://{name} (also http://{name}:{port})");
+    }
     eprintln!("=====> App {app} deployed on port {port}");
     Ok(())
 }

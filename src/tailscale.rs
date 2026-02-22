@@ -137,7 +137,13 @@ pub fn install_in_container(app: &str) -> Result<(), String> {
     container::exec_cmd(app, "systemctl enable tailscaled")
 }
 
-pub fn join_in_container(app: &str) -> Result<(), String> {
+pub fn dns_name_in_container(app: &str) -> Option<String> {
+    container::exec_output(app, "tailscale status --json")
+        .ok()
+        .and_then(|json| parse_self_dns_name(&json))
+}
+
+pub fn join_in_container(app: &str) -> Result<Option<String>, String> {
     let key = auth_key()?;
     container::exec_cmd(app, "systemctl start tailscaled")?;
     container::exec_cmd(
@@ -145,15 +151,26 @@ pub fn join_in_container(app: &str) -> Result<(), String> {
         &format!("tailscale up --auth-key {key} --hostname {app} --ssh"),
     )?;
 
-    let ts_hostname = container::exec_output(app, "tailscale status --json")
-        .ok()
-        .and_then(|json| parse_self_dns_name(&json));
+    let ts_hostname = dns_name_in_container(app);
     match ts_hostname {
-        Some(name) => eprintln!("       Joined tailnet as {name}"),
+        Some(ref name) => eprintln!("       Joined tailnet as {name}"),
         None => eprintln!("       Joined tailnet"),
     }
 
-    Ok(())
+    Ok(ts_hostname)
+}
+
+fn serve_http_command(port: u16) -> String {
+    format!(
+        "tailscale serve --bg --http=80 http://127.0.0.1:{port} >/dev/null 2>&1 || \
+tailscale serve --bg --http=80 / http://127.0.0.1:{port} >/dev/null 2>&1 || \
+tailscale serve --bg http://127.0.0.1:{port} >/dev/null 2>&1 || \
+tailscale serve --bg {port}"
+    )
+}
+
+pub fn expose_http_in_container(app: &str, port: u16) -> Result<(), String> {
+    container::exec_cmd(app, &serve_http_command(port))
 }
 
 #[cfg(test)]
@@ -293,5 +310,19 @@ mod tests {
     fn parse_self_dns_name_missing_self() {
         let json = r#"{"Version":"1.0"}"#;
         assert!(parse_self_dns_name(json).is_none());
+    }
+
+    #[test]
+    fn serve_http_command_includes_expected_port_and_fallbacks() {
+        let cmd = serve_http_command(3233);
+        assert!(
+            cmd.contains("--http=80"),
+            "should attempt explicit port 80 mapping"
+        );
+        assert!(
+            cmd.contains("http://127.0.0.1:3233"),
+            "should map to localhost app port"
+        );
+        assert!(cmd.contains("tailscale serve --bg 3233"), "should fallback");
     }
 }
