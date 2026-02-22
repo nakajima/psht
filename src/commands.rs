@@ -24,7 +24,7 @@ const STACKS: &[(&str, &str)] = &[
     ("static", include_str!("../stacks/static.sh")),
 ];
 
-const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
+const DEFAULT_FORGE_URL: &str = "https://git.fishmt.net/nakajima/psht";
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -1502,13 +1502,29 @@ case "$ARCH" in
     *)       err "Unsupported architecture: $ARCH" ;;
 esac
 
-# Fetch latest version from forge releases page redirect.
+# Resolve latest version from forge.
 log "Checking for updates"
-LATEST_URL=$(curl -fsSL -o /dev/null -w '%{{url_effective}}' "$FORGE_URL/releases/latest")
-LATEST_TAG="${{LATEST_URL##*/}}"
-LATEST_TAG="${{LATEST_TAG%%\?*}}"
-LATEST="${{LATEST_TAG#v}}"
-[[ -n "$LATEST" && "$LATEST" != "latest" ]] || err "Failed to resolve latest release from $LATEST_URL"
+LATEST=""
+LATEST_URL=$(curl -fsSL -o /dev/null -w '%{{url_effective}}' "$FORGE_URL/releases/latest" 2>/dev/null || true)
+if [[ -n "$LATEST_URL" ]]; then
+    LATEST_TAG="${{LATEST_URL##*/}}"
+    LATEST_TAG="${{LATEST_TAG%%\?*}}"
+    if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "latest" ]]; then
+        LATEST="${{LATEST_TAG#v}}"
+    fi
+fi
+
+if [[ -z "$LATEST" ]]; then
+    REPO_PATH=$(echo "$FORGE_URL" | sed -E 's#https?://[^/]+/##')
+    if [[ -n "$REPO_PATH" && "$REPO_PATH" != "$FORGE_URL" ]]; then
+        LATEST_API=$(curl -fsSL "$FORGE_URL/api/v1/repos/$REPO_PATH/releases/latest" 2>/dev/null || true)
+        if [[ -n "$LATEST_API" ]]; then
+            LATEST=$(echo "$LATEST_API" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | cut -d'"' -f4 | sed 's/^v//')
+        fi
+    fi
+fi
+
+[[ -n "$LATEST" ]] || err "Failed to resolve latest release from $FORGE_URL (tried /releases/latest and /api/v1/repos/.../releases/latest)"
 
 if [[ "$CURRENT_VERSION" == "$LATEST" ]]; then
     echo "psht $CURRENT_VERSION (up to date)"
@@ -2261,8 +2277,12 @@ devices:
     fn upgrade_script_fetches_latest_version() {
         let script = upgrade_script();
         assert!(
-            script.contains("LATEST_URL=$(curl -fsSL -o /dev/null -w '%{url_effective}' \"$FORGE_URL/releases/latest\")"),
-            "should resolve latest release via forge latest redirect"
+            script.contains("LATEST_URL=$(curl -fsSL -o /dev/null -w '%{url_effective}' \"$FORGE_URL/releases/latest\" 2>/dev/null || true)"),
+            "should try latest release redirect first"
+        );
+        assert!(
+            script.contains("$FORGE_URL/api/v1/repos/$REPO_PATH/releases/latest"),
+            "should fallback to forge API latest endpoint"
         );
     }
 
