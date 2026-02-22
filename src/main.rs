@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "psht",
+    name = "psht-server",
     about = "psht server commands",
     version,
     arg_required_else_help = true
@@ -74,9 +74,9 @@ fn strip_git_suffix(name: &str) -> String {
 fn cli_from_env() -> Result<Cli, String> {
     let args: Vec<String> = env::args().collect();
 
-    // SSH login shell: psht -c "command args"
+    // SSH login shell: psht-server -c "command args"
     if args.len() == 3 && args[1] == "-c" {
-        let mut synthetic = vec!["psht".to_string()];
+        let mut synthetic = vec!["psht-server".to_string()];
         synthetic.extend(
             shell_words::split(&args[2]).map_err(|e| format!("failed to parse command: {e}"))?,
         );
@@ -86,7 +86,7 @@ fn cli_from_env() -> Result<Cli, String> {
     // SSH_ORIGINAL_COMMAND
     if args.len() == 1 {
         if let Ok(ssh_cmd) = env::var("SSH_ORIGINAL_COMMAND") {
-            let mut synthetic = vec!["psht".to_string()];
+            let mut synthetic = vec!["psht-server".to_string()];
             synthetic.extend(
                 shell_words::split(&ssh_cmd)
                     .map_err(|e| format!("failed to parse command: {e}"))?,
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn parse_git_receive_pack() {
-        let cli = parse_cli(&["psht", "git-receive-pack", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "git-receive-pack", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::GitReceivePack {
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn parse_git_receive_pack_with_git_suffix() {
-        let cli = parse_cli(&["psht", "git-receive-pack", "myapp.git"]).unwrap();
+        let cli = parse_cli(&["psht-server", "git-receive-pack", "myapp.git"]).unwrap();
         assert_eq!(
             cli.command,
             Command::GitReceivePack {
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn parse_git_upload_pack() {
-        let cli = parse_cli(&["psht", "git-upload-pack", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "git-upload-pack", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::GitUploadPack {
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn parse_deploy() {
-        let cli = parse_cli(&["psht", "deploy", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "deploy", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Deploy {
@@ -216,13 +216,13 @@ mod tests {
 
     #[test]
     fn parse_ps() {
-        let cli = parse_cli(&["psht", "ps"]).unwrap();
+        let cli = parse_cli(&["psht-server", "ps"]).unwrap();
         assert_eq!(cli.command, Command::Ps);
     }
 
     #[test]
     fn parse_logs() {
-        let cli = parse_cli(&["psht", "logs", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "logs", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Logs {
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn parse_logs_follow() {
-        let cli = parse_cli(&["psht", "logs", "-f", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "logs", "-f", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Logs {
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn parse_stop() {
-        let cli = parse_cli(&["psht", "stop", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "stop", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Stop {
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn parse_start() {
-        let cli = parse_cli(&["psht", "start", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "start", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Start {
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn parse_destroy() {
-        let cli = parse_cli(&["psht", "destroy", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "destroy", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Destroy {
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn parse_push() {
-        let cli = parse_cli(&["psht", "push", "myapp"]).unwrap();
+        let cli = parse_cli(&["psht-server", "push", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Push {
@@ -290,50 +290,50 @@ mod tests {
 
     #[test]
     fn parse_setup() {
-        let cli = parse_cli(&["psht", "setup"]).unwrap();
+        let cli = parse_cli(&["psht-server", "setup"]).unwrap();
         assert_eq!(cli.command, Command::Setup);
     }
 
     #[test]
     fn parse_init_stacks() {
-        let cli = parse_cli(&["psht", "init-stacks"]).unwrap();
+        let cli = parse_cli(&["psht-server", "init-stacks"]).unwrap();
         assert_eq!(cli.command, Command::InitStacks);
     }
 
     #[test]
     fn parse_print_cli() {
-        let cli = parse_cli(&["psht", "print-cli"]).unwrap();
+        let cli = parse_cli(&["psht-server", "print-cli"]).unwrap();
         assert_eq!(cli.command, Command::PrintCli);
     }
 
     #[test]
     fn parse_bootstrap() {
-        let cli = parse_cli(&["psht", "bootstrap"]).unwrap();
+        let cli = parse_cli(&["psht-server", "bootstrap"]).unwrap();
         assert_eq!(cli.command, Command::Bootstrap);
     }
 
     #[test]
     fn parse_upgrade() {
-        let cli = parse_cli(&["psht", "upgrade"]).unwrap();
+        let cli = parse_cli(&["psht-server", "upgrade"]).unwrap();
         assert_eq!(cli.command, Command::Upgrade);
     }
 
     #[test]
     fn parse_doctor() {
-        let cli = parse_cli(&["psht", "doctor"]).unwrap();
+        let cli = parse_cli(&["psht-server", "doctor"]).unwrap();
         assert_eq!(cli.command, Command::Doctor);
     }
 
     #[test]
     fn parse_unknown_command() {
-        let result = parse_cli(&["psht", "wat"]);
+        let result = parse_cli(&["psht-server", "wat"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_shell_dash_c_ps() {
-        // Simulates: psht -c "ps" — shell_words splits "ps" into ["ps"]
-        let mut synthetic = vec!["psht".to_string()];
+        // Simulates: psht-server -c "ps" (shell_words splits "ps" into ["ps"])
+        let mut synthetic = vec!["psht-server".to_string()];
         synthetic.extend(shell_words::split("ps").unwrap());
         let cli = Cli::try_parse_from(synthetic).unwrap();
         assert_eq!(cli.command, Command::Ps);
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn parse_shell_dash_c_with_arg() {
-        let mut synthetic = vec!["psht".to_string()];
+        let mut synthetic = vec!["psht-server".to_string()];
         synthetic.extend(shell_words::split("logs myapp").unwrap());
         let cli = Cli::try_parse_from(synthetic).unwrap();
         assert_eq!(
@@ -357,7 +357,7 @@ mod tests {
     fn parse_shell_dash_c_git_receive() {
         // SSH sends: git-receive-pack 'myapp.git'
         // shell_words strips the quotes, clap parses the subcommand
-        let mut synthetic = vec!["psht".to_string()];
+        let mut synthetic = vec!["psht-server".to_string()];
         synthetic.extend(shell_words::split("git-receive-pack 'myapp.git'").unwrap());
         let cli = Cli::try_parse_from(synthetic).unwrap();
         assert_eq!(
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn parse_shell_dash_c_setup() {
-        let mut synthetic = vec!["psht".to_string()];
+        let mut synthetic = vec!["psht-server".to_string()];
         synthetic.extend(shell_words::split("setup").unwrap());
         let cli = Cli::try_parse_from(synthetic).unwrap();
         assert_eq!(cli.command, Command::Setup);
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn parse_no_subcommand_is_error() {
-        let cli = parse_cli(&["psht"]);
+        let cli = parse_cli(&["psht-server"]);
         assert!(cli.is_err());
     }
 }

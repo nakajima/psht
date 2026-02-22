@@ -183,8 +183,8 @@ fn parse_tailscale_dns_name(json: &str) -> Option<String> {
 
 fn tailscale_ssh_enabled() -> Result<bool, String> {
     let json = run_cmd_capture("tailscale", &["status", "--json"])?;
-    let value: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| format!("failed to parse tailscale status: {e}"))?;
 
     if value
         .pointer("/Self/SSH")
@@ -214,38 +214,284 @@ fn detect_release_target() -> Result<&'static str, String> {
     }
 }
 
+fn first_storage_pool_name() -> Result<Option<String>, String> {
+    let json = run_cmd_capture("incus", &["storage", "list", "--format=json"])?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| format!("failed to parse incus storage list: {e}"))?;
+    let pools = value
+        .as_array()
+        .ok_or_else(|| "unexpected incus storage list response".to_string())?;
+    for pool in pools {
+        if let Some(name) = pool.get("name").and_then(serde_json::Value::as_str) {
+            if !name.is_empty() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn default_storage_pool() -> Result<String, String> {
+    if let Ok(pool) = run_cmd_capture(
+        "incus",
+        &["profile", "device", "get", "default", "root", "pool"],
+    ) {
+        let pool = pool.trim();
+        if !pool.is_empty() {
+            return Ok(pool.to_string());
+        }
+    }
+
+    if let Some(pool) = first_storage_pool_name()? {
+        return Ok(pool);
+    }
+
+    // Fresh Incus installs may have no storage configured yet.
+    run_cmd("incus", &["storage", "create", "default", "dir"])?;
+    Ok("default".to_string())
+}
+
+fn project_uses_profiles(project: &str) -> Result<bool, String> {
+    let value = run_cmd_capture("incus", &["project", "get", project, "features.profiles"])?;
+    Ok(value.trim().eq_ignore_ascii_case("true"))
+}
+
+fn profile_has_root_disk(profile: &str) -> bool {
+    let mut in_devices = false;
+    let mut current_device_indent = None;
+    let mut current_is_disk = false;
+    let mut current_is_root_path = false;
+
+    for raw_line in profile.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        let indent = line
+            .chars()
+            .take_while(|ch| ch.is_ascii_whitespace())
+            .count();
+
+        if !in_devices {
+            if trimmed == "devices:" {
+                in_devices = true;
+            }
+            continue;
+        }
+
+        if indent == 0 {
+            if current_is_disk && current_is_root_path {
+                return true;
+            }
+            break;
+        }
+
+        if indent == 2 && trimmed.ends_with(':') {
+            if current_is_disk && current_is_root_path {
+                return true;
+            }
+            current_device_indent = Some(indent);
+            current_is_disk = false;
+            current_is_root_path = false;
+            continue;
+        }
+
+        let Some(device_indent) = current_device_indent else {
+            continue;
+        };
+
+        if indent <= device_indent {
+            if current_is_disk && current_is_root_path {
+                return true;
+            }
+            current_device_indent = None;
+            continue;
+        }
+
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if key == "type" && value == "disk" {
+                current_is_disk = true;
+            }
+            if key == "path" && value == "/" {
+                current_is_root_path = true;
+            }
+        }
+    }
+
+    current_is_disk && current_is_root_path
+}
+
+fn project_profile_has_root_disk(project: &str) -> Result<bool, String> {
+    let profile = run_cmd_capture(
+        "incus",
+        &["--project", project, "profile", "show", "default"],
+    )?;
+    Ok(profile_has_root_disk(&profile))
+}
+
+fn ensure_project_default_profile(project: &str) -> Result<(), String> {
+    if !project_uses_profiles(project)? {
+        return Ok(());
+    }
+
+    if !command_succeeds(
+        "incus",
+        &["--project", project, "profile", "show", "default"],
+    ) {
+        run_cmd(
+            "incus",
+            &["--project", project, "profile", "create", "default"],
+        )?;
+    }
+
+    if project_profile_has_root_disk(project)? {
+        return Ok(());
+    }
+
+    let pool = default_storage_pool()?;
+    let path_arg = "path=/".to_string();
+    let pool_arg = format!("pool={pool}");
+    run_cmd(
+        "incus",
+        &[
+            "--project",
+            project,
+            "profile",
+            "device",
+            "add",
+            "default",
+            "root",
+            "disk",
+            &path_arg,
+            &pool_arg,
+        ],
+    )?;
+    Ok(())
+}
+
+fn latest_release_version() -> Result<String, String> {
+    let json = run_cmd_capture(
+        "curl",
+        &[
+            "-fsSL",
+            "https://api.github.com/repos/nakajima/psht/releases/latest",
+        ],
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("failed to parse latest release: {e}"))?;
+    let tag = value
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "latest release response missing tag_name".to_string())?;
+    let version = tag.trim_start_matches('v').trim();
+    if version.is_empty() {
+        return Err("latest release tag_name was empty".to_string());
+    }
+    Ok(version.to_string())
+}
+
+fn release_version_candidates(current: &str, latest: Option<&str>) -> Vec<String> {
+    let mut versions = vec![current.to_string()];
+    if let Some(latest) = latest {
+        let latest = latest.trim();
+        if !latest.is_empty() && latest != current {
+            versions.push(latest.to_string());
+        }
+    }
+    versions
+}
+
+fn cli_release_urls(version: &str, target: &str) -> [String; 2] {
+    [
+        format!(
+            "https://github.com/nakajima/psht/releases/download/v{version}/psht-{version}-{target}.tar.gz"
+        ),
+        format!(
+            "https://github.com/nakajima/psht/releases/download/v{version}/psht-cli-{version}-{target}.tar.gz"
+        ),
+    ]
+}
+
 fn install_cli_from_release(dst: &Path) -> Result<(), String> {
-    let version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("CARGO_PKG_VERSION");
+    let latest_version = latest_release_version().ok();
+    let versions = release_version_candidates(current_version, latest_version.as_deref());
     let target = detect_release_target()?;
     let tmpdir = run_cmd_capture("mktemp", &["-d"])?;
     let tmpdir_path = PathBuf::from(tmpdir);
     let tmpdir_s = tmpdir_path.to_string_lossy().to_string();
-    let tarball = tmpdir_path.join("psht-cli.tar.gz");
+    let tarball = tmpdir_path.join("psht.tar.gz");
     let tarball_s = tarball.to_string_lossy().to_string();
-    let url = format!(
-        "https://github.com/nakajima/psht/releases/download/v{version}/psht-cli-{version}-{target}.tar.gz"
-    );
 
     let result = (|| {
-        run_cmd_quiet("curl", &["-fsSL", &url, "-o", &tarball_s])?;
-        run_cmd_quiet("tar", &["xzf", &tarball_s, "-C", &tmpdir_s])?;
+        let mut errors = Vec::new();
+        for (idx, version) in versions.iter().enumerate() {
+            let mut download_error = String::new();
+            let mut downloaded = false;
+            for url in cli_release_urls(version, target) {
+                match run_cmd_quiet("curl", &["-fsSL", &url, "-o", &tarball_s]) {
+                    Ok(()) => {
+                        downloaded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        download_error = e;
+                    }
+                }
+            }
+            if !downloaded {
+                errors.push(format!("{version}: {download_error}"));
+                continue;
+            }
+            let _ = fs::remove_file(tmpdir_path.join("psht"));
+            let _ = fs::remove_file(tmpdir_path.join("psht-cli"));
+            if let Err(e) = run_cmd_quiet("tar", &["xzf", &tarball_s, "-C", &tmpdir_s]) {
+                errors.push(format!("{version}: {e}"));
+                continue;
+            }
 
-        let extracted = tmpdir_path.join("psht-cli");
-        if !extracted.is_file() {
-            return Err(format!(
-                "release tarball did not contain {}",
-                extracted.display()
-            ));
+            let extracted = ["psht", "psht-cli"]
+                .into_iter()
+                .map(|name| tmpdir_path.join(name))
+                .find(|path| path.is_file());
+            let Some(extracted) = extracted else {
+                errors.push(format!(
+                    "{version}: release tarball did not contain psht or psht-cli"
+                ));
+                continue;
+            };
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            }
+            fs::copy(&extracted, dst).map_err(|e| {
+                format!(
+                    "failed to copy {} to {}: {e}",
+                    extracted.display(),
+                    dst.display()
+                )
+            })?;
+            fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("failed to chmod {}: {e}", dst.display()))?;
+            if idx > 0 {
+                eprintln!(
+                    "-----> psht {current_version} not published; using released psht {version}"
+                );
+            }
+            return Ok(());
         }
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-        }
-        fs::copy(&extracted, dst)
-            .map_err(|e| format!("failed to copy {} to {}: {e}", extracted.display(), dst.display()))?;
-        fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("failed to chmod {}: {e}", dst.display()))?;
-        Ok(())
+        Err(format!(
+            "release download attempts failed: {}",
+            errors.join("; ")
+        ))
     })();
 
     let _ = fs::remove_dir_all(&tmpdir_path);
@@ -259,7 +505,7 @@ fn build_cli_from_source(dst: &Path) -> Result<bool, String> {
         let manifest = dir.join("Cargo.toml");
         if manifest.is_file() {
             let output = Command::new("cargo")
-                .args(["build", "--release", "--bin", "psht-cli"])
+                .args(["build", "--release", "--bin", "psht"])
                 .current_dir(&dir)
                 .output()
                 .map_err(|e| format!("failed to run cargo in {}: {e}", dir.display()))?;
@@ -271,7 +517,7 @@ fn build_cli_from_source(dst: &Path) -> Result<bool, String> {
                 return Err(format!("cargo build failed in {}: {stderr}", dir.display()));
             }
 
-            let built = dir.join("target/release/psht-cli");
+            let built = dir.join("target/release/psht");
             if !built.is_file() {
                 return Err(format!(
                     "cargo build succeeded but {} was not created",
@@ -282,8 +528,13 @@ fn build_cli_from_source(dst: &Path) -> Result<bool, String> {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
             }
-            fs::copy(&built, dst)
-                .map_err(|e| format!("failed to copy {} to {}: {e}", built.display(), dst.display()))?;
+            fs::copy(&built, dst).map_err(|e| {
+                format!(
+                    "failed to copy {} to {}: {e}",
+                    built.display(),
+                    dst.display()
+                )
+            })?;
             fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("failed to chmod {}: {e}", dst.display()))?;
             return Ok(true);
@@ -294,14 +545,14 @@ fn build_cli_from_source(dst: &Path) -> Result<bool, String> {
 }
 
 fn ensure_cli_binary() -> Result<PathBuf, String> {
-    let home_cli = home_dir().join("bin/psht-cli");
+    let home_cli = home_dir().join("bin/psht");
     if home_cli.is_file() {
         return Ok(home_cli);
     }
 
     let current_bin = current_psht_binary()?;
     if let Some(parent) = current_bin.parent() {
-        let sibling = parent.join("psht-cli");
+        let sibling = parent.join("psht");
         if sibling.is_file() {
             return Ok(sibling);
         }
@@ -316,10 +567,10 @@ fn ensure_cli_binary() -> Result<PathBuf, String> {
     if let Err(download_err) = install_cli_from_release(&home_cli) {
         if let Some(build_err) = build_err {
             return Err(format!(
-                "failed to provide psht-cli (build failed: {build_err}; release download failed: {download_err})"
+                "failed to provide psht (build failed: {build_err}; release download failed: {download_err})"
             ));
         }
-        return Err(format!("failed to provide psht-cli: {download_err}"));
+        return Err(format!("failed to provide psht: {download_err}"));
     }
     Ok(home_cli)
 }
@@ -349,8 +600,8 @@ fn path_is_world_executable(path: &Path) -> Result<bool, String> {
         }
     }
 
-    let file_meta =
-        fs::metadata(&resolved).map_err(|e| format!("failed to stat {}: {e}", resolved.display()))?;
+    let file_meta = fs::metadata(&resolved)
+        .map_err(|e| format!("failed to stat {}: {e}", resolved.display()))?;
     Ok(file_meta.permissions().mode() & 0o001 != 0)
 }
 
@@ -360,7 +611,7 @@ fn prepare_server_binary(current_bin: &Path) -> Result<PathBuf, String> {
         return Ok(resolved);
     }
 
-    let fallback = PathBuf::from("/usr/local/bin/psht");
+    let fallback = PathBuf::from("/usr/local/bin/psht-server");
     eprintln!(
         "-----> Binary path {} is not accessible to other users; installing to {}",
         resolved.display(),
@@ -693,16 +944,15 @@ fn write_oauth_config(path: &Path, client_id: &str, client_secret: &str) -> Resu
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    let content = format!(
-        "TS_OAUTH_CLIENT_ID={client_id}\nTS_OAUTH_CLIENT_SECRET={client_secret}\n"
-    );
+    let content =
+        format!("TS_OAUTH_CLIENT_ID={client_id}\nTS_OAUTH_CLIENT_SECRET={client_secret}\n");
     fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     Ok(())
 }
 
 pub fn bootstrap() -> Result<(), String> {
     if run_cmd_capture("id", &["-u"])? != "0" {
-        return Err("Run this command as root: sudo psht bootstrap".to_string());
+        return Err("Run this command as root: sudo psht-server bootstrap".to_string());
     }
 
     let psht_user = "psht";
@@ -740,11 +990,13 @@ pub fn bootstrap() -> Result<(), String> {
         let source = format!(
             "Enabled: yes\nTypes: deb\nURIs: https://pkgs.zabbly.com/incus/stable\nSuites: {codename}\nComponents: main\nArchitectures: {arch}\nSigned-By: /etc/apt/keyrings/zabbly.asc\n"
         );
-        fs::write("/etc/apt/sources.list.d/zabbly-incus-stable.sources", source).map_err(
-            |e| {
-                format!("failed to write /etc/apt/sources.list.d/zabbly-incus-stable.sources: {e}")
-            },
-        )?;
+        fs::write(
+            "/etc/apt/sources.list.d/zabbly-incus-stable.sources",
+            source,
+        )
+        .map_err(|e| {
+            format!("failed to write /etc/apt/sources.list.d/zabbly-incus-stable.sources: {e}")
+        })?;
 
         run_cmd("apt-get", &["update"])?;
         run_cmd("apt-get", &["install", "-y", "incus"])?;
@@ -804,7 +1056,9 @@ pub fn bootstrap() -> Result<(), String> {
 
             let confirm = prompt_tty("       Have you completed the steps above? (y/n) ")?;
             if confirm != "y" && confirm != "Y" {
-                return Err("Complete the steps above and re-run: sudo psht bootstrap".to_string());
+                return Err(
+                    "Complete the steps above and re-run: sudo psht-server bootstrap".to_string(),
+                );
             }
 
             println!();
@@ -852,12 +1106,12 @@ pub fn bootstrap() -> Result<(), String> {
         run_cmd("chmod", &["600", &oauth])?;
     }
 
-    let psht_cli_src = psht_dir.join("psht-cli");
+    let psht_cli_src = psht_dir.join("psht");
     let psht_bin_dir = psht_home.join("bin");
     fs::create_dir_all(&psht_bin_dir)
         .map_err(|e| format!("failed to create {}: {e}", psht_bin_dir.display()))?;
     if psht_cli_src.exists() {
-        let psht_cli_dst = psht_bin_dir.join("psht-cli");
+        let psht_cli_dst = psht_bin_dir.join("psht");
         fs::copy(&psht_cli_src, &psht_cli_dst).map_err(|e| {
             format!(
                 "failed to copy {} to {}: {e}",
@@ -891,7 +1145,10 @@ pub fn bootstrap() -> Result<(), String> {
     if !command_succeeds("incus", &["project", "show", &psht_project]) {
         run_cmd("incus", &["project", "create", &psht_project])?;
     }
-    run_cmd("incus", &["project", "set", &psht_project, "restricted=true"])?;
+    run_cmd(
+        "incus",
+        &["project", "set", &psht_project, "restricted=true"],
+    )?;
     run_cmd(
         "incus",
         &[
@@ -901,6 +1158,7 @@ pub fn bootstrap() -> Result<(), String> {
             "restricted.devices.proxy=allow",
         ],
     )?;
+    ensure_project_default_profile(&psht_project)?;
 
     eprintln!("-----> Setting up directories");
     let repos = psht_home.join("repos");
@@ -957,12 +1215,12 @@ err() {{ echo "ERROR: $*" >&2; exit 1; }}
 
 PSHT_BIN=$(getent passwd "$PSHT_USER" | cut -d: -f7 || true)
 if [[ -z "$PSHT_BIN" ]]; then
-    PSHT_BIN=$(command -v psht) || err "psht not found in PATH"
+    PSHT_BIN=$(command -v psht-server) || err "psht-server not found in PATH"
 fi
 PSHT_BIN=$(realpath "$PSHT_BIN")
-[[ -x "$PSHT_BIN" ]] || err "psht binary is not executable: $PSHT_BIN"
+[[ -x "$PSHT_BIN" ]] || err "psht-server binary is not executable: $PSHT_BIN"
 
-[[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht upgrade"
+[[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht-server upgrade"
 
 CURRENT_VERSION="{version}"
 
@@ -992,18 +1250,18 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # Download both tarballs
 BASE_URL="https://github.com/nakajima/psht/releases/download/v$LATEST"
 log "Downloading psht $LATEST"
+curl -fsSL "$BASE_URL/psht-server-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht-server.tar.gz"
 curl -fsSL "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht.tar.gz"
-curl -fsSL "$BASE_URL/psht-cli-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht-cli.tar.gz"
 
 # Extract and install
+tar xzf "$TMPDIR/psht-server.tar.gz" -C "$TMPDIR"
 tar xzf "$TMPDIR/psht.tar.gz" -C "$TMPDIR"
-tar xzf "$TMPDIR/psht-cli.tar.gz" -C "$TMPDIR"
 
 log "Installing binaries"
-install -m 755 "$TMPDIR/psht" "$PSHT_BIN"
+install -m 755 "$TMPDIR/psht-server" "$PSHT_BIN"
 mkdir -p "$PSHT_HOME/bin"
-install -m 755 "$TMPDIR/psht-cli" "$PSHT_HOME/bin/psht-cli"
-chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin/psht-cli"
+install -m 755 "$TMPDIR/psht" "$PSHT_HOME/bin/psht"
+chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin/psht"
 
 # Update incus
 log "Updating incus"
@@ -1059,11 +1317,11 @@ check() {{
 
 echo "Installation:"
 if [[ -n "$PSHT_USER_SHELL" ]]; then
-    check "psht binary at $PSHT_USER_SHELL" test -x "$PSHT_USER_SHELL"
+    check "psht-server binary at $PSHT_USER_SHELL" test -x "$PSHT_USER_SHELL"
 else
     fail "psht user shell path missing"
 fi
-check "psht-cli binary at \$PSHT_HOME/bin/psht-cli" test -x "$PSHT_HOME/bin/psht-cli"
+check "psht CLI binary at \$PSHT_HOME/bin/psht" test -x "$PSHT_HOME/bin/psht"
 if [[ -n "$PSHT_USER_SHELL" ]]; then
     INSTALLED_VERSION=$("$PSHT_USER_SHELL" --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
 else
@@ -1489,13 +1747,66 @@ mod tests {
     #[test]
     fn parse_version_codename_from_os_release() {
         let os_release = "NAME=Ubuntu\nVERSION_CODENAME=noble\n";
-        assert_eq!(parse_version_codename(os_release), Some("noble".to_string()));
+        assert_eq!(
+            parse_version_codename(os_release),
+            Some("noble".to_string())
+        );
     }
 
     #[test]
     fn parse_version_codename_handles_quotes() {
         let os_release = "NAME=Ubuntu\nVERSION_CODENAME=\"jammy\"\n";
-        assert_eq!(parse_version_codename(os_release), Some("jammy".to_string()));
+        assert_eq!(
+            parse_version_codename(os_release),
+            Some("jammy".to_string())
+        );
+    }
+
+    #[test]
+    fn profile_has_root_disk_detects_root_device() {
+        let profile = r#"name: default
+devices:
+  eth0:
+    type: nic
+    nictype: bridged
+  root:
+    path: /
+    pool: default
+    type: disk
+"#;
+        assert!(profile_has_root_disk(profile));
+    }
+
+    #[test]
+    fn profile_has_root_disk_detects_non_root_named_device() {
+        let profile = r#"name: default
+devices:
+  data:
+    path: /data
+    pool: default
+    type: disk
+  disk0:
+    path: /
+    pool: default
+    type: disk
+"#;
+        assert!(profile_has_root_disk(profile));
+    }
+
+    #[test]
+    fn profile_has_root_disk_returns_false_without_root_path_disk() {
+        let profile = r#"name: default
+devices:
+  root:
+    path: /
+    pool: default
+    type: nic
+  disk0:
+    path: /data
+    pool: default
+    type: disk
+"#;
+        assert!(!profile_has_root_disk(profile));
     }
 
     #[test]
@@ -1504,13 +1815,13 @@ mod tests {
         let path = tmp.path().join("shells");
         fs::write(&path, "/bin/sh\n").unwrap();
 
-        ensure_line_in_file(&path, "/opt/psht/bin/psht").unwrap();
-        ensure_line_in_file(&path, "/opt/psht/bin/psht").unwrap();
+        ensure_line_in_file(&path, "/opt/psht/bin/psht-server").unwrap();
+        ensure_line_in_file(&path, "/opt/psht/bin/psht-server").unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         let count = contents
             .lines()
-            .filter(|line| *line == "/opt/psht/bin/psht")
+            .filter(|line| *line == "/opt/psht/bin/psht-server")
             .count();
         assert_eq!(count, 1, "line should only be written once");
     }
@@ -1601,12 +1912,13 @@ mod tests {
     fn upgrade_script_downloads_both_binaries() {
         let script = upgrade_script();
         assert!(
-            script.contains("psht-cli-"),
-            "should download psht-cli tarball"
+            script.contains("psht-server-${"),
+            "should download psht-server tarball"
         );
-        // The psht tarball (not psht-cli) should also be downloaded
-        let has_psht_download = script.contains("psht-$") || script.contains("psht-${");
-        assert!(has_psht_download, "should download psht tarball");
+        assert!(
+            script.contains("psht-${"),
+            "should download psht CLI tarball"
+        );
     }
 
     #[test]
@@ -1617,16 +1929,16 @@ mod tests {
             "should resolve psht binary path from user shell"
         );
         assert!(
-            script.contains("PSHT_BIN=$(command -v psht)"),
-            "should fall back to command -v psht"
+            script.contains("PSHT_BIN=$(command -v psht-server)"),
+            "should fall back to command -v psht-server"
         );
         assert!(
-            script.contains("install -m 755 \"$TMPDIR/psht\" \"$PSHT_BIN\""),
-            "should install psht to active binary path"
+            script.contains("install -m 755 \"$TMPDIR/psht-server\" \"$PSHT_BIN\""),
+            "should install psht-server to active binary path"
         );
         assert!(
-            script.contains("$PSHT_HOME/bin/psht-cli"),
-            "should install psht-cli to $PSHT_HOME/bin/psht-cli"
+            script.contains("$PSHT_HOME/bin/psht"),
+            "should install psht CLI to $PSHT_HOME/bin/psht"
         );
     }
 
@@ -1686,7 +1998,10 @@ mod tests {
     #[test]
     fn doctor_script_checks_psht_cli_binary() {
         let script = doctor_script();
-        assert!(script.contains("psht-cli"), "should check psht-cli binary");
+        assert!(
+            script.contains("$PSHT_HOME/bin/psht"),
+            "should check psht CLI binary"
+        );
     }
 
     #[test]

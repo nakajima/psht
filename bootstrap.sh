@@ -102,14 +102,14 @@ TS_OAUTH_CLIENT_SECRET=$TS_OAUTH_CLIENT_SECRET
 EOF
 fi
 
-# --- Build psht ---
-log "Building psht"
+# --- Build binaries ---
+log "Building psht-server and psht"
 cd "$SCRIPT_DIR"
-cargo build --release
-PSHT_BIN="$SCRIPT_DIR/target/release/psht"
+cargo build --release --bin psht-server --bin psht
+PSHT_BIN="$SCRIPT_DIR/target/release/psht-server"
 [[ -f "$PSHT_BIN" ]] || err "Build failed: $PSHT_BIN not found"
 
-INSTALLED_BIN="/usr/local/bin/psht"
+INSTALLED_BIN="/usr/local/bin/psht-server"
 cp "$PSHT_BIN" "$INSTALLED_BIN"
 chmod 755 "$INSTALLED_BIN"
 
@@ -134,9 +134,9 @@ fi
 
 # Install client CLI binary for scp distribution
 mkdir -p "$PSHT_HOME/bin"
-cp "$SCRIPT_DIR/target/release/psht-cli" "$PSHT_HOME/bin/psht-cli"
-chmod 755 "$PSHT_HOME/bin/psht-cli"
-chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht-cli"
+cp "$SCRIPT_DIR/target/release/psht" "$PSHT_HOME/bin/psht"
+chmod 755 "$PSHT_HOME/bin/psht"
+chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin" "$PSHT_HOME/bin/psht"
 
 # --- Grant Incus access ---
 log "Adding $PSHT_USER to incus group"

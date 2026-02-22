@@ -1,6 +1,6 @@
 [package]
 name = "psht"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2024"
 
 [dependencies]
@@ -12,12 +12,12 @@ shell-words = "1"
 toml = "0.8"
 
 [[bin]]
-name = "psht"
+name = "psht-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "psht-cli"
-path = "src/bin/psht-cli.rs"
+name = "psht"
+path = "src/bin/psht.rs"
 
 [features]
 integration = []

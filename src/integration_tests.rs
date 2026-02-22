@@ -641,28 +641,31 @@ fn integration_bootstrap() {
     // Wait for the VM agent to be ready (VMs take longer than containers)
     wait_for_vm_agent(vm_name, Duration::from_secs(120)).expect("VM agent not ready");
 
-    // Build and push the latest psht binary into the VM at a non-standard path.
+    // Build and push the latest psht-server binary into the VM at a non-standard path.
     let build_status = Command::new("cargo")
-        .args(["build", "--bin", "psht"])
+        .args(["build", "--bin", "psht-server"])
         .status()
-        .expect("failed to build psht binary");
-    assert!(build_status.success(), "cargo build --bin psht failed");
+        .expect("failed to build psht-server binary");
+    assert!(
+        build_status.success(),
+        "cargo build --bin psht-server failed"
+    );
 
-    let psht_bin = format!("{}/target/debug/psht", env!("CARGO_MANIFEST_DIR"));
+    let psht_bin = format!("{}/target/debug/psht-server", env!("CARGO_MANIFEST_DIR"));
     vm_exec(vm_name, "mkdir -p /opt/psht/bin").expect("failed to create /opt/psht/bin");
     let status = Command::new("incus")
         .args([
             "file",
             "push",
             &psht_bin,
-            &format!("{vm_name}/opt/psht/bin/psht"),
+            &format!("{vm_name}/opt/psht/bin/psht-server"),
         ])
         .status()
         .expect("failed to push binary");
     assert!(status.success(), "incus file push failed");
 
     // Make it executable
-    vm_exec(vm_name, "chmod 755 /opt/psht/bin/psht").expect("failed to chmod psht");
+    vm_exec(vm_name, "chmod 755 /opt/psht/bin/psht-server").expect("failed to chmod psht-server");
 
     // Run bootstrap with Tailscale skipped
     let output = Command::new("incus")
@@ -672,7 +675,7 @@ fn integration_bootstrap() {
             "--",
             "sh",
             "-c",
-            "PSHT_SKIP_TAILSCALE=1 /opt/psht/bin/psht bootstrap",
+            "PSHT_SKIP_TAILSCALE=1 /opt/psht/bin/psht-server bootstrap",
         ])
         .output()
         .expect("failed to run bootstrap");
@@ -685,8 +688,11 @@ fn integration_bootstrap() {
 
     // Verify: user psht exists
     vm_exec(vm_name, "id psht").expect("user psht should exist");
-    vm_exec(vm_name, "stat -c '%U:%G' /home/psht | grep -q '^psht:psht$'")
-        .expect("/home/psht should be owned by psht");
+    vm_exec(
+        vm_name,
+        "stat -c '%U:%G' /home/psht | grep -q '^psht:psht$'",
+    )
+    .expect("/home/psht should be owned by psht");
     vm_exec(
         vm_name,
         "su -s /bin/sh -c 'mkdir -p /home/psht/.config/incus && test -w /home/psht/.config/incus' psht",
@@ -704,11 +710,19 @@ fn integration_bootstrap() {
     vm_exec(vm_name, "test -f /home/psht/.hushlogin").expect("/home/psht/.hushlogin should exist");
 
     // Verify: psht shell path is the dropped binary path.
-    vm_exec(vm_name, "getent passwd psht | grep -q ':/opt/psht/bin/psht$'")
-        .expect("psht user shell should be /opt/psht/bin/psht");
-    vm_exec(vm_name, "grep -qx /opt/psht/bin/psht /etc/shells")
-        .expect("/opt/psht/bin/psht should be in /etc/shells");
+    vm_exec(
+        vm_name,
+        "getent passwd psht | grep -q ':/opt/psht/bin/psht-server$'",
+    )
+    .expect("psht user shell should be /opt/psht/bin/psht-server");
+    vm_exec(vm_name, "grep -qx /opt/psht/bin/psht-server /etc/shells")
+        .expect("/opt/psht/bin/psht-server should be in /etc/shells");
 
     // Verify: incus is installed
     vm_exec(vm_name, "command -v incus").expect("incus should be installed");
+    vm_exec(
+        vm_name,
+        "su -s /bin/sh -c 'incus launch images:ubuntu/24.04 psht-bootstrap-check && incus delete -f psht-bootstrap-check' psht",
+    )
+    .expect("psht should be able to launch and delete a container");
 }

@@ -1,6 +1,6 @@
 [project]
 name = "psht"
-binary = "psht"
+binary = "psht-server"
 repo = "nakajima/psht"
 # version_command = "git describe --tags --abbrev=0"
 
