@@ -3,6 +3,7 @@ use std::path::Path;
 
 #[derive(Debug, PartialEq)]
 pub enum AppType {
+    Binary,
     Bun,
     Node,
     Python,
@@ -21,6 +22,7 @@ pub struct AppConfig {
 impl AppType {
     fn default_start_command(&self) -> &str {
         match self {
+            AppType::Binary => "./app",
             AppType::Bun => "bun run index.ts",
             AppType::Node => "npm start",
             AppType::Python => "python app.py",
@@ -32,6 +34,7 @@ impl AppType {
 
     pub fn stack(&self) -> &str {
         match self {
+            AppType::Binary => "binary",
             AppType::Bun => "bun",
             AppType::Node => "node",
             AppType::Python => "python",
@@ -43,6 +46,7 @@ impl AppType {
 
     fn install_command(&self) -> &str {
         match self {
+            AppType::Binary => "",
             AppType::Bun => "bun install",
             AppType::Node => "npm install",
             AppType::Python => "pip install -r requirements.txt",
@@ -60,6 +64,14 @@ impl AppConfig {
 }
 
 pub fn detect(dir: &Path) -> Result<AppConfig, String> {
+    if let Some(start_command) = read_start_command_file(dir)? {
+        return Ok(AppConfig {
+            app_type: AppType::Binary,
+            start_command,
+            install_command: "".to_string(),
+        });
+    }
+
     let start_command = read_procfile(dir);
 
     let markers: &[(&str, AppType)] = &[
@@ -89,6 +101,20 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
     }
 
     Err("could not detect app type".to_string())
+}
+
+fn read_start_command_file(dir: &Path) -> Result<Option<String>, String> {
+    let marker = dir.join(".psht-start-command");
+    if !marker.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&marker)
+        .map_err(|e| format!("failed to read {}: {e}", marker.display()))?;
+    let cmd = content.trim();
+    if cmd.is_empty() {
+        return Err(".psht-start-command is empty".to_string());
+    }
+    Ok(Some(cmd.to_string()))
 }
 
 fn read_procfile(dir: &Path) -> Option<String> {
@@ -145,6 +171,7 @@ mod tests {
 
     #[test]
     fn stack_returns_correct_name() {
+        assert_eq!(AppType::Binary.stack(), "binary");
         assert_eq!(AppType::Bun.stack(), "bun");
         assert_eq!(AppType::Node.stack(), "node");
         assert_eq!(AppType::Python.stack(), "python");
@@ -210,6 +237,24 @@ mod tests {
     }
 
     #[test]
+    fn detect_binary_app_from_start_command_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".psht-start-command"), "./mybin --flag").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Binary);
+        assert_eq!(config.start_command, "./mybin --flag");
+        assert!(config.install_command.is_empty());
+    }
+
+    #[test]
+    fn detect_binary_app_rejects_empty_start_command_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".psht-start-command"), "\n  \n").unwrap();
+        let err = detect(tmp.path()).unwrap_err();
+        assert!(err.contains(".psht-start-command is empty"));
+    }
+
+    #[test]
     fn procfile_overrides_start_command() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
@@ -230,6 +275,7 @@ mod tests {
 
     #[test]
     fn install_command_for_each_type() {
+        assert_eq!(AppType::Binary.install_command(), "");
         assert!(AppType::Bun.install_command().contains("bun install"));
         assert_eq!(AppType::Node.install_command(), "npm install");
         assert_eq!(

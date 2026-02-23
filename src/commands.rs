@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,6 +16,7 @@ use crate::detect;
 use crate::tailscale;
 
 const STACKS: &[(&str, &str)] = &[
+    ("binary", include_str!("../stacks/binary.sh")),
     ("bun", include_str!("../stacks/bun.sh")),
     ("go", include_str!("../stacks/go.sh")),
     ("node", include_str!("../stacks/node.sh")),
@@ -40,6 +41,125 @@ fn repos_dir() -> PathBuf {
 
 fn stacks_dir() -> PathBuf {
     home_dir().join("stacks")
+}
+
+fn build_numbers_dir() -> PathBuf {
+    home_dir().join("build-numbers")
+}
+
+fn build_number_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.build"))
+}
+
+fn read_build_number_from(path: &Path) -> u64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn increment_build_number_in(dir: &Path, app: &str) -> Result<u64, String> {
+    let path = build_number_path_in(dir, app);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let next = read_build_number_from(&path).saturating_add(1);
+    fs::write(&path, format!("{next}\n"))
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(next)
+}
+
+fn increment_build_number(app: &str) -> Result<u64, String> {
+    increment_build_number_in(&build_numbers_dir(), app)
+}
+
+fn binary_hashes_dir() -> PathBuf {
+    home_dir().join("binary-hashes")
+}
+
+fn binary_hash_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.hash"))
+}
+
+fn binary_hash_path(app: &str) -> PathBuf {
+    binary_hash_path_in(&binary_hashes_dir(), app)
+}
+
+fn read_binary_hash_from(path: &Path) -> Option<String> {
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn read_binary_hash(app: &str) -> Option<String> {
+    read_binary_hash_from(&binary_hash_path(app))
+}
+
+fn write_binary_hash_to(path: &Path, hash: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    fs::write(path, format!("{hash}\n"))
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn write_binary_hash(app: &str, hash: &str) -> Result<(), String> {
+    write_binary_hash_to(&binary_hash_path(app), hash)
+}
+
+fn clear_binary_hash(app: &str) -> Result<(), String> {
+    let path = binary_hash_path(app);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn binary_payload_hash(code_dir: &Path) -> Result<Option<String>, String> {
+    let marker_path = code_dir.join(".psht-start-command");
+    if !marker_path.is_file() {
+        return Ok(None);
+    }
+
+    let marker = fs::read_to_string(&marker_path)
+        .map_err(|e| format!("failed to read {}: {e}", marker_path.display()))?;
+    let marker = marker.trim();
+    if marker.is_empty() {
+        return Err(".psht-start-command is empty".to_string());
+    }
+
+    let binary_token = marker
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| ".psht-start-command is empty".to_string())?;
+
+    // Only hash local relative binaries we can inspect.
+    if binary_token.starts_with('/') || binary_token.contains("..") {
+        return Ok(None);
+    }
+    let rel = binary_token.strip_prefix("./").unwrap_or(binary_token);
+    if rel.is_empty() {
+        return Ok(None);
+    }
+
+    let binary_path = code_dir.join(rel);
+    if !binary_path.is_file() {
+        return Ok(None);
+    }
+
+    let mut hasher = DefaultHasher::new();
+    marker.hash(&mut hasher);
+    let bytes = fs::read(&binary_path)
+        .map_err(|e| format!("failed to read {}: {e}", binary_path.display()))?;
+    bytes.hash(&mut hasher);
+    Ok(Some(format!("{:016x}", hasher.finish())))
 }
 
 fn command_exists(name: &str) -> bool {
@@ -940,6 +1060,14 @@ pub fn push(app: &str) -> Result<(), String> {
         return Err("tar extraction failed".to_string());
     }
 
+    let candidate_hash = binary_payload_hash(&code_dir)?;
+    if let Some(hash) = candidate_hash.as_deref() {
+        if container::exists(app) && read_binary_hash(app).as_deref() == Some(hash) {
+            eprintln!("-----> Binary unchanged ({hash}), skipping deploy");
+            return Ok(());
+        }
+    }
+
     deploy_from(app, &code_dir)
 }
 
@@ -953,6 +1081,11 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
     eprintln!("       Detected: {:?}", config.app_type);
+    let binary_hash = if matches!(config.app_type, detect::AppType::Binary) {
+        binary_payload_hash(code_dir)?
+    } else {
+        None
+    };
 
     if code_dir.join("psht-stack.sh").exists() {
         eprintln!("       Using custom stack");
@@ -1040,10 +1173,21 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     caddy::add(app, port)?;
 
+    let build_number = increment_build_number(app)?;
+
     if let Some(name) = tailnet_hostname {
         eprintln!("       Tailnet: http://{name} (also http://{name}:{port})");
     }
-    eprintln!("=====> App {app} deployed on port {port}");
+
+    if let Some(hash) = binary_hash {
+        if let Err(e) = write_binary_hash(app, &hash) {
+            eprintln!("       Warning: failed to persist binary hash: {e}");
+        }
+    } else if let Err(e) = clear_binary_hash(app) {
+        eprintln!("       Warning: failed to clear binary hash: {e}");
+    }
+
+    eprintln!("=====> App {app} deployed on port {port} (build {build_number})");
     Ok(())
 }
 
@@ -2000,6 +2144,68 @@ mod tests {
     fn stack_hash_errors_on_missing_file() {
         let result = stack_hash(Path::new("/nonexistent/file.sh"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_hash_cache_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = binary_hash_path_in(tmp.path(), "myapp");
+        write_binary_hash_to(&path, "deadbeef").unwrap();
+        assert_eq!(read_binary_hash_from(&path).as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn binary_payload_hash_none_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("app"), "#!/bin/sh\necho ok\n").unwrap();
+        let hash = binary_payload_hash(tmp.path()).unwrap();
+        assert!(hash.is_none());
+    }
+
+    #[test]
+    fn binary_payload_hash_changes_with_binary_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".psht-start-command"), "./app\n").unwrap();
+        fs::write(tmp.path().join("app"), "first").unwrap();
+        let hash1 = binary_payload_hash(tmp.path()).unwrap().unwrap();
+        fs::write(tmp.path().join("app"), "second").unwrap();
+        let hash2 = binary_payload_hash(tmp.path()).unwrap().unwrap();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn binary_payload_hash_changes_with_start_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("app"), "same-bits").unwrap();
+        fs::write(tmp.path().join(".psht-start-command"), "./app\n").unwrap();
+        let hash1 = binary_payload_hash(tmp.path()).unwrap().unwrap();
+        fs::write(tmp.path().join(".psht-start-command"), "./app --debug\n").unwrap();
+        let hash2 = binary_payload_hash(tmp.path()).unwrap().unwrap();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn read_build_number_defaults_to_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing.build");
+        assert_eq!(read_build_number_from(&path), 0);
+    }
+
+    #[test]
+    fn read_build_number_invalid_defaults_to_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad.build");
+        fs::write(&path, "nope\n").unwrap();
+        assert_eq!(read_build_number_from(&path), 0);
+    }
+
+    #[test]
+    fn increment_build_number_is_monotonic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let n1 = increment_build_number_in(tmp.path(), "myapp").unwrap();
+        let n2 = increment_build_number_in(tmp.path(), "myapp").unwrap();
+        let n3 = increment_build_number_in(tmp.path(), "myapp").unwrap();
+        assert_eq!((n1, n2, n3), (1, 2, 3));
     }
 
     #[test]

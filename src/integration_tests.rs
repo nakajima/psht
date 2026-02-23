@@ -245,6 +245,17 @@ fn scaffold_rust(app: &str) -> Result<(), String> {
     )
 }
 
+fn scaffold_binary(app: &str) -> Result<(), String> {
+    write_file(app, "/app/index.html", "<html><body>ok</body></html>")?;
+    write_file(
+        app,
+        "/app/app",
+        concat!("#!/bin/sh\n", "exec python3 -m http.server \"$PORT\"\n",),
+    )?;
+    container::exec_cmd(app, "chmod 755 /app/app")?;
+    write_file(app, "/app/.psht-start-command", "./app\n")
+}
+
 const APP_PORT: u16 = 8080;
 
 fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), String> {
@@ -255,6 +266,7 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
     container::exec_cmd(app, "mkdir -p /var/psht")?;
 
     match stack {
+        "binary" => scaffold_binary(app)?,
         "static" => scaffold_static(app)?,
         "python" => scaffold_python(app)?,
         "node" => scaffold_node(app)?,
@@ -279,6 +291,7 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
 
     // Start the app
     let start_cmd = match stack {
+        "binary" => format!("cd /app && PORT={APP_PORT} nohup ./app > /var/psht/app.log 2>&1 &"),
         "static" => format!(
             "cd /app && PORT={APP_PORT} nohup python3 -m http.server {APP_PORT} > /var/psht/app.log 2>&1 &"
         ),
@@ -541,6 +554,20 @@ fn integration_static() {
 }
 
 #[test]
+fn integration_binary_no_procfile() {
+    let app = "inttest-binary";
+    let (_guard, ip) = deploy_stack(app, "binary").expect("deploy binary failed");
+
+    let marker = exec_output(app, "cat /app/.psht-start-command").expect("read marker failed");
+    assert_eq!(marker.trim(), "./app", "expected start-command marker");
+    exec_output(app, "test ! -f /app/Procfile").expect("Procfile should not exist");
+
+    let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
+        .unwrap_or_else(|e| panic!("binary app not reachable: {e}\n{}", debug_info(app)));
+    assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
+}
+
+#[test]
 fn integration_python() {
     let app = "inttest-python";
     let (_guard, ip) = deploy_stack(app, "python").expect("deploy python failed");
@@ -699,10 +726,10 @@ fn integration_bootstrap() {
     )
     .expect("psht should be able to create ~/.config/incus");
 
-    // Verify: stacks directory has 6 .sh files
+    // Verify: stacks directory has 7 .sh files
     let count =
         vm_exec(vm_name, "ls /home/psht/stacks/*.sh | wc -l").expect("failed to count stacks");
-    assert_eq!(count.trim(), "6", "expected 6 stack scripts, got {count}");
+    assert_eq!(count.trim(), "7", "expected 7 stack scripts, got {count}");
 
     // Verify: repos and builds directories exist
     vm_exec(vm_name, "test -d /home/psht/repos").expect("/home/psht/repos should exist");

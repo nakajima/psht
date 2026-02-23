@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -24,7 +28,7 @@ struct Cli {
 enum CliCommand {
     /// Deploy the current directory
     Deploy {
-        /// App name (defaults to current directory name)
+        /// App name or path to a binary (defaults to current directory name)
         app: Option<String>,
     },
     /// List running apps
@@ -102,25 +106,121 @@ fn ssh_cmd(host: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn deploy(host: &str, app: &str) -> Result<(), String> {
-    let tar = Command::new("tar")
-        .args(["cz", "--exclude=.git", "."])
+fn deploy_from_dir(
+    host: &str,
+    app: &str,
+    source_dir: &Path,
+    exclude_git: bool,
+) -> Result<(), String> {
+    let mut tar_cmd = Command::new("tar");
+    if exclude_git {
+        tar_cmd.args(["cz", "--exclude=.git", "."]);
+    } else {
+        tar_cmd.args(["cz", "."]);
+    }
+    let mut tar = tar_cmd
+        .current_dir(source_dir)
         .stdout(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run tar: {e}"))?;
+    let tar_stdout = tar
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture tar stdout".to_string())?;
 
     let status = Command::new("ssh")
         .arg(format!("psht@{host}"))
         .args(["push", app])
-        .stdin(tar.stdout.unwrap())
+        .stdin(tar_stdout)
         .stderr(std::process::Stdio::inherit())
         .status()
         .map_err(|e| format!("failed to run ssh: {e}"))?;
+    let tar_status = tar
+        .wait()
+        .map_err(|e| format!("failed to wait for tar: {e}"))?;
 
     if !status.success() {
         return Err(format!("deploy failed with status {}", status));
     }
+    if !tar_status.success() {
+        return Err(format!("tar failed with status {}", tar_status));
+    }
     Ok(())
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.contains('/') || value.starts_with('.')
+}
+
+fn resolve_binary_path(cwd: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
+    let file_name = binary_path
+        .file_name()
+        .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging = env::temp_dir().join(format!("psht-bin-{}-{ts}", process::id()));
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("failed to create staging dir {}: {e}", staging.display()))?;
+
+    let staged_bin = staging.join(file_name);
+    fs::copy(binary_path, &staged_bin).map_err(|e| {
+        format!(
+            "failed to copy {} to {}: {e}",
+            binary_path.display(),
+            staged_bin.display()
+        )
+    })?;
+    fs::set_permissions(&staged_bin, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("failed to chmod {}: {e}", staged_bin.display()))?;
+
+    let start_cmd = format!("./{}", file_name.to_string_lossy());
+    fs::write(
+        staging.join(".psht-start-command"),
+        format!("{start_cmd}\n"),
+    )
+    .map_err(|e| format!("failed to write .psht-start-command: {e}"))?;
+
+    Ok(staging)
+}
+
+fn deploy_binary(host: &str, app: &str, binary_path: &Path) -> Result<(), String> {
+    let staging = stage_binary_dir(binary_path)?;
+    let result = deploy_from_dir(host, app, &staging, false);
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn deploy(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
+    deploy_from_dir(host, app, cwd, true)
+}
+
+fn deploy_with_app_or_binary(host: &str, cwd: &Path, value: Option<&str>) -> Result<(), String> {
+    if let Some(arg) = value {
+        if looks_like_path(arg) {
+            let binary_path = resolve_binary_path(cwd, arg);
+            if !binary_path.is_file() {
+                return Err(format!("binary not found: {}", binary_path.display()));
+            }
+            let name = app_name(None, cwd);
+            app_name::validate_app_name(&name)?;
+            return deploy_binary(host, &name, &binary_path);
+        }
+    }
+    let name = app_name(value, cwd);
+    app_name::validate_app_name(&name)?;
+    deploy(host, &name, cwd)
 }
 
 fn save_config(config: &Config, path: &Path) -> Result<(), String> {
@@ -209,9 +309,7 @@ fn run() -> Result<(), String> {
         }
         CliCommand::Deploy { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            let name = app_name(app.as_deref(), &cwd);
-            app_name::validate_app_name(&name)?;
-            deploy(&host, &name)
+            deploy_with_app_or_binary(&host, &cwd, app.as_deref())
         }
         CliCommand::Ps => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
@@ -358,6 +456,36 @@ mod tests {
     fn is_cli_probe_command_parses() {
         let cli = Cli::try_parse_from(["psht", "__is-cli"]).expect("probe command should parse");
         assert!(matches!(cli.command, CliCommand::IsCli));
+    }
+
+    #[test]
+    fn looks_like_path_distinguishes_paths_from_app_names() {
+        assert!(looks_like_path("path/to/bin"));
+        assert!(looks_like_path("./bin"));
+        assert!(looks_like_path("../bin"));
+        assert!(!looks_like_path("myapp"));
+    }
+
+    #[test]
+    fn stage_binary_dir_writes_start_command_marker() {
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("mybin");
+        fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let staged = stage_binary_dir(&bin).unwrap();
+        assert!(staged.join("mybin").is_file());
+        let marker = fs::read_to_string(staged.join(".psht-start-command")).unwrap();
+        assert_eq!(marker.trim(), "./mybin");
+        let _ = fs::remove_dir_all(staged);
+    }
+
+    #[test]
+    fn deploy_with_path_errors_when_binary_missing() {
+        let cwd = tempdir().unwrap();
+        let err =
+            deploy_with_app_or_binary("example.com", cwd.path(), Some("bin/missing")).unwrap_err();
+        assert!(err.contains("binary not found"));
     }
 
     #[test]
