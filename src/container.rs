@@ -63,6 +63,7 @@ impl IncusCommand {
     }
 
     fn run_rolling(self, window: usize) -> Result<(), String> {
+        let window = window.max(1);
         let args_display = self.args.join(" ");
         let mut child = self
             .build()
@@ -154,6 +155,9 @@ fn incus() -> IncusCommand {
 }
 
 fn update_ring(ring: &mut Vec<String>, line: String, capacity: usize) {
+    if capacity == 0 {
+        return;
+    }
     if ring.len() >= capacity {
         ring.remove(0);
     }
@@ -196,10 +200,13 @@ pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
         .stdin(stdin)
         .status()
         .map_err(|e| format!("failed to push code to container: {e}"))?;
+    let tar_status = tar.wait().map_err(|e| format!("tar failed: {e}"))?;
     if !status.success() {
         return Err("failed to push code to container".to_string());
     }
-    tar.wait().map_err(|e| format!("tar failed: {e}"))?;
+    if !tar_status.success() {
+        return Err(format!("tar failed with status {tar_status}"));
+    }
     Ok(())
 }
 
@@ -510,6 +517,13 @@ mod tests {
             update_ring(&mut ring, line.into(), 3);
         }
         assert_eq!(ring, vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn ring_buffer_zero_capacity_noop() {
+        let mut ring = Vec::new();
+        update_ring(&mut ring, "a".into(), 0);
+        assert!(ring.is_empty());
     }
 
     #[test]

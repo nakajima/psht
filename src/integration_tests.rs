@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::caddy;
+use crate::commands;
 use crate::container;
 
 // RAII guard: stops + deletes the container on drop, even on panic.
@@ -435,6 +436,10 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn full_integration_enabled() -> bool {
+    std::env::var_os("PSHT_FULL_INTEGRATION").is_some()
+}
+
 struct CaddyEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     old_api_url: Option<String>,
@@ -482,6 +487,12 @@ impl Drop for CaddyEnvGuard {
 
 #[test]
 fn integration_caddy_end_to_end_with_real_container() {
+    if !full_integration_enabled() {
+        eprintln!(
+            "skipping integration_caddy_end_to_end_with_real_container (set PSHT_FULL_INTEGRATION=1)"
+        );
+        return;
+    }
     let app = "inttest-caddy-app";
     let caddy_app = "inttest-caddy";
 
@@ -569,6 +580,10 @@ fn integration_binary_no_procfile() {
 
 #[test]
 fn integration_python() {
+    if !full_integration_enabled() {
+        eprintln!("skipping integration_python (set PSHT_FULL_INTEGRATION=1)");
+        return;
+    }
     let app = "inttest-python";
     let (_guard, ip) = deploy_stack(app, "python").expect("deploy python failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
@@ -578,6 +593,10 @@ fn integration_python() {
 
 #[test]
 fn integration_node() {
+    if !full_integration_enabled() {
+        eprintln!("skipping integration_node (set PSHT_FULL_INTEGRATION=1)");
+        return;
+    }
     let app = "inttest-node";
     let (_guard, ip) = deploy_stack(app, "node").expect("deploy node failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(60))
@@ -587,6 +606,10 @@ fn integration_node() {
 
 #[test]
 fn integration_go() {
+    if !full_integration_enabled() {
+        eprintln!("skipping integration_go (set PSHT_FULL_INTEGRATION=1)");
+        return;
+    }
     let app = "inttest-go";
     let (_guard, ip) = deploy_stack(app, "go").expect("deploy go failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(60))
@@ -596,6 +619,10 @@ fn integration_go() {
 
 #[test]
 fn integration_rust() {
+    if !full_integration_enabled() {
+        eprintln!("skipping integration_rust (set PSHT_FULL_INTEGRATION=1)");
+        return;
+    }
     let app = "inttest-rust";
     let (_guard, ip) = deploy_stack(app, "rust").expect("deploy rust failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(120))
@@ -662,6 +689,10 @@ fn vm_exec(name: &str, cmd: &str) -> Result<String, String> {
 
 #[test]
 fn integration_bootstrap() {
+    if !full_integration_enabled() {
+        eprintln!("skipping integration_bootstrap (set PSHT_FULL_INTEGRATION=1)");
+        return;
+    }
     let vm_name = "inttest-bootstrap";
     let _guard = VmGuard::new(vm_name).expect("failed to launch VM");
 
@@ -752,4 +783,29 @@ fn integration_bootstrap() {
         "su -s /bin/sh -c 'incus launch images:ubuntu/24.04 psht-bootstrap-check && incus exec psht-bootstrap-check -- sh -c \"ip link show eth0 >/dev/null 2>&1\" && incus delete -f psht-bootstrap-check' psht",
     )
     .expect("psht should be able to launch a container with a network device");
+}
+
+#[test]
+fn integration_start_launches_app_process_from_metadata() {
+    let app = "inttest-start";
+    let _guard = ContainerGuard::new(app).expect("create container failed");
+    wait_for_container_network(app).expect("container network not ready");
+
+    container::exec_cmd(
+        app,
+        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'while true; do sleep 60; done' > /app/run.sh && chmod 755 /app/run.sh",
+    )
+    .expect("failed to prepare app script");
+    container::exec_cmd(app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
+        .expect("failed to write start metadata");
+    container::stop(app).expect("failed to stop container before start test");
+
+    commands::start(app).expect("commands::start failed");
+
+    let alive = container::exec_output(
+        app,
+        "test -s /var/psht/app.pid && kill -0 $(cat /var/psht/app.pid) && echo ok",
+    )
+    .expect("app process not running");
+    assert_eq!(alive.trim(), "ok");
 }

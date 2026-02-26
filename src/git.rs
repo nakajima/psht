@@ -14,6 +14,10 @@ fn repos_dir() -> PathBuf {
     home_dir().join("repos")
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 pub fn ensure_repo(app: &str) -> Result<PathBuf, String> {
     ensure_repo_in(app, &repos_dir())
 }
@@ -43,7 +47,11 @@ fn install_hook_at(app: &str, repo: &PathBuf) -> Result<(), String> {
     let current_exe = env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "psht".to_string());
-    let hook_content = format!("#!/bin/sh\nexec {current_exe} deploy {app}\n");
+    let hook_content = format!(
+        "#!/bin/sh\nexec {} deploy {}\n",
+        shell_quote(&current_exe),
+        shell_quote(app)
+    );
 
     if hook_path.exists() {
         let existing = fs::read_to_string(&hook_path).unwrap_or_default();
@@ -110,7 +118,7 @@ mod tests {
         let hook_path = repo.join("hooks").join("post-receive");
         assert!(hook_path.exists());
         let content = fs::read_to_string(&hook_path).unwrap();
-        assert!(content.contains("deploy hooktest"));
+        assert!(content.contains("deploy 'hooktest'"));
         assert!(content.starts_with("#!/bin/sh"));
         let perms = fs::metadata(&hook_path).unwrap().permissions();
         assert_ne!(perms.mode() & 0o111, 0, "hook should be executable");

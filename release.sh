@@ -62,22 +62,25 @@ read_toml_array() {
   ' "$file"
 }
 
-parse_version_arg() {
-  local version=""
+parse_release_args() {
+  SCRIPT_VERSION=""
+  FORWARDED_ARGS=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --version)
         shift
         [[ $# -gt 0 ]] || err "--version requires a value"
-        version="$1"
+        SCRIPT_VERSION="$1"
         ;;
       --version=*)
-        version="${1#*=}"
+        SCRIPT_VERSION="${1#*=}"
+        ;;
+      *)
+        FORWARDED_ARGS+=("$1")
         ;;
     esac
     shift || true
   done
-  echo "$version"
 }
 
 manifest_version() {
@@ -267,7 +270,8 @@ base_url="$(read_toml_string "git" "base_url" "$CONFIG_PATH")"
 [[ -n "$base_url" ]] || err "missing [git].base_url in $CONFIG_PATH"
 api_base="${base_url%/}/api/v1/repos/$repo"
 
-version="$(parse_version_arg "$@")"
+parse_release_args "$@"
+version="$SCRIPT_VERSION"
 if [[ -z "$version" ]]; then
   version="$(manifest_version)"
 fi
@@ -276,7 +280,7 @@ fi
 log_file="$(mktemp)"
 trap 'rm -f "$log_file"' EXIT
 
-if run_releasor "$log_file" "$@"; then
+if run_releasor "$log_file" "${FORWARDED_ARGS[@]}"; then
   mapfile -t succeeded_targets < <(parse_succeeded_targets "$log_file")
   upload_cli_assets "$api_base" "$token" "$version" "${succeeded_targets[@]}"
   exit 0

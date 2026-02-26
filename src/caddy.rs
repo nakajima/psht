@@ -9,6 +9,30 @@ fn route_hostname(app: &str, domain: &str) -> String {
     format!("{app}.{domain}")
 }
 
+fn validate_route_app_label(app: &str) -> Result<(), String> {
+    if app.is_empty() {
+        return Err("invalid app name for Caddy route host: empty".to_string());
+    }
+    if app.len() > 63 {
+        return Err(format!(
+            "invalid app name for Caddy route host: '{app}' exceeds 63 characters"
+        ));
+    }
+    if !app.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(format!(
+            "invalid app name for Caddy route host '{app}': only [A-Za-z0-9-] are allowed"
+        ));
+    }
+    let first = app.as_bytes()[0];
+    let last = app.as_bytes()[app.len() - 1];
+    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+        return Err(format!(
+            "invalid app name for Caddy route host '{app}': must start and end with [A-Za-z0-9]"
+        ));
+    }
+    Ok(())
+}
+
 fn route_json(app: &str, domain: &str, port: u16) -> String {
     let id = route_id(app);
     let host = route_hostname(app, domain);
@@ -99,11 +123,23 @@ fn upsert_route_list(
     routes
 }
 
-fn delete_route(api_url: &str, app: &str) {
+fn delete_route(api_url: &str, app: &str) -> Result<(), String> {
     let url = format!("{}/id/{}", api_url, route_id(app));
-    let _ = Command::new("curl")
+    let output = Command::new("curl")
         .args(["-sf", "-X", "DELETE", &url])
-        .output();
+        .output()
+        .map_err(|e| format!("failed to delete caddy route for {app}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("404") {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to delete caddy route for {app}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
 }
 
 fn add_route(api_url: &str, app: &str, domain: &str, port: u16) -> Result<(), String> {
@@ -144,6 +180,7 @@ pub fn add(app: &str, port: u16) -> Result<(), String> {
         Some(cfg) => cfg,
         None => return Ok(()),
     };
+    validate_route_app_label(app)?;
     add_route(&api_url, app, &domain, port)?;
     eprintln!("       Route: {}", route_hostname(app, &domain));
     Ok(())
@@ -154,8 +191,7 @@ pub fn remove(app: &str) -> Result<(), String> {
         Some(url) => url,
         None => return Ok(()),
     };
-    delete_route(&api_url, app);
-    Ok(())
+    delete_route(&api_url, app)
 }
 
 #[cfg(test)]
@@ -171,6 +207,17 @@ mod tests {
     #[test]
     fn route_hostname_format() {
         assert_eq!(route_hostname("myapp", "example.com"), "myapp.example.com");
+    }
+
+    #[test]
+    fn validate_route_app_label_accepts_dns_label() {
+        assert!(validate_route_app_label("my-app-1").is_ok());
+    }
+
+    #[test]
+    fn validate_route_app_label_rejects_underscore_and_dot() {
+        let err = validate_route_app_label("my_app.v1").unwrap_err();
+        assert!(err.contains("[A-Za-z0-9-]"));
     }
 
     #[test]

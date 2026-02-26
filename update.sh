@@ -11,7 +11,11 @@ err() { echo "ERROR: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || err "Run this script as root: sudo $0"
 
 log "Building psht-server and psht"
-sudo -iu "$SUDO_USER" cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --bin psht-server --bin psht
+if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -iu "$SUDO_USER" cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --bin psht-server --bin psht
+else
+    cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --bin psht-server --bin psht
+fi
 
 cp "$SCRIPT_DIR/target/debug/psht-server" /usr/local/bin/psht-server
 chmod 755 /usr/local/bin/psht-server

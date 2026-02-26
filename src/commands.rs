@@ -26,6 +26,7 @@ const STACKS: &[(&str, &str)] = &[
 ];
 
 const DEFAULT_FORGE_URL: &str = "https://git.fishmt.net/nakajima/psht";
+const START_COMMAND_PATH: &str = "/etc/psht-start-command";
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -167,7 +168,10 @@ fn command_exists(name: &str) -> bool {
         .map(|path| {
             env::split_paths(&path).any(|dir| {
                 let candidate = dir.join(name);
-                candidate.is_file()
+                candidate
+                    .metadata()
+                    .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+                    .unwrap_or(false)
             })
         })
         .unwrap_or(false)
@@ -1028,6 +1032,40 @@ fn start_cmd(port: u16, cmd: &str) -> String {
     )
 }
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn write_start_command_cmd(cmd: &str) -> Result<String, String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return Err("start command is empty".to_string());
+    }
+    let escaped = shell_quote(cmd);
+    Ok(format!(
+        "mkdir -p /etc && printf '%s\\n' {escaped} > {START_COMMAND_PATH}"
+    ))
+}
+
+fn persist_start_command(app: &str, cmd: &str) -> Result<(), String> {
+    let command = write_start_command_cmd(cmd)?;
+    container::exec_cmd(app, &command)
+}
+
+fn read_start_command(app: &str) -> Result<String, String> {
+    let cmd = container::exec_output(
+        app,
+        &format!("cat {START_COMMAND_PATH} 2>/dev/null || true"),
+    )?;
+    let cmd = cmd.trim().to_string();
+    if cmd.is_empty() {
+        return Err(format!(
+            "missing start command metadata at {START_COMMAND_PATH}; redeploy app '{app}'"
+        ));
+    }
+    Ok(cmd)
+}
+
 pub fn deploy(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
@@ -1153,6 +1191,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     eprintln!("-----> Pushing code to container");
     container::push_code(app, &code_dir.to_string_lossy())?;
+    persist_start_command(app, &config.start_command)?;
 
     if !config.install_command.is_empty() {
         eprintln!("-----> Installing dependencies");
@@ -1305,11 +1344,22 @@ fi
 target=$(detect_target)
 asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz"
 tmpdir=$(mktemp -d)
-rm -f "$PSHT_BIN"
+trap 'rm -rf "$tmpdir"' EXIT
 curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"
 tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
-install -m 755 "$tmpdir/psht" "$PSHT_BIN"
-rm -rf "$tmpdir"
+candidate="$tmpdir/psht"
+if [ ! -x "$candidate" ]; then
+  echo "error: downloaded archive missing executable psht binary" >&2
+  exit 1
+fi
+candidate_version=$("$candidate" --version 2>/dev/null | awk '{{print $2}}') || candidate_version=""
+if [ "$candidate_version" != "{version}" ]; then
+  echo "error: downloaded psht ${{candidate_version:-unknown}}, expected {version}" >&2
+  exit 1
+fi
+staged="$tmpdir/psht.new"
+install -m 755 "$candidate" "$staged"
+mv "$staged" "$PSHT_BIN"
 installed=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || installed=""
 if [ "$installed" != "{version}" ]; then
   echo "error: installed psht ${{installed:-unknown}}, expected {version}" >&2
@@ -1873,6 +1923,14 @@ pub fn start(app: &str) -> Result<(), String> {
     }
     eprintln!("-----> Starting {app}");
     container::start(app)?;
+    let command = read_start_command(app)?;
+    let port = allocate_port(app);
+    container::exec_cmd(app, &start_cmd(port, &command))?;
+    if tailscale::dns_name_in_container(app).is_some()
+        && let Err(e) = tailscale::expose_http_in_container(app, port)
+    {
+        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+    }
     eprintln!("=====> {app} started");
     Ok(())
 }
@@ -2023,15 +2081,20 @@ mod tests {
     }
 
     #[test]
-    fn update_script_removes_before_install() {
+    fn update_script_replaces_atomically() {
         let script = update_script("example.com");
-        let rm_pos = script
-            .find("rm -f \"$PSHT_BIN\"")
-            .expect("should rm the old binary to avoid ETXTBSY");
-        let install_pos = script
-            .find("install -m 755 \"$tmpdir/psht\" \"$PSHT_BIN\"")
-            .expect("should install the new binary");
-        assert!(rm_pos < install_pos, "rm must come before install");
+        assert!(
+            !script.contains("rm -f \"$PSHT_BIN\""),
+            "should not remove current binary before replacement is staged"
+        );
+        assert!(
+            script.contains("install -m 755 \"$candidate\" \"$staged\""),
+            "should install candidate to staged path first"
+        );
+        assert!(
+            script.contains("mv \"$staged\" \"$PSHT_BIN\""),
+            "should atomically swap staged binary into place"
+        );
     }
 
     #[test]
@@ -2059,6 +2122,14 @@ mod tests {
     #[test]
     fn update_script_verifies_installed_version() {
         let script = update_script("example.com");
+        assert!(
+            script.contains("candidate_version=$(\"$candidate\" --version"),
+            "should verify downloaded candidate version before replacement"
+        );
+        assert!(
+            script.contains("downloaded psht ${candidate_version:-unknown}, expected"),
+            "should fail when downloaded candidate version mismatches"
+        );
         assert!(
             script.contains("installed=$(\"$PSHT_BIN\" --version"),
             "should read installed version after downloading"
@@ -2729,5 +2800,23 @@ devices:
         assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && export PORT=3737 && {"));
         assert!(cmd.contains("export PORT=3737 &&"));
         assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("echo 'hi'"), "'echo '\"'\"'hi'\"'\"''");
+    }
+
+    #[test]
+    fn write_start_command_cmd_rejects_empty() {
+        let err = write_start_command_cmd(" \n ").unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn write_start_command_cmd_targets_metadata_path() {
+        let cmd = write_start_command_cmd("./app --flag").unwrap();
+        assert!(cmd.contains(START_COMMAND_PATH));
+        assert!(cmd.contains("printf '%s\\n'"));
     }
 }

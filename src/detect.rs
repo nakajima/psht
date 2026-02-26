@@ -74,9 +74,24 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
 
     let start_command = read_procfile(dir);
 
+    if is_bun_project(dir) {
+        let start = start_command
+            .clone()
+            .unwrap_or_else(|| AppType::Bun.default_start_command().to_string());
+        let install = if dir.join("package.json").exists() {
+            AppType::Bun.install_command()
+        } else {
+            ""
+        };
+        return Ok(AppConfig {
+            app_type: AppType::Bun,
+            start_command: start,
+            install_command: install.to_string(),
+        });
+    }
+
     let markers: &[(&str, AppType)] = &[
         ("Cargo.toml", AppType::Rust),
-        ("index.ts", AppType::Bun),
         ("package.json", AppType::Node),
         ("requirements.txt", AppType::Python),
         ("Pipfile", AppType::Python),
@@ -101,6 +116,12 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
     }
 
     Err("could not detect app type".to_string())
+}
+
+fn is_bun_project(dir: &Path) -> bool {
+    let has_bun_marker = dir.join("bun.lockb").exists() || dir.join("bunfig.toml").exists();
+    let has_index_ts = dir.join("index.ts").exists();
+    has_bun_marker || (has_index_ts && !dir.join("package.json").exists())
 }
 
 fn read_start_command_file(dir: &Path) -> Result<Option<String>, String> {
@@ -164,9 +185,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("index.ts"), "").unwrap();
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("bun.lockb"), "").unwrap();
         let config = detect(tmp.path()).unwrap();
         assert_eq!(config.app_type, AppType::Bun);
         assert!(config.install_command.contains("bun install"));
+    }
+
+    #[test]
+    fn node_typescript_project_prefers_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("index.ts"), "console.log('hi')").unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Node);
+        assert_eq!(config.start_command, "npm start");
+    }
+
+    #[test]
+    fn bun_marker_overrides_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("index.ts"), "console.log('hi')").unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("bunfig.toml"), "").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Bun);
     }
 
     #[test]

@@ -69,14 +69,23 @@ fn parse_auth_key(json: &str) -> Result<String, String> {
         .ok_or_else(|| "missing key in auth key response".to_string())
 }
 
+fn oauth_token_request_args(client_id: &str, client_secret: &str) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        "--data-urlencode".to_string(),
+        format!("client_id={client_id}"),
+        "--data-urlencode".to_string(),
+        format!("client_secret={client_secret}"),
+        "https://api.tailscale.com/api/v2/oauth/token".to_string(),
+    ]
+}
+
 pub fn oauth_token(client_id: &str, client_secret: &str) -> Result<String, String> {
+    let args = oauth_token_request_args(client_id, client_secret);
     let output = Command::new("curl")
-        .args(["-s", "-X", "POST"])
-        .args([
-            "-d",
-            &format!("client_id={client_id}&client_secret={client_secret}"),
-        ])
-        .arg("https://api.tailscale.com/api/v2/oauth/token")
+        .args(&args)
         .output()
         .map_err(|e| format!("failed to request OAuth token: {e}"))?;
 
@@ -253,6 +262,14 @@ mod tests {
         let json = r#"{"access_token":"tok123","token_type":"Bearer","expires_in":3600}"#;
         let token = parse_oauth_token(json).unwrap();
         assert_eq!(token, "tok123");
+    }
+
+    #[test]
+    fn oauth_token_request_uses_urlencoding() {
+        let args = oauth_token_request_args("id@x", "sec&ret");
+        assert!(args.contains(&"--data-urlencode".to_string()));
+        assert!(args.contains(&"client_id=id@x".to_string()));
+        assert!(args.contains(&"client_secret=sec&ret".to_string()));
     }
 
     #[test]
