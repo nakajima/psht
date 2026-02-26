@@ -30,8 +30,9 @@ struct Cli {
 enum Command {
     /// Print setup script for local CLI install
     Setup,
-    /// Print update script for local CLI
-    Update,
+    /// Update local CLI
+    #[command(name = "update-cli")]
+    UpdateCli,
     /// List running apps
     Ps,
     /// Show app logs
@@ -139,7 +140,7 @@ fn run() -> Result<(), String> {
             commands::destroy(&app)
         }
         Command::Setup => commands::setup(),
-        Command::Update => commands::update(),
+        Command::UpdateCli => commands::update(),
         Command::Bootstrap => commands::bootstrap(),
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
@@ -295,6 +296,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_cli() {
+        let cli = parse_cli(&["psht-server", "update-cli"]).unwrap();
+        assert_eq!(cli.command, Command::UpdateCli);
+    }
+
+    #[test]
     fn parse_init_stacks() {
         let cli = parse_cli(&["psht-server", "init-stacks"]).unwrap();
         assert_eq!(cli.command, Command::InitStacks);
@@ -380,6 +387,14 @@ mod tests {
         synthetic.extend(shell_words::split("setup").unwrap());
         let cli = Cli::try_parse_from(synthetic).unwrap();
         assert_eq!(cli.command, Command::Setup);
+    }
+
+    #[test]
+    fn parse_shell_dash_c_update_cli() {
+        let mut synthetic = vec!["psht-server".to_string()];
+        synthetic.extend(shell_words::split("update-cli").unwrap());
+        let cli = Cli::try_parse_from(synthetic).unwrap();
+        assert_eq!(cli.command, Command::UpdateCli);
     }
 
     #[test]

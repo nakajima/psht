@@ -265,7 +265,7 @@ fn setup_project_in(host: &str, cwd: &Path, config_path: &Path) -> Result<(), St
 fn update(host: &str) -> Result<(), String> {
     let mut ssh = Command::new("ssh")
         .arg(format!("psht@{host}"))
-        .arg("update")
+        .arg("update-cli")
         .stdout(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run ssh: {e}"))?;
