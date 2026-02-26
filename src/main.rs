@@ -45,7 +45,7 @@ enum Command {
     Stop { app: String },
     /// Start a stopped app
     Start { app: String },
-    /// Stop and remove an app
+    /// Stop and remove an app (Caddy routing cleanup is experimental)
     Destroy { app: String },
     /// Set up this server as a psht host
     Bootstrap,

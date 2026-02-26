@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Deploy the current directory
+    /// Deploy the current directory (Caddy routing is experimental)
     Deploy {
         /// App name or path to a binary (defaults to current directory name)
         app: Option<String>,
@@ -42,7 +42,7 @@ enum CliCommand {
     },
     /// Stop an app
     Stop { app: String },
-    /// Stop and remove an app
+    /// Stop and remove an app (Caddy routing cleanup is experimental)
     Destroy { app: String },
     /// Set up project for deployment
     Setup,
