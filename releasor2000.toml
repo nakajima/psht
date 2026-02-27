@@ -15,8 +15,7 @@ targets = [
 ]
 
 [git]
-type = "gitea"                  # defaults to "github"
-base_url = "https://git.fishmt.net"
+base_url = "https://github.com"
 # token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
 
 [channels.git]
