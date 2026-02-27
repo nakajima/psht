@@ -1,6 +1,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -134,6 +135,38 @@ fn write_file(app: &str, path: &str, content: &str) -> Result<(), String> {
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn launch_app_background(app: &str, cmd: &str) -> Result<(), String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return Err("launch command is empty".to_string());
+    }
+
+    let escaped = shell_escape(cmd);
+    let launch_cmd = format!(
+        "mkdir -p /var/psht && cd /app && export PORT={APP_PORT} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > /var/psht/app.pid; }}"
+    );
+    container::exec_cmd(app, &launch_cmd)?;
+
+    // Confirm the process is actually alive, not just that a PID was written.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if exec_output(
+            app,
+            "test -s /var/psht/app.pid && kill -0 $(cat /var/psht/app.pid) && echo ok",
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(format!(
+        "app process failed to stay up after launch: {cmd}\n{}",
+        debug_info(app)
+    ))
 }
 
 fn scaffold_static(app: &str) -> Result<(), String> {
@@ -292,23 +325,15 @@ fn deploy_stack(app: &str, stack: &str) -> Result<(ContainerGuard, String), Stri
 
     // Start the app
     let start_cmd = match stack {
-        "binary" => format!("cd /app && PORT={APP_PORT} nohup ./app > /var/psht/app.log 2>&1 &"),
-        "static" => format!(
-            "cd /app && PORT={APP_PORT} nohup python3 -m http.server {APP_PORT} > /var/psht/app.log 2>&1 &"
-        ),
-        "python" => {
-            format!("cd /app && PORT={APP_PORT} nohup python3 app.py > /var/psht/app.log 2>&1 &")
-        }
-        "node" => {
-            format!("cd /app && PORT={APP_PORT} nohup node server.js > /var/psht/app.log 2>&1 &")
-        }
-        "go" => format!("cd /app && PORT={APP_PORT} nohup ./app > /var/psht/app.log 2>&1 &"),
-        "rust" => format!(
-            "cd /app && PORT={APP_PORT} nohup ./target/release/app > /var/psht/app.log 2>&1 &"
-        ),
+        "binary" => "./app",
+        "static" => "python3 -m http.server \"$PORT\"",
+        "python" => "python3 app.py",
+        "node" => "node server.js",
+        "go" => "./app",
+        "rust" => "./target/release/app",
         _ => unreachable!(),
     };
-    container::exec_cmd(app, &start_cmd)?;
+    launch_app_background(app, start_cmd)?;
 
     // Brief pause to let the app bind its port
     thread::sleep(Duration::from_secs(2));
@@ -436,8 +461,21 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn full_integration_enabled() -> bool {
-    std::env::var_os("PSHT_FULL_INTEGRATION").is_some()
+fn integration_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("warning: integration lock poisoned; continuing");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn unique_name(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{pid}-{n}", pid = std::process::id())
 }
 
 struct CaddyEnvGuard {
@@ -448,7 +486,13 @@ struct CaddyEnvGuard {
 
 impl CaddyEnvGuard {
     fn set(api_url: &str, domain: Option<&str>) -> Self {
-        let lock = env_lock().lock().expect("env lock poisoned");
+        let lock = match env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("warning: env lock poisoned; continuing");
+                poisoned.into_inner()
+            }
+        };
         let old_api_url = std::env::var("CADDY_API_URL").ok();
         let old_domain = std::env::var("CADDY_DOMAIN").ok();
 
@@ -487,28 +531,23 @@ impl Drop for CaddyEnvGuard {
 
 #[test]
 fn integration_caddy_end_to_end_with_real_container() {
-    if !full_integration_enabled() {
-        eprintln!(
-            "skipping integration_caddy_end_to_end_with_real_container (set PSHT_FULL_INTEGRATION=1)"
-        );
-        return;
-    }
-    let app = "inttest-caddy-app";
-    let caddy_app = "inttest-caddy";
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-caddy-app");
+    let caddy_app = unique_name("inttest-caddy");
 
-    let (_app_guard, app_ip) = deploy_stack(app, "static").expect("deploy app failed");
+    let (_app_guard, app_ip) = deploy_stack(&app, "static").expect("deploy app failed");
     let (_caddy_guard, caddy_ip) =
-        setup_caddy_container(caddy_app, app, &app_ip).expect("setup caddy failed");
+        setup_caddy_container(&caddy_app, &app, &app_ip).expect("setup caddy failed");
 
     let api_url = format!("http://{caddy_ip}:2019");
     let route_host = format!("{app}.example.com");
 
     {
         let _env = CaddyEnvGuard::set(&api_url, Some("example.com"));
-        if let Err(e) = caddy::add(app, APP_PORT) {
+        if let Err(e) = caddy::add(&app, APP_PORT) {
             panic!(
                 "caddy add failed: {e}\ncaddy debug:\n{}",
-                caddy_debug_info(caddy_app)
+                caddy_debug_info(&caddy_app)
             );
         }
     }
@@ -524,15 +563,15 @@ fn integration_caddy_end_to_end_with_real_container() {
     .unwrap_or_else(|e| {
         panic!(
             "caddy route did not proxy app: {e}\napp debug:\n{}\ncaddy debug:\n{}",
-            debug_info(app),
-            caddy_debug_info(caddy_app)
+            debug_info(&app),
+            caddy_debug_info(&caddy_app)
         )
     });
     assert!(resp.contains("ok"), "expected proxied app response: {resp}");
 
     {
         let _env = CaddyEnvGuard::set(&api_url, None);
-        caddy::remove(app).expect("caddy remove failed");
+        caddy::remove(&app).expect("caddy remove failed");
     }
 
     let removed = wait_for_http_with_host(
@@ -546,7 +585,7 @@ fn integration_caddy_end_to_end_with_real_container() {
     .unwrap_or_else(|e| {
         panic!(
             "caddy route was not removed: {e}\ncaddy debug:\n{}",
-            caddy_debug_info(caddy_app)
+            caddy_debug_info(&caddy_app)
         )
     });
     assert!(
@@ -557,76 +596,66 @@ fn integration_caddy_end_to_end_with_real_container() {
 
 #[test]
 fn integration_static() {
-    let app = "inttest-static";
-    let (_guard, ip) = deploy_stack(app, "static").expect("deploy static failed");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-static");
+    let (_guard, ip) = deploy_stack(&app, "static").expect("deploy static failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
-        .unwrap_or_else(|e| panic!("static app not reachable: {e}\n{}", debug_info(app)));
+        .unwrap_or_else(|e| panic!("static app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
 #[test]
 fn integration_binary_no_procfile() {
-    let app = "inttest-binary";
-    let (_guard, ip) = deploy_stack(app, "binary").expect("deploy binary failed");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-binary");
+    let (_guard, ip) = deploy_stack(&app, "binary").expect("deploy binary failed");
 
-    let marker = exec_output(app, "cat /app/.psht-start-command").expect("read marker failed");
+    let marker = exec_output(&app, "cat /app/.psht-start-command").expect("read marker failed");
     assert_eq!(marker.trim(), "./app", "expected start-command marker");
-    exec_output(app, "test ! -f /app/Procfile").expect("Procfile should not exist");
+    exec_output(&app, "test ! -f /app/Procfile").expect("Procfile should not exist");
 
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
-        .unwrap_or_else(|e| panic!("binary app not reachable: {e}\n{}", debug_info(app)));
+        .unwrap_or_else(|e| panic!("binary app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
 #[test]
 fn integration_python() {
-    if !full_integration_enabled() {
-        eprintln!("skipping integration_python (set PSHT_FULL_INTEGRATION=1)");
-        return;
-    }
-    let app = "inttest-python";
-    let (_guard, ip) = deploy_stack(app, "python").expect("deploy python failed");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-python");
+    let (_guard, ip) = deploy_stack(&app, "python").expect("deploy python failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(30))
-        .unwrap_or_else(|e| panic!("python app not reachable: {e}\n{}", debug_info(app)));
+        .unwrap_or_else(|e| panic!("python app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
 #[test]
 fn integration_node() {
-    if !full_integration_enabled() {
-        eprintln!("skipping integration_node (set PSHT_FULL_INTEGRATION=1)");
-        return;
-    }
-    let app = "inttest-node";
-    let (_guard, ip) = deploy_stack(app, "node").expect("deploy node failed");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-node");
+    let (_guard, ip) = deploy_stack(&app, "node").expect("deploy node failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(60))
-        .unwrap_or_else(|e| panic!("node app not reachable: {e}\n{}", debug_info(app)));
+        .unwrap_or_else(|e| panic!("node app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
 #[test]
 fn integration_go() {
-    if !full_integration_enabled() {
-        eprintln!("skipping integration_go (set PSHT_FULL_INTEGRATION=1)");
-        return;
-    }
-    let app = "inttest-go";
-    let (_guard, ip) = deploy_stack(app, "go").expect("deploy go failed");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-go");
+    let (_guard, ip) = deploy_stack(&app, "go").expect("deploy go failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(60))
-        .unwrap_or_else(|e| panic!("go app not reachable: {e}\n{}", debug_info(app)));
+        .unwrap_or_else(|e| panic!("go app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
 #[test]
 fn integration_rust() {
-    if !full_integration_enabled() {
-        eprintln!("skipping integration_rust (set PSHT_FULL_INTEGRATION=1)");
-        return;
-    }
-    let app = "inttest-rust";
-    let (_guard, ip) = deploy_stack(app, "rust").expect("deploy rust failed");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-rust");
+    let (_guard, ip) = deploy_stack(&app, "rust").expect("deploy rust failed");
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(120))
-        .unwrap_or_else(|e| panic!("rust app not reachable: {e}\n{}", debug_info(app)));
+        .unwrap_or_else(|e| panic!("rust app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
@@ -689,15 +718,12 @@ fn vm_exec(name: &str, cmd: &str) -> Result<String, String> {
 
 #[test]
 fn integration_bootstrap() {
-    if !full_integration_enabled() {
-        eprintln!("skipping integration_bootstrap (set PSHT_FULL_INTEGRATION=1)");
-        return;
-    }
-    let vm_name = "inttest-bootstrap";
-    let _guard = VmGuard::new(vm_name).expect("failed to launch VM");
+    let _serial = integration_test_lock();
+    let vm_name = unique_name("inttest-bootstrap");
+    let _guard = VmGuard::new(&vm_name).expect("failed to launch VM");
 
     // Wait for the VM agent to be ready (VMs take longer than containers)
-    wait_for_vm_agent(vm_name, Duration::from_secs(120)).expect("VM agent not ready");
+    wait_for_vm_agent(&vm_name, Duration::from_secs(120)).expect("VM agent not ready");
 
     // Build and push the latest psht-server binary into the VM at a non-standard path.
     let build_status = Command::new("cargo")
@@ -710,7 +736,7 @@ fn integration_bootstrap() {
     );
 
     let psht_bin = format!("{}/target/debug/psht-server", env!("CARGO_MANIFEST_DIR"));
-    vm_exec(vm_name, "mkdir -p /opt/psht/bin").expect("failed to create /opt/psht/bin");
+    vm_exec(&vm_name, "mkdir -p /opt/psht/bin").expect("failed to create /opt/psht/bin");
     let status = Command::new("incus")
         .args([
             "file",
@@ -723,13 +749,13 @@ fn integration_bootstrap() {
     assert!(status.success(), "incus file push failed");
 
     // Make it executable
-    vm_exec(vm_name, "chmod 755 /opt/psht/bin/psht-server").expect("failed to chmod psht-server");
+    vm_exec(&vm_name, "chmod 755 /opt/psht/bin/psht-server").expect("failed to chmod psht-server");
 
     // Run bootstrap with Tailscale skipped
     let output = Command::new("incus")
         .args([
             "exec",
-            vm_name,
+            &vm_name,
             "--",
             "sh",
             "-c",
@@ -745,41 +771,41 @@ fn integration_bootstrap() {
     );
 
     // Verify: user psht exists
-    vm_exec(vm_name, "id psht").expect("user psht should exist");
+    vm_exec(&vm_name, "id psht").expect("user psht should exist");
     vm_exec(
-        vm_name,
+        &vm_name,
         "stat -c '%U:%G' /home/psht | grep -q '^psht:psht$'",
     )
     .expect("/home/psht should be owned by psht");
     vm_exec(
-        vm_name,
+        &vm_name,
         "su -s /bin/sh -c 'mkdir -p /home/psht/.config/incus && test -w /home/psht/.config/incus' psht",
     )
     .expect("psht should be able to create ~/.config/incus");
 
     // Verify: stacks directory has 7 .sh files
     let count =
-        vm_exec(vm_name, "ls /home/psht/stacks/*.sh | wc -l").expect("failed to count stacks");
+        vm_exec(&vm_name, "ls /home/psht/stacks/*.sh | wc -l").expect("failed to count stacks");
     assert_eq!(count.trim(), "7", "expected 7 stack scripts, got {count}");
 
     // Verify: repos and builds directories exist
-    vm_exec(vm_name, "test -d /home/psht/repos").expect("/home/psht/repos should exist");
-    vm_exec(vm_name, "test -d /home/psht/builds").expect("/home/psht/builds should exist");
-    vm_exec(vm_name, "test -f /home/psht/.hushlogin").expect("/home/psht/.hushlogin should exist");
+    vm_exec(&vm_name, "test -d /home/psht/repos").expect("/home/psht/repos should exist");
+    vm_exec(&vm_name, "test -d /home/psht/builds").expect("/home/psht/builds should exist");
+    vm_exec(&vm_name, "test -f /home/psht/.hushlogin").expect("/home/psht/.hushlogin should exist");
 
     // Verify: psht shell path is the dropped binary path.
     vm_exec(
-        vm_name,
+        &vm_name,
         "getent passwd psht | grep -q ':/opt/psht/bin/psht-server$'",
     )
     .expect("psht user shell should be /opt/psht/bin/psht-server");
-    vm_exec(vm_name, "grep -qx /opt/psht/bin/psht-server /etc/shells")
+    vm_exec(&vm_name, "grep -qx /opt/psht/bin/psht-server /etc/shells")
         .expect("/opt/psht/bin/psht-server should be in /etc/shells");
 
     // Verify: incus is installed
-    vm_exec(vm_name, "command -v incus").expect("incus should be installed");
+    vm_exec(&vm_name, "command -v incus").expect("incus should be installed");
     vm_exec(
-        vm_name,
+        &vm_name,
         "su -s /bin/sh -c 'incus launch images:ubuntu/24.04 psht-bootstrap-check && incus exec psht-bootstrap-check -- sh -c \"ip link show eth0 >/dev/null 2>&1\" && incus delete -f psht-bootstrap-check' psht",
     )
     .expect("psht should be able to launch a container with a network device");
@@ -787,23 +813,24 @@ fn integration_bootstrap() {
 
 #[test]
 fn integration_start_launches_app_process_from_metadata() {
-    let app = "inttest-start";
-    let _guard = ContainerGuard::new(app).expect("create container failed");
-    wait_for_container_network(app).expect("container network not ready");
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-start");
+    let _guard = ContainerGuard::new(&app).expect("create container failed");
+    wait_for_container_network(&app).expect("container network not ready");
 
     container::exec_cmd(
-        app,
+        &app,
         "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'while true; do sleep 60; done' > /app/run.sh && chmod 755 /app/run.sh",
     )
     .expect("failed to prepare app script");
-    container::exec_cmd(app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
+    container::exec_cmd(&app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
         .expect("failed to write start metadata");
-    container::stop(app).expect("failed to stop container before start test");
+    container::stop(&app).expect("failed to stop container before start test");
 
-    commands::start(app).expect("commands::start failed");
+    commands::start(&app).expect("commands::start failed");
 
     let alive = container::exec_output(
-        app,
+        &app,
         "test -s /var/psht/app.pid && kill -0 $(cat /var/psht/app.pid) && echo ok",
     )
     .expect("app process not running");

@@ -214,7 +214,7 @@ pub fn exec_cmd(app: &str, cmd: &str) -> Result<(), String> {
     incus()
         .arg("exec")
         .arg(container_name(app))
-        .args(&["--", "sh", "-c", cmd])
+        .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
         .run()
 }
 
@@ -222,7 +222,7 @@ pub fn exec_cmd_rolling(app: &str, cmd: &str, window: usize) -> Result<(), Strin
     incus()
         .arg("exec")
         .arg(container_name(app))
-        .args(&["--", "sh", "-c", cmd])
+        .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
         .run_rolling(window)
 }
 
@@ -230,7 +230,7 @@ pub fn exec_output(app: &str, cmd: &str) -> Result<String, String> {
     incus()
         .arg("exec")
         .arg(container_name(app))
-        .args(&["--", "sh", "-c", cmd])
+        .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
         .output()
 }
 

@@ -1027,8 +1027,9 @@ fn allocate_port(app: &str) -> u16 {
 }
 
 fn start_cmd(port: u16, cmd: &str) -> String {
+    let escaped = shell_quote(cmd);
     format!(
-        "mkdir -p /var/psht && cd /app && export PORT={port} && {{ nohup {cmd} > /var/psht/app.log 2>&1 & echo $! > /var/psht/app.pid; }}"
+        "mkdir -p /var/psht && cd /app && export PORT={port} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > /var/psht/app.pid; }}"
     )
 }
 
@@ -2794,11 +2795,13 @@ devices:
 
     #[test]
     fn start_cmd_backgrounds_with_pid_file() {
-        // The start command must use { } grouping so only nohup is backgrounded,
+        // The start command must use { } grouping so launch + PID capture are
+        // synchronous, while the app process is detached in a separate session.
         // and echo writes the pid synchronously before the group exits.
         let cmd = start_cmd(3737, "bun run index.ts");
         assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && export PORT=3737 && {"));
         assert!(cmd.contains("export PORT=3737 &&"));
+        assert!(cmd.contains("setsid sh -c 'bun run index.ts'"));
         assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
     }
 

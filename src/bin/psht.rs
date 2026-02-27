@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 #[path = "../app_name.rs"]
 mod app_name;
+
+const PROJECT_CONFIG_FILE: &str = "psht.toml";
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +33,18 @@ enum CliCommand {
     Deploy {
         /// App name or path to a binary (defaults to current directory name)
         app: Option<String>,
+        /// Release artifact URL (.tar.gz/.tgz/.zip)
+        #[arg(long)]
+        url: Option<String>,
+        /// Custom start command
+        #[arg(long)]
+        start: Option<String>,
+        /// App name for release deploys
+        #[arg(long = "app")]
+        app_flag: Option<String>,
+        /// Path to binary inside archive
+        #[arg(long)]
+        bin: Option<String>,
     },
     /// List running apps
     Ps,
@@ -60,8 +75,30 @@ struct Config {
     projects: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct ProjectConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bin: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ArchiveFormat {
+    TarGz,
+    Zip,
+}
+
 fn config_path_at(home: &Path) -> PathBuf {
     home.join(".psht").join("config.toml")
+}
+
+fn project_config_path(cwd: &Path) -> PathBuf {
+    cwd.join(PROJECT_CONFIG_FILE)
 }
 
 fn load_config_from(path: &Path) -> Config {
@@ -69,6 +106,23 @@ fn load_config_from(path: &Path) -> Config {
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn load_project_config(path: &Path) -> Result<Option<ProjectConfig>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let cfg: ProjectConfig =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(cfg))
+}
+
+fn save_project_config(path: &Path, cfg: &ProjectConfig) -> Result<(), String> {
+    let content = toml::to_string_pretty(cfg)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 fn resolve_host_from(config: &Config, cwd: &str) -> Result<String, String> {
@@ -161,19 +215,35 @@ fn resolve_binary_path(cwd: &Path, value: &str) -> PathBuf {
     }
 }
 
-fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
-    let file_name = binary_path
-        .file_name()
-        .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
-
+fn mktemp_dir(prefix: &str) -> Result<PathBuf, String> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let staging = env::temp_dir().join(format!("psht-bin-{}-{ts}", process::id()));
-    fs::create_dir_all(&staging)
-        .map_err(|e| format!("failed to create staging dir {}: {e}", staging.display()))?;
+    let dir = env::temp_dir().join(format!("{prefix}-{}-{ts}", process::id()));
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create staging dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
 
+fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
+    let file_name = binary_path
+        .file_name()
+        .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
+    let start_cmd = format!("./{}", file_name.to_string_lossy());
+    stage_binary_dir_with_start(binary_path, &start_cmd)
+}
+
+fn stage_binary_dir_with_start(binary_path: &Path, start: &str) -> Result<PathBuf, String> {
+    let file_name = binary_path
+        .file_name()
+        .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
+    let start = start.trim();
+    if start.is_empty() {
+        return Err("start command is empty".to_string());
+    }
+
+    let staging = mktemp_dir("psht-bin")?;
     let staged_bin = staging.join(file_name);
     fs::copy(binary_path, &staged_bin).map_err(|e| {
         format!(
@@ -185,13 +255,8 @@ fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
     fs::set_permissions(&staged_bin, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("failed to chmod {}: {e}", staged_bin.display()))?;
 
-    let start_cmd = format!("./{}", file_name.to_string_lossy());
-    fs::write(
-        staging.join(".psht-start-command"),
-        format!("{start_cmd}\n"),
-    )
-    .map_err(|e| format!("failed to write .psht-start-command: {e}"))?;
-
+    fs::write(staging.join(".psht-start-command"), format!("{start}\n"))
+        .map_err(|e| format!("failed to write .psht-start-command: {e}"))?;
     Ok(staging)
 }
 
@@ -207,20 +272,453 @@ fn deploy(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
 }
 
 fn deploy_with_app_or_binary(host: &str, cwd: &Path, value: Option<&str>) -> Result<(), String> {
-    if let Some(arg) = value {
-        if looks_like_path(arg) {
-            let binary_path = resolve_binary_path(cwd, arg);
-            if !binary_path.is_file() {
-                return Err(format!("binary not found: {}", binary_path.display()));
-            }
-            let name = app_name(None, cwd);
-            app_name::validate_app_name(&name)?;
-            return deploy_binary(host, &name, &binary_path);
+    if let Some(arg) = value
+        && looks_like_path(arg)
+    {
+        let binary_path = resolve_binary_path(cwd, arg);
+        if !binary_path.is_file() {
+            return Err(format!("binary not found: {}", binary_path.display()));
         }
+        let name = app_name(None, cwd);
+        app_name::validate_app_name(&name)?;
+        return deploy_binary(host, &name, &binary_path);
     }
     let name = app_name(value, cwd);
     app_name::validate_app_name(&name)?;
     deploy(host, &name, cwd)
+}
+
+fn path_from_url(url: &str) -> &str {
+    let no_fragment = url.split('#').next().unwrap_or(url);
+    no_fragment.split('?').next().unwrap_or(no_fragment)
+}
+
+fn detect_archive_format(url: &str) -> Result<ArchiveFormat, String> {
+    let path = path_from_url(url).to_ascii_lowercase();
+    if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+        return Ok(ArchiveFormat::TarGz);
+    }
+    if path.ends_with(".zip") {
+        return Ok(ArchiveFormat::Zip);
+    }
+    Err("unsupported archive format; expected .tar.gz, .tgz, or .zip URL".to_string())
+}
+
+fn download_url_to_file(url: &str, out: &Path) -> Result<(), String> {
+    let status = Command::new("curl")
+        .arg("-fsSL")
+        .arg(url)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to download {url} (curl exited with {status})"
+        ));
+    }
+    Ok(())
+}
+
+fn extract_tar_gz(archive_path: &Path, out_dir: &Path) -> Result<(), String> {
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(out_dir)
+        .status()
+        .map_err(|e| format!("failed to run tar: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to unpack {} (tar exited with {status})",
+            archive_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn extract_zip(archive_path: &Path, out_dir: &Path) -> Result<(), String> {
+    let status = Command::new("unzip")
+        .arg("-qq")
+        .arg(archive_path)
+        .arg("-d")
+        .arg(out_dir)
+        .status()
+        .map_err(|e| format!("failed to run unzip: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to unpack {} (unzip exited with {status})",
+            archive_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn extract_archive(archive_path: &Path, out_dir: &Path, fmt: ArchiveFormat) -> Result<(), String> {
+    match fmt {
+        ArchiveFormat::TarGz => extract_tar_gz(archive_path, out_dir),
+        ArchiveFormat::Zip => extract_zip(archive_path, out_dir),
+    }
+}
+
+fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("failed to read dir entry: {e}"))?;
+        let path = entry.path();
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            collect_regular_files(&path, out)?;
+        } else if meta.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_executable(path: &Path) -> Result<bool, String> {
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+        .permissions()
+        .mode();
+    Ok(mode & 0o111 != 0)
+}
+
+fn safe_join_relative(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err("`bin` must be a relative path inside the archive".to_string());
+    }
+    if rel_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+    {
+        return Err("`bin` cannot contain parent-directory traversal".to_string());
+    }
+    Ok(base.join(rel_path))
+}
+
+fn resolve_binary_from_archive(extracted_dir: &Path, bin: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(bin) = bin {
+        let bin = bin.trim();
+        if bin.is_empty() {
+            return Err("`bin` cannot be empty".to_string());
+        }
+        let candidate = safe_join_relative(extracted_dir, bin)?;
+        if !candidate.is_file() {
+            return Err(format!("`bin` target not found in archive: {bin}"));
+        }
+        return Ok(candidate);
+    }
+
+    let mut files = Vec::new();
+    collect_regular_files(extracted_dir, &mut files)?;
+    if files.is_empty() {
+        return Err("archive did not contain files".to_string());
+    }
+
+    let mut executable = Vec::new();
+    for file in &files {
+        if is_executable(file)? {
+            executable.push(file.clone());
+        }
+    }
+
+    if executable.len() == 1 {
+        return Ok(executable.remove(0));
+    }
+    if executable.is_empty() && files.len() == 1 {
+        return Ok(files.remove(0));
+    }
+    if executable.is_empty() {
+        return Err(
+            "no executable found in archive; set `bin` in psht.toml to select one file".to_string(),
+        );
+    }
+    Err("multiple executable files found; set `bin` in psht.toml to choose one".to_string())
+}
+
+fn stage_binary_from_url(url: &str, start: &str, bin: Option<&str>) -> Result<PathBuf, String> {
+    let tmp = mktemp_dir("psht-release")?;
+    let archive_path = tmp.join("asset");
+    let extract_dir = tmp.join("extract");
+    fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("failed to create {}: {e}", extract_dir.display()))?;
+
+    let fmt = detect_archive_format(url)?;
+    download_url_to_file(url, &archive_path)?;
+    extract_archive(&archive_path, &extract_dir, fmt)?;
+    let binary = resolve_binary_from_archive(&extract_dir, bin)?;
+    let staged = stage_binary_dir_with_start(&binary, start);
+    let _ = fs::remove_dir_all(&tmp);
+    staged
+}
+
+fn strip_archive_suffix(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    for suffix in [".tar.gz", ".tgz", ".zip"] {
+        if lower.ends_with(suffix) {
+            return &name[..name.len() - suffix.len()];
+        }
+    }
+    name
+}
+
+fn sanitize_app_name(input: &str) -> String {
+    let mut output = String::new();
+    let mut prev_dash = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            output.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            output.push('-');
+            prev_dash = true;
+        }
+    }
+
+    let output = output.trim_matches('-').to_string();
+    if output == "." || output == ".." {
+        return String::new();
+    }
+    output
+}
+
+fn derive_app_name_from_url(url: &str) -> Result<String, String> {
+    let path = path_from_url(url);
+    let segment = path
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| "could not derive app name from URL".to_string())?;
+    if segment.is_empty() {
+        return Err("could not derive app name from URL; set `app` in psht.toml".to_string());
+    }
+    let stripped = strip_archive_suffix(segment);
+    let sanitized = sanitize_app_name(stripped);
+    if sanitized.is_empty() {
+        return Err("derived app name is empty; set `app` in psht.toml".to_string());
+    }
+    app_name::validate_app_name(&sanitized)?;
+    Ok(sanitized)
+}
+
+fn has_release_settings(cfg: &ProjectConfig) -> bool {
+    cfg.url.is_some() || cfg.start.is_some() || cfg.app.is_some() || cfg.bin.is_some()
+}
+
+fn normalize_opt(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+fn cli_release_settings(
+    url: Option<&str>,
+    start: Option<&str>,
+    app: Option<&str>,
+    bin: Option<&str>,
+) -> ProjectConfig {
+    ProjectConfig {
+        url: normalize_opt(url),
+        start: normalize_opt(start),
+        app: normalize_opt(app),
+        bin: normalize_opt(bin),
+    }
+}
+
+fn push_conflict(
+    conflicts: &mut Vec<&'static str>,
+    key: &'static str,
+    file_value: &Option<String>,
+    cli_value: &Option<String>,
+) {
+    if let (Some(file_value), Some(cli_value)) = (file_value.as_deref(), cli_value.as_deref())
+        && file_value.trim() != cli_value.trim()
+    {
+        conflicts.push(key);
+    }
+}
+
+fn ensure_no_release_conflicts(
+    file_cfg: &ProjectConfig,
+    cli_cfg: &ProjectConfig,
+) -> Result<(), String> {
+    let mut conflicts = Vec::new();
+    push_conflict(&mut conflicts, "url", &file_cfg.url, &cli_cfg.url);
+    push_conflict(&mut conflicts, "start", &file_cfg.start, &cli_cfg.start);
+    push_conflict(&mut conflicts, "app", &file_cfg.app, &cli_cfg.app);
+    push_conflict(&mut conflicts, "bin", &file_cfg.bin, &cli_cfg.bin);
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "conflicting settings between {} and CLI for keys: {}",
+        PROJECT_CONFIG_FILE,
+        conflicts.join(", ")
+    ))
+}
+
+fn prompt_required(label: &str, default: Option<&str>) -> Result<String, String> {
+    loop {
+        match default {
+            Some(default) => eprint!("{label} [{default}]: "),
+            None => eprint!("{label}: "),
+        }
+        io::stderr()
+            .flush()
+            .map_err(|e| format!("failed to flush stderr: {e}"))?;
+
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("failed to read input: {e}"))?;
+        let value = line.trim();
+        if value.is_empty() {
+            if let Some(default) = default {
+                return Ok(default.to_string());
+            }
+            eprintln!("Value is required.");
+            continue;
+        }
+        return Ok(value.to_string());
+    }
+}
+
+fn prompt_confirm(label: &str) -> Result<bool, String> {
+    eprint!("{label} [y/N]: ");
+    io::stderr()
+        .flush()
+        .map_err(|e| format!("failed to flush stderr: {e}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("failed to read input: {e}"))?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+fn is_interactive() -> bool {
+    io::stdin().is_terminal() && io::stderr().is_terminal()
+}
+
+fn bootstrap_project_config(
+    path: &Path,
+    defaults: &ProjectConfig,
+) -> Result<ProjectConfig, String> {
+    if !is_interactive() {
+        return Err(format!(
+            "{PROJECT_CONFIG_FILE} is missing. Run `psht deploy` once interactively to generate it."
+        ));
+    }
+
+    eprintln!("No {PROJECT_CONFIG_FILE} found. Creating one for release deploy.");
+    let url = prompt_required("Release URL", defaults.url.as_deref())?;
+    let start = prompt_required("Start command", defaults.start.as_deref())?;
+
+    let app = if let Some(app) = defaults.app.as_deref() {
+        app.trim().to_string()
+    } else {
+        derive_app_name_from_url(&url)?
+    };
+    app_name::validate_app_name(&app)?;
+
+    let cfg = ProjectConfig {
+        url: Some(url),
+        start: Some(start),
+        app: Some(app),
+        bin: defaults.bin.clone(),
+    };
+
+    let preview = toml::to_string_pretty(&cfg)
+        .map_err(|e| format!("failed to serialize {PROJECT_CONFIG_FILE}: {e}"))?;
+    eprintln!("Proposed {PROJECT_CONFIG_FILE}:\n{preview}");
+
+    if !prompt_confirm("Write this file?")? {
+        return Err(format!("aborted; {PROJECT_CONFIG_FILE} was not written"));
+    }
+
+    save_project_config(path, &cfg)?;
+    eprintln!("Wrote {}", path.display());
+    Ok(cfg)
+}
+
+fn deploy_from_release_config(host: &str, cfg: &ProjectConfig) -> Result<(), String> {
+    let url = cfg
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{PROJECT_CONFIG_FILE}: missing `url`"))?;
+    let start = cfg
+        .start
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{PROJECT_CONFIG_FILE}: missing `start`"))?;
+
+    let app = if let Some(app) = cfg.app.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        app.to_string()
+    } else {
+        derive_app_name_from_url(url)?
+    };
+    app_name::validate_app_name(&app)?;
+
+    let staging = stage_binary_from_url(url, start, cfg.bin.as_deref())?;
+    let result = deploy_from_dir(host, &app, &staging, false);
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn deploy_with_project_config(
+    host: &str,
+    cwd: &Path,
+    app: Option<&str>,
+    url: Option<&str>,
+    start: Option<&str>,
+    app_flag: Option<&str>,
+    bin: Option<&str>,
+) -> Result<(), String> {
+    let config_path = project_config_path(cwd);
+    let file_cfg = load_project_config(&config_path)?;
+    let cli_cfg = cli_release_settings(url, start, app_flag, bin);
+
+    match file_cfg {
+        Some(file_cfg) => {
+            if file_cfg.url.is_some() {
+                ensure_no_release_conflicts(&file_cfg, &cli_cfg)?;
+                if app.is_some() {
+                    return Err(format!(
+                        "positional deploy target cannot be used when {} has `url`; set `app` in {} instead",
+                        PROJECT_CONFIG_FILE, PROJECT_CONFIG_FILE
+                    ));
+                }
+                return deploy_from_release_config(host, &file_cfg);
+            }
+
+            if has_release_settings(&cli_cfg) {
+                return Err(format!(
+                    "{} exists without release settings. Edit {} to add `url` and `start`.",
+                    PROJECT_CONFIG_FILE, PROJECT_CONFIG_FILE
+                ));
+            }
+
+            deploy_with_app_or_binary(host, cwd, app)
+        }
+        None => {
+            if app.is_some() && !has_release_settings(&cli_cfg) {
+                return deploy_with_app_or_binary(host, cwd, app);
+            }
+
+            let cfg = bootstrap_project_config(&config_path, &cli_cfg)?;
+            deploy_from_release_config(host, &cfg)
+        }
+    }
 }
 
 fn save_config(config: &Config, path: &Path) -> Result<(), String> {
@@ -307,9 +805,23 @@ fn run() -> Result<(), String> {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             setup_project_in(&host, &cwd, &config_path)
         }
-        CliCommand::Deploy { app } => {
+        CliCommand::Deploy {
+            app,
+            url,
+            start,
+            app_flag,
+            bin,
+        } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            deploy_with_app_or_binary(&host, &cwd, app.as_deref())
+            deploy_with_project_config(
+                &host,
+                &cwd,
+                app.as_deref(),
+                url.as_deref(),
+                start.as_deref(),
+                app_flag.as_deref(),
+                bin.as_deref(),
+            )
         }
         CliCommand::Ps => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
@@ -352,7 +864,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -372,19 +883,40 @@ mod tests {
     }
 
     #[test]
-    fn load_config_parses_projects() {
+    fn load_project_config_missing_returns_none() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = dir.path().join("psht.toml");
+        assert!(load_project_config(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_project_config_parses_flat_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("psht.toml");
         fs::write(
             &path,
-            "host = \"default\"\n\n[projects]\n\"/home/user/myapp\" = \"other-host\"\n",
+            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\n",
         )
         .unwrap();
-        let config = load_config_from(&path);
-        assert_eq!(
-            config.projects.get("/home/user/myapp").map(|s| s.as_str()),
-            Some("other-host")
-        );
+        let cfg = load_project_config(&path).unwrap().unwrap();
+        assert_eq!(cfg.url.as_deref(), Some("https://example.com/app.tar.gz"));
+        assert_eq!(cfg.start.as_deref(), Some("./app"));
+        assert_eq!(cfg.app.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn save_project_config_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("psht.toml");
+        let cfg = ProjectConfig {
+            url: Some("https://example.com/a.tar.gz".to_string()),
+            start: Some("./app".to_string()),
+            app: Some("demo".to_string()),
+            bin: Some("bin/app".to_string()),
+        };
+        save_project_config(&path, &cfg).unwrap();
+        let loaded = load_project_config(&path).unwrap().unwrap();
+        assert_eq!(loaded, cfg);
     }
 
     #[test]
@@ -453,9 +985,49 @@ mod tests {
     }
 
     #[test]
+    fn project_config_path_uses_cwd() {
+        let path = project_config_path(Path::new("/home/user/app"));
+        assert_eq!(path, PathBuf::from("/home/user/app/psht.toml"));
+    }
+
+    #[test]
     fn is_cli_probe_command_parses() {
         let cli = Cli::try_parse_from(["psht", "__is-cli"]).expect("probe command should parse");
         assert!(matches!(cli.command, CliCommand::IsCli));
+    }
+
+    #[test]
+    fn deploy_release_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "psht",
+            "deploy",
+            "--url",
+            "https://example.com/app.tar.gz",
+            "--start",
+            "./app --port $PORT",
+            "--app",
+            "my-app",
+            "--bin",
+            "dist/app",
+        ])
+        .expect("deploy should parse");
+
+        match cli.command {
+            CliCommand::Deploy {
+                app,
+                url,
+                start,
+                app_flag,
+                bin,
+            } => {
+                assert!(app.is_none());
+                assert_eq!(url.as_deref(), Some("https://example.com/app.tar.gz"));
+                assert_eq!(start.as_deref(), Some("./app --port $PORT"));
+                assert_eq!(app_flag.as_deref(), Some("my-app"));
+                assert_eq!(bin.as_deref(), Some("dist/app"));
+            }
+            _ => panic!("expected deploy command"),
+        }
     }
 
     #[test]
@@ -481,11 +1053,136 @@ mod tests {
     }
 
     #[test]
+    fn stage_binary_dir_with_start_writes_custom_marker() {
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("mybin");
+        fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let staged = stage_binary_dir_with_start(&bin, "./mybin --debug").unwrap();
+        let marker = fs::read_to_string(staged.join(".psht-start-command")).unwrap();
+        assert_eq!(marker.trim(), "./mybin --debug");
+        let _ = fs::remove_dir_all(staged);
+    }
+
+    #[test]
+    fn stage_binary_dir_with_start_rejects_empty() {
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("mybin");
+        fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = stage_binary_dir_with_start(&bin, "  ").unwrap_err();
+        assert!(err.contains("start command is empty"));
+    }
+
+    #[test]
     fn deploy_with_path_errors_when_binary_missing() {
         let cwd = tempdir().unwrap();
         let err =
             deploy_with_app_or_binary("example.com", cwd.path(), Some("bin/missing")).unwrap_err();
         assert!(err.contains("binary not found"));
+    }
+
+    #[test]
+    fn detect_archive_format_accepts_tar_and_zip() {
+        assert!(matches!(
+            detect_archive_format("https://x/y/app.tar.gz").unwrap(),
+            ArchiveFormat::TarGz
+        ));
+        assert!(matches!(
+            detect_archive_format("https://x/y/app.tgz?dl=1").unwrap(),
+            ArchiveFormat::TarGz
+        ));
+        assert!(matches!(
+            detect_archive_format("https://x/y/app.zip").unwrap(),
+            ArchiveFormat::Zip
+        ));
+    }
+
+    #[test]
+    fn detect_archive_format_rejects_other_extensions() {
+        let err = detect_archive_format("https://x/y/app.bin").unwrap_err();
+        assert!(err.contains("unsupported archive format"));
+    }
+
+    #[test]
+    fn derive_app_name_from_url_strips_archive_suffix() {
+        let name = derive_app_name_from_url("https://example.com/releases/my-app.tar.gz").unwrap();
+        assert_eq!(name, "my-app");
+    }
+
+    #[test]
+    fn derive_app_name_from_url_sanitizes() {
+        let name =
+            derive_app_name_from_url("https://example.com/releases/My App (linux).zip").unwrap();
+        assert_eq!(name, "My-App-linux");
+    }
+
+    #[test]
+    fn ensure_no_release_conflicts_detects_mismatch() {
+        let file = ProjectConfig {
+            url: Some("https://a".to_string()),
+            start: Some("./app".to_string()),
+            app: Some("myapp".to_string()),
+            bin: None,
+        };
+        let cli = ProjectConfig {
+            url: Some("https://b".to_string()),
+            start: Some("./app".to_string()),
+            app: None,
+            bin: None,
+        };
+        let err = ensure_no_release_conflicts(&file, &cli).unwrap_err();
+        assert!(err.contains("url"));
+    }
+
+    #[test]
+    fn resolve_binary_from_archive_prefers_single_executable() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("app");
+        fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve_binary_from_archive(dir.path(), None).unwrap();
+        assert_eq!(resolved, bin);
+    }
+
+    #[test]
+    fn resolve_binary_from_archive_falls_back_to_single_file() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("app");
+        fs::write(&bin, "binary data").unwrap();
+        let resolved = resolve_binary_from_archive(dir.path(), None).unwrap();
+        assert_eq!(resolved, bin);
+    }
+
+    #[test]
+    fn resolve_binary_from_archive_errors_on_many_executables() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = resolve_binary_from_archive(dir.path(), None).unwrap_err();
+        assert!(err.contains("multiple executable"));
+    }
+
+    #[test]
+    fn resolve_binary_from_archive_uses_bin_override() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("dist");
+        fs::create_dir_all(&nested).unwrap();
+        let bin = nested.join("app");
+        fs::write(&bin, "x").unwrap();
+        let resolved = resolve_binary_from_archive(dir.path(), Some("dist/app")).unwrap();
+        assert_eq!(resolved, bin);
+    }
+
+    #[test]
+    fn safe_join_relative_rejects_parent() {
+        let err = safe_join_relative(Path::new("/tmp/x"), "../bad").unwrap_err();
+        assert!(err.contains("parent-directory"));
     }
 
     #[test]

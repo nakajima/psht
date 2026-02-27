@@ -37,6 +37,14 @@ This installs the `psht` cli and writes `~/.psht/config.toml`, which tracks wher
 ```sh
 cd your-app
 psht setup
-psht deploy # tries to use git, if no git, scp
+psht deploy # first run creates psht.toml (release URL + start command)
 ```
 
+`psht.toml` (project root) is used for release deploys:
+
+```toml
+url = "https://github.com/org/repo/releases/download/v1.2.3/my-app-linux-amd64.tar.gz"
+start = "./my-app --port $PORT"
+app = "my-app" # optional override for derived app name
+bin = "my-app" # optional path inside archive when needed
+```
