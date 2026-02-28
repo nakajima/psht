@@ -465,6 +465,66 @@ fn strip_archive_suffix(name: &str) -> &str {
     name
 }
 
+fn strip_arch_suffix(name: &str) -> &str {
+    const SUFFIXES: &[&str] = &[
+        "-x86_64-unknown-linux-gnu",
+        "-aarch64-unknown-linux-gnu",
+        "-x86_64-unknown-linux-musl",
+        "-aarch64-unknown-linux-musl",
+        "-x86_64-apple-darwin",
+        "-aarch64-apple-darwin",
+        "-x86_64-pc-windows-msvc",
+        "-x86_64-pc-windows-gnu",
+        "-aarch64-pc-windows-msvc",
+        "-linux-amd64",
+        "-linux-arm64",
+        "-darwin-amd64",
+        "-darwin-arm64",
+        "-windows-amd64",
+        "-windows-arm64",
+    ];
+
+    let lower = name.to_ascii_lowercase();
+    for suffix in SUFFIXES {
+        if lower.ends_with(suffix) && name.len() > suffix.len() {
+            return name[..name.len() - suffix.len()].trim_end_matches('-');
+        }
+    }
+    name
+}
+
+fn is_semverish(value: &str) -> bool {
+    let value = value
+        .strip_prefix('v')
+        .or_else(|| value.strip_prefix('V'))
+        .unwrap_or(value);
+    if !value.contains('.') {
+        return false;
+    }
+    if !value.bytes().any(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
+fn strip_version_suffix(name: &str) -> &str {
+    for (idx, ch) in name.char_indices().rev() {
+        if ch != '-' {
+            continue;
+        }
+        let candidate = &name[idx + 1..];
+        if is_semverish(candidate) {
+            let base = name[..idx].trim_end_matches('-');
+            if !base.is_empty() {
+                return base;
+            }
+        }
+    }
+    name
+}
+
 fn sanitize_app_name(input: &str) -> String {
     let mut output = String::new();
     let mut prev_dash = false;
@@ -513,6 +573,8 @@ fn derive_app_name_from_url(url: &str) -> Result<String, String> {
         return Err("could not derive app name from URL; set `app` in psht.toml".to_string());
     }
     let stripped = strip_archive_suffix(segment);
+    let stripped = strip_arch_suffix(stripped);
+    let stripped = strip_version_suffix(stripped);
     let sanitized = sanitize_app_name(stripped);
     if sanitized.is_empty() {
         return Err("derived app name is empty; set `app` in psht.toml".to_string());
@@ -1170,6 +1232,24 @@ mod tests {
         let name =
             derive_app_name_from_url("https://example.com/releases/My App (linux).zip").unwrap();
         assert_eq!(name, "My-App-linux");
+    }
+
+    #[test]
+    fn derive_app_name_from_url_strips_version_and_target_triple() {
+        let name = derive_app_name_from_url(
+            "https://example.com/releases/download/v0.0.3/hyperlinked-0.0.3-x86_64-unknown-linux-gnu.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(name, "hyperlinked");
+    }
+
+    #[test]
+    fn derive_app_name_from_url_strips_version_and_go_style_target() {
+        let name = derive_app_name_from_url(
+            "https://example.com/releases/download/v1.2.3/my-app-v1.2.3-linux-amd64.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(name, "my-app");
     }
 
     #[test]
