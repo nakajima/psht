@@ -267,6 +267,69 @@ fn deploy_binary(host: &str, app: &str, binary_path: &Path) -> Result<(), String
     result
 }
 
+fn is_git_worktree(cwd: &Path) -> bool {
+    let output = match Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).trim() == "true"
+}
+
+fn ensure_psht_git_remote(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
+    let expected = format!("psht@{host}:{app}");
+    let output = Command::new("git")
+        .args(["remote", "get-url", "psht"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("failed to inspect git remote: {e}"))?;
+
+    if output.status.success() {
+        let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if current == expected {
+            return Ok(());
+        }
+        let status = Command::new("git")
+            .args(["remote", "set-url", "psht", &expected])
+            .current_dir(cwd)
+            .status()
+            .map_err(|e| format!("failed to update git remote: {e}"))?;
+        if !status.success() {
+            return Err("failed to update git remote `psht`".to_string());
+        }
+        return Ok(());
+    }
+
+    let status = Command::new("git")
+        .args(["remote", "add", "psht", &expected])
+        .current_dir(cwd)
+        .status()
+        .map_err(|e| format!("failed to add git remote: {e}"))?;
+    if !status.success() {
+        return Err("failed to add git remote `psht`".to_string());
+    }
+    Ok(())
+}
+
+fn deploy_from_git(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
+    ensure_psht_git_remote(host, app, cwd)?;
+    let status = Command::new("git")
+        .args(["push", "psht", "HEAD"])
+        .current_dir(cwd)
+        .status()
+        .map_err(|e| format!("failed to run git push: {e}"))?;
+    if !status.success() {
+        return Err(format!("git push failed with status {status}"));
+    }
+    Ok(())
+}
+
 fn deploy(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
     deploy_from_dir(host, app, cwd, true)
 }
@@ -285,6 +348,10 @@ fn deploy_with_app_or_binary(host: &str, cwd: &Path, value: Option<&str>) -> Res
     }
     let name = app_name(value, cwd);
     app_name::validate_app_name(&name)?;
+    if value.is_none() && is_git_worktree(cwd) {
+        eprintln!("-----> Deploying via git");
+        return deploy_from_git(host, &name, cwd);
+    }
     deploy(host, &name, cwd)
 }
 
@@ -811,23 +878,9 @@ fn save_config(config: &Config, path: &Path) -> Result<(), String> {
 }
 
 fn setup_project_in(host: &str, cwd: &Path, config_path: &Path) -> Result<(), String> {
-    if cwd.join(".git").is_dir() {
-        let _ = Command::new("git")
-            .args(["remote", "remove", "psht"])
-            .current_dir(cwd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+    if is_git_worktree(cwd) {
         let app = app_name(None, cwd);
-        let url = format!("psht@{host}:{app}");
-        let status = Command::new("git")
-            .args(["remote", "add", "psht", &url])
-            .current_dir(cwd)
-            .status()
-            .map_err(|e| format!("failed to add git remote: {e}"))?;
-        if !status.success() {
-            return Err("failed to add git remote".to_string());
-        }
+        ensure_psht_git_remote(host, &app, cwd)?;
     }
     let cwd_str = cwd.to_string_lossy().to_string();
     let mut config = load_config_from(config_path);
@@ -1197,6 +1250,56 @@ mod tests {
         let err =
             deploy_with_app_or_binary("example.com", cwd.path(), Some("bin/missing")).unwrap_err();
         assert!(err.contains("binary not found"));
+    }
+
+    #[test]
+    fn is_git_worktree_detects_repo_and_non_repo() {
+        let repo = tempdir().unwrap();
+        let non_repo = tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(is_git_worktree(repo.path()));
+        assert!(!is_git_worktree(non_repo.path()));
+    }
+
+    #[test]
+    fn ensure_psht_git_remote_adds_and_updates_remote() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        ensure_psht_git_remote("host-a", "demo", dir.path()).unwrap();
+
+        let output = Command::new("git")
+            .args(["remote", "get-url", "psht"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "psht@host-a:demo"
+        );
+
+        ensure_psht_git_remote("host-b", "demo", dir.path()).unwrap();
+        let output = Command::new("git")
+            .args(["remote", "get-url", "psht"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "psht@host-b:demo"
+        );
     }
 
     #[test]

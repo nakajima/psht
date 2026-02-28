@@ -1703,8 +1703,12 @@ pub fn bootstrap() -> Result<(), String> {
 }
 
 fn upgrade_script() -> String {
-    let version = env!("CARGO_PKG_VERSION");
     let forge_url = configured_forge_url();
+    let invoked_bin = env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let invoked_bin_quoted = shell_quote(&invoked_bin);
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -1716,6 +1720,10 @@ FORGE_URL="${{FORGE_URL%/}}"
 
 log() {{ echo "-----> $*"; }}
 err() {{ echo "ERROR: $*" >&2; exit 1; }}
+detect_version() {{
+    local bin="$1"
+    "$bin" --version 2>/dev/null | awk '{{print $2}}' | head -n1
+}}
 
 PSHT_BIN=$(getent passwd "$PSHT_USER" | cut -d: -f7 || true)
 if [[ -z "$PSHT_BIN" ]]; then
@@ -1724,9 +1732,27 @@ fi
 PSHT_BIN=$(realpath "$PSHT_BIN")
 [[ -x "$PSHT_BIN" ]] || err "psht-server binary is not executable: $PSHT_BIN"
 
+PATH_BIN=$(command -v psht-server || true)
+if [[ -n "$PATH_BIN" ]]; then
+    PATH_BIN=$(realpath "$PATH_BIN")
+fi
+INVOKED_BIN={invoked_bin_quoted}
+if [[ -n "$INVOKED_BIN" ]]; then
+    INVOKED_BIN=$(realpath "$INVOKED_BIN" 2>/dev/null || true)
+fi
+
+install_targets=("$PSHT_BIN")
+if [[ -n "$PATH_BIN" && "$PATH_BIN" != "$PSHT_BIN" ]]; then
+    install_targets+=("$PATH_BIN")
+fi
+if [[ -n "$INVOKED_BIN" && "$INVOKED_BIN" != "$PSHT_BIN" && "$INVOKED_BIN" != "${{PATH_BIN:-}}" ]]; then
+    install_targets+=("$INVOKED_BIN")
+fi
+
 [[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht-server upgrade"
 
-CURRENT_VERSION="{version}"
+CURRENT_VERSION=$(detect_version "$PSHT_BIN")
+[[ -n "$CURRENT_VERSION" ]] || err "failed to detect installed psht-server version from $PSHT_BIN"
 
 # Detect architecture
 ARCH=$(uname -m)
@@ -1760,12 +1786,23 @@ fi
 
 [[ -n "$LATEST" ]] || err "Failed to resolve latest release from $FORGE_URL (tried /releases/latest and /api/v1/repos/.../releases/latest)"
 
-if [[ "$CURRENT_VERSION" == "$LATEST" ]]; then
-    echo "psht $CURRENT_VERSION (up to date)"
+needs_upgrade=0
+for target in "${{install_targets[@]}}"; do
+    target_version=$(detect_version "$target" || true)
+    if [[ -z "$target_version" || "$target_version" != "$LATEST" ]]; then
+        needs_upgrade=1
+        break
+    fi
+done
+if [[ "$needs_upgrade" -eq 0 ]]; then
+    echo "psht $LATEST (up to date)"
     exit 0
 fi
-
-log "Upgrading psht $CURRENT_VERSION -> $LATEST"
+if [[ "$CURRENT_VERSION" == "$LATEST" ]]; then
+    log "Upgrading psht binaries to $LATEST"
+else
+    log "Upgrading psht $CURRENT_VERSION -> $LATEST"
+fi
 
 # Set up temp directory with cleanup
 TMPDIR=$(mktemp -d)
@@ -1789,11 +1826,26 @@ download_or_err "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" "$TMPDIR/psht.ta
 tar xzf "$TMPDIR/psht-server.tar.gz" -C "$TMPDIR"
 tar xzf "$TMPDIR/psht.tar.gz" -C "$TMPDIR"
 
+candidate_version=$(detect_version "$TMPDIR/psht-server" || true)
+[[ -n "$candidate_version" ]] || err "failed to detect downloaded psht-server version"
+if [[ "$candidate_version" != "$LATEST" ]]; then
+    err "downloaded psht-server ${{candidate_version:-unknown}}, expected $LATEST"
+fi
+
 log "Installing binaries"
-install -m 755 "$TMPDIR/psht-server" "$PSHT_BIN"
+for target in "${{install_targets[@]}}"; do
+    install -m 755 "$TMPDIR/psht-server" "$target"
+done
 mkdir -p "$PSHT_HOME/bin"
 install -m 755 "$TMPDIR/psht" "$PSHT_HOME/bin/psht"
 chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin/psht"
+
+for target in "${{install_targets[@]}}"; do
+    installed_version=$(detect_version "$target" || true)
+    if [[ -z "$installed_version" || "$installed_version" != "$LATEST" ]]; then
+        err "installed $target reports ${{installed_version:-unknown}}, expected $LATEST"
+    fi
+done
 
 # Update incus
 log "Updating incus"
@@ -2631,11 +2683,11 @@ devices:
     }
 
     #[test]
-    fn upgrade_script_embeds_current_version() {
+    fn upgrade_script_detects_current_version_from_binary() {
         let script = upgrade_script();
         assert!(
-            script.contains(env!("CARGO_PKG_VERSION")),
-            "should embed the current version"
+            script.contains("detect_version \"$PSHT_BIN\""),
+            "should detect current version from installed psht-server binary"
         );
     }
 
@@ -2709,8 +2761,16 @@ devices:
             "should fall back to command -v psht-server"
         );
         assert!(
-            script.contains("install -m 755 \"$TMPDIR/psht-server\" \"$PSHT_BIN\""),
-            "should install psht-server to active binary path"
+            script.contains("install_targets=(\"$PSHT_BIN\")"),
+            "should include psht shell binary in install targets"
+        );
+        assert!(
+            script.contains("install -m 755 \"$TMPDIR/psht-server\" \"$target\""),
+            "should install psht-server to all target binary paths"
+        );
+        assert!(
+            script.contains("INVOKED_BIN="),
+            "should include the invoked binary path as an install target"
         );
         assert!(
             script.contains("$PSHT_HOME/bin/psht"),
@@ -2746,6 +2806,276 @@ devices:
         assert!(
             script.contains("trap") && script.contains("rm -rf"),
             "should clean up temp directory on exit"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_upgrades_when_path_binary_is_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        fn write_exec(path: &Path, contents: &str) {
+            fs::write(path, contents).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn build_tarball(dir: &Path, tar_path: &Path, file_name: &str, contents: &str) {
+            let src = dir.join(file_name);
+            write_exec(&src, contents);
+            let status = Command::new("tar")
+                .args(["-czf"])
+                .arg(tar_path)
+                .args(["-C"])
+                .arg(dir)
+                .arg(file_name)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build tarball {}", tar_path.display());
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_bin = tmp.path().join("fake-bin");
+        let fake_home = tmp.path().join("fake-home");
+        let assets = tmp.path().join("assets");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(&fake_home).unwrap();
+        fs::create_dir_all(&assets).unwrap();
+
+        let path_bin = fake_bin.join("psht-server");
+        let shell_bin = tmp.path().join("psht-shell-server");
+        write_exec(
+            &path_bin,
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
+        );
+        write_exec(
+            &shell_bin,
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.8 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
+        );
+
+        let server_tar = assets.join("psht-server.tar.gz");
+        let cli_tar = assets.join("psht-cli.tar.gz");
+        build_tarball(
+            &assets,
+            &server_tar,
+            "psht-server",
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.8 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
+        );
+        build_tarball(
+            &assets,
+            &cli_tar,
+            "psht",
+            "#!/usr/bin/env bash\necho \"psht 0.2.8 (cli)\"\n",
+        );
+
+        write_exec(
+            &fake_bin.join("getent"),
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"passwd\" && \"${2:-}\" == \"psht\" ]]; then\n  echo \"psht:x:1000:1000::/home/psht:$PSHT_TEST_SHELL_BIN\"\n  exit 0\nfi\nexit 2\n",
+        );
+        write_exec(
+            &fake_bin.join("curl"),
+            "#!/usr/bin/env bash\nset -euo pipefail\nout=\"\"\nwrite_fmt=\"\"\nurl=\"\"\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    -w) write_fmt=\"$2\"; shift 2 ;;\n    -fsSL|-f|-s|-S|-L) shift ;;\n    *) url=\"$1\"; shift ;;\n  esac\ndone\nif [[ \"$url\" == *\"/releases/latest\" && \"$out\" == \"/dev/null\" ]]; then\n  printf \"https://example.com/org/repo/releases/tag/v0.2.8\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-server-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_SERVER_TARBALL\" \"$out\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_CLI_TARBALL\" \"$out\"\n  exit 0\nfi\necho \"unexpected curl URL: $url\" >&2\nexit 22\n",
+        );
+        write_exec(&fake_bin.join("apt-get"), "#!/usr/bin/env bash\nexit 0\n");
+        write_exec(
+            &fake_bin.join("sudo"),
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"-u\" ]]; then shift 2; fi\nexec \"$@\"\n",
+        );
+        write_exec(&fake_bin.join("chown"), "#!/usr/bin/env bash\nexit 0\n");
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{}", fake_bin.display(), original_path);
+
+        let mut script = upgrade_script();
+        script = script.replace(
+            "PSHT_HOME=\"/home/$PSHT_USER\"",
+            &format!("PSHT_HOME=\"{}\"", fake_home.display()),
+        );
+        script = script.replace(
+            "[[ $EUID -eq 0 ]] || err \"Run this script as root: sudo psht-server upgrade\"",
+            "true",
+        );
+        script = script
+            .lines()
+            .map(|line| {
+                if line.starts_with("INVOKED_BIN=") {
+                    "INVOKED_BIN=\"\"".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let output1 = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", &test_path)
+            .env("PSHT_FORGE_URL", "https://example.com/org/repo")
+            .env("PSHT_TEST_SHELL_BIN", shell_bin.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_SERVER_TARBALL",
+                server_tar.to_string_lossy().to_string(),
+            )
+            .env("PSHT_TEST_CLI_TARBALL", cli_tar.to_string_lossy().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output1.status.success(),
+            "first upgrade failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output1.stdout),
+            String::from_utf8_lossy(&output1.stderr)
+        );
+
+        let path_version = Command::new(&path_bin).arg("--version").output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&path_version.stdout).contains("0.2.8"),
+            "PATH binary should be upgraded to 0.2.8"
+        );
+
+        let output2 = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", &test_path)
+            .env("PSHT_FORGE_URL", "https://example.com/org/repo")
+            .env("PSHT_TEST_SHELL_BIN", shell_bin.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_SERVER_TARBALL",
+                server_tar.to_string_lossy().to_string(),
+            )
+            .env("PSHT_TEST_CLI_TARBALL", cli_tar.to_string_lossy().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output2.status.success(),
+            "second upgrade failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output2.stdout),
+            String::from_utf8_lossy(&output2.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output2.stdout).contains("up to date"),
+            "second run should report up to date"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_errors_when_downloaded_server_version_mismatches_latest() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        fn write_exec(path: &Path, contents: &str) {
+            fs::write(path, contents).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn build_tarball(dir: &Path, tar_path: &Path, file_name: &str, contents: &str) {
+            let src = dir.join(file_name);
+            write_exec(&src, contents);
+            let status = Command::new("tar")
+                .args(["-czf"])
+                .arg(tar_path)
+                .args(["-C"])
+                .arg(dir)
+                .arg(file_name)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build tarball {}", tar_path.display());
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_bin = tmp.path().join("fake-bin");
+        let fake_home = tmp.path().join("fake-home");
+        let assets = tmp.path().join("assets");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(&fake_home).unwrap();
+        fs::create_dir_all(&assets).unwrap();
+
+        let path_bin = fake_bin.join("psht-server");
+        let shell_bin = tmp.path().join("psht-shell-server");
+        write_exec(
+            &path_bin,
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
+        );
+        write_exec(
+            &shell_bin,
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
+        );
+
+        let server_tar = assets.join("psht-server.tar.gz");
+        let cli_tar = assets.join("psht-cli.tar.gz");
+        build_tarball(
+            &assets,
+            &server_tar,
+            "psht-server",
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
+        );
+        build_tarball(
+            &assets,
+            &cli_tar,
+            "psht",
+            "#!/usr/bin/env bash\necho \"psht 0.2.8 (cli)\"\n",
+        );
+
+        write_exec(
+            &fake_bin.join("getent"),
+            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"passwd\" && \"${2:-}\" == \"psht\" ]]; then\n  echo \"psht:x:1000:1000::/home/psht:$PSHT_TEST_SHELL_BIN\"\n  exit 0\nfi\nexit 2\n",
+        );
+        write_exec(
+            &fake_bin.join("curl"),
+            "#!/usr/bin/env bash\nset -euo pipefail\nout=\"\"\nurl=\"\"\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    -w) shift 2 ;;\n    -fsSL|-f|-s|-S|-L) shift ;;\n    *) url=\"$1\"; shift ;;\n  esac\ndone\nif [[ \"$url\" == *\"/releases/latest\" && \"$out\" == \"/dev/null\" ]]; then\n  printf \"https://example.com/org/repo/releases/tag/v0.2.8\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-server-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_SERVER_TARBALL\" \"$out\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_CLI_TARBALL\" \"$out\"\n  exit 0\nfi\nexit 22\n",
+        );
+        write_exec(&fake_bin.join("apt-get"), "#!/usr/bin/env bash\nexit 0\n");
+        write_exec(
+            &fake_bin.join("sudo"),
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"-u\" ]]; then shift 2; fi\nexec \"$@\"\n",
+        );
+        write_exec(&fake_bin.join("chown"), "#!/usr/bin/env bash\nexit 0\n");
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{}", fake_bin.display(), original_path);
+
+        let mut script = upgrade_script();
+        script = script.replace(
+            "PSHT_HOME=\"/home/$PSHT_USER\"",
+            &format!("PSHT_HOME=\"{}\"", fake_home.display()),
+        );
+        script = script.replace(
+            "[[ $EUID -eq 0 ]] || err \"Run this script as root: sudo psht-server upgrade\"",
+            "true",
+        );
+        script = script
+            .lines()
+            .map(|line| {
+                if line.starts_with("INVOKED_BIN=") {
+                    "INVOKED_BIN=\"\"".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", &test_path)
+            .env("PSHT_FORGE_URL", "https://example.com/org/repo")
+            .env("PSHT_TEST_SHELL_BIN", shell_bin.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_SERVER_TARBALL",
+                server_tar.to_string_lossy().to_string(),
+            )
+            .env("PSHT_TEST_CLI_TARBALL", cli_tar.to_string_lossy().to_string())
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "upgrade should fail when downloaded server version mismatches latest"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("downloaded psht-server 0.2.7, expected 0.2.8"),
+            "unexpected stderr:\n{stderr}"
         );
     }
 
