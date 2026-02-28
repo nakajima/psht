@@ -149,6 +149,27 @@ get_release_id() {
   return 1
 }
 
+wait_for_release_id() {
+  local api_base="$1"
+  local token="$2"
+  local version="$3"
+  local attempts="${4:-10}"
+  local delay_seconds="${5:-1}"
+  local release_id=""
+
+  for ((i = 1; i <= attempts; i++)); do
+    release_id="$(get_release_id "$api_base" "$token" "$version")" || release_id=""
+    if [[ -n "$release_id" ]]; then
+      echo "$release_id"
+      return 0
+    fi
+    if (( i < attempts )); then
+      sleep "$delay_seconds"
+    fi
+  done
+  return 1
+}
+
 upload_asset() {
   local api_base="$1"
   local token="$2"
@@ -191,8 +212,8 @@ upload_cli_assets() {
   shift 3
 
   local release_id
-  release_id="$(get_release_id "$api_base" "$token" "$version")" || {
-    err "release $version not found after releasor run"
+  release_id="$(wait_for_release_id "$api_base" "$token" "$version" 12 1)" || {
+    err "release $version not found after releasor run (tried tags: $version, v$version via $api_base)"
   }
 
   local targets=()
@@ -261,14 +282,21 @@ run_releasor() {
 [[ -x "$RELEASOR_BIN" ]] || err "releasor binary not executable: $RELEASOR_BIN"
 [[ -f "$CONFIG_PATH" ]] || err "config not found: $CONFIG_PATH"
 
-token="${GITEA_TOKEN:-${GITHUB_TOKEN:-}}"
-[[ -n "$token" ]] || err "set GITEA_TOKEN (or GITHUB_TOKEN) for git release operations"
-
 repo="$(read_toml_string "project" "repo" "$CONFIG_PATH")"
 [[ -n "$repo" ]] || err "missing [project].repo in $CONFIG_PATH"
 base_url="$(read_toml_string "git" "base_url" "$CONFIG_PATH")"
 [[ -n "$base_url" ]] || err "missing [git].base_url in $CONFIG_PATH"
-api_base="${base_url%/}/api/v1/repos/$repo"
+base_url_no_scheme="${base_url#*://}"
+base_host="${base_url_no_scheme%%/*}"
+if [[ "$base_host" == "github.com" || "$base_host" == "www.github.com" ]]; then
+  api_base="https://api.github.com/repos/$repo"
+  token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+  [[ -n "$token" ]] || err "set GITHUB_TOKEN (or GITEA_TOKEN) for GitHub release operations"
+else
+  api_base="${base_url%/}/api/v1/repos/$repo"
+  token="${GITEA_TOKEN:-${GITHUB_TOKEN:-}}"
+  [[ -n "$token" ]] || err "set GITEA_TOKEN (or GITHUB_TOKEN) for release operations"
+fi
 
 parse_release_args "$@"
 version="$SCRIPT_VERSION"
