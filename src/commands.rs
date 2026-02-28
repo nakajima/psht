@@ -1773,9 +1773,17 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 # Download both tarballs
 BASE_URL="$FORGE_URL/releases/download/v$LATEST"
+download_or_err() {{
+    local url="$1"
+    local out="$2"
+    if ! curl -fsSL "$url" -o "$out"; then
+        err "download failed: $url"
+    fi
+}}
+
 log "Downloading psht $LATEST"
-curl -fsSL "$BASE_URL/psht-server-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht-server.tar.gz"
-curl -fsSL "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" -o "$TMPDIR/psht.tar.gz"
+download_or_err "$BASE_URL/psht-server-${{LATEST}}-${{TARGET}}.tar.gz" "$TMPDIR/psht-server.tar.gz"
+download_or_err "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" "$TMPDIR/psht.tar.gz"
 
 # Extract and install
 tar xzf "$TMPDIR/psht-server.tar.gz" -C "$TMPDIR"
@@ -2677,6 +2685,15 @@ devices:
         assert!(
             script.contains("psht-${"),
             "should download psht CLI tarball"
+        );
+    }
+
+    #[test]
+    fn upgrade_script_reports_failed_download_url() {
+        let script = upgrade_script();
+        assert!(
+            script.contains("download failed: $url"),
+            "should include the failed download URL in errors"
         );
     }
 
