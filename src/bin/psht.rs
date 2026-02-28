@@ -31,7 +31,7 @@ struct Cli {
 enum CliCommand {
     /// Deploy the current directory (Caddy routing is experimental)
     Deploy {
-        /// App name or path to a binary (defaults to current directory name)
+        /// App name, path to a binary, or HTTPS release URL
         app: Option<String>,
         /// Release artifact URL (.tar.gz/.tgz/.zip)
         #[arg(long)]
@@ -486,6 +486,23 @@ fn sanitize_app_name(input: &str) -> String {
     output
 }
 
+fn is_https_url(value: &str) -> bool {
+    value.trim().to_ascii_lowercase().starts_with("https://")
+}
+
+fn normalize_deploy_target(
+    app: Option<String>,
+    url: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    match (app, url) {
+        (Some(app), Some(url)) if is_https_url(&app) => Err(
+            "deploy URL was provided both positionally and with --url; use one form".to_string(),
+        ),
+        (Some(app), None) if is_https_url(&app) => Ok((None, Some(app))),
+        (app, url) => Ok((app, url)),
+    }
+}
+
 fn derive_app_name_from_url(url: &str) -> Result<String, String> {
     let path = path_from_url(url);
     let segment = path
@@ -813,6 +830,7 @@ fn run() -> Result<(), String> {
             bin,
         } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            let (app, url) = normalize_deploy_target(app, url)?;
             deploy_with_project_config(
                 &host,
                 &cwd,
@@ -1025,6 +1043,42 @@ mod tests {
                 assert_eq!(start.as_deref(), Some("./app --port $PORT"));
                 assert_eq!(app_flag.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("dist/app"));
+            }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_release_positional_https_url_maps_to_url() {
+        let cli = Cli::try_parse_from(["psht", "deploy", "https://example.com/app.tar.gz"])
+            .expect("deploy should parse");
+
+        match cli.command {
+            CliCommand::Deploy { app, url, .. } => {
+                let (app, url) =
+                    normalize_deploy_target(app, url).expect("target normalization should succeed");
+                assert!(app.is_none());
+                assert_eq!(url.as_deref(), Some("https://example.com/app.tar.gz"));
+            }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_release_positional_https_url_conflicts_with_url_flag() {
+        let cli = Cli::try_parse_from([
+            "psht",
+            "deploy",
+            "https://example.com/a.tar.gz",
+            "--url",
+            "https://example.com/b.tar.gz",
+        ])
+        .expect("deploy should parse");
+
+        match cli.command {
+            CliCommand::Deploy { app, url, .. } => {
+                let err = normalize_deploy_target(app, url).unwrap_err();
+                assert!(err.contains("both positionally and with --url"));
             }
             _ => panic!("expected deploy command"),
         }

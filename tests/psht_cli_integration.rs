@@ -49,6 +49,29 @@ fn deploy_release_without_psht_toml_in_non_tty_errors_with_guidance() {
 }
 
 #[test]
+fn deploy_release_with_positional_https_url_without_psht_toml_in_non_tty_errors_with_guidance() {
+    let tmp = tempdir().expect("tempdir");
+    let project_dir = tmp.path().join("project");
+    let home_dir = tmp.path().join("home");
+    fs::create_dir_all(&project_dir).expect("create project");
+    fs::create_dir_all(&home_dir).expect("create home");
+    write_home_config(&home_dir);
+
+    let output = run_psht(
+        &project_dir,
+        &home_dir,
+        &["deploy", "https://example.com/app.tar.gz"],
+    );
+    assert!(!output.status.success(), "expected deploy to fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("psht.toml is missing. Run `psht deploy` once interactively to generate it."),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn deploy_release_conflicting_cli_and_file_settings_errors_before_deploy() {
     let tmp = tempdir().expect("tempdir");
     let project_dir = tmp.path().join("project");
