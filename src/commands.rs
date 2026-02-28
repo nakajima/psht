@@ -1067,6 +1067,14 @@ fn read_start_command(app: &str) -> Result<String, String> {
     Ok(cmd)
 }
 
+fn run_hook(app: &str, phase: &str, command: Option<&str>) -> Result<(), String> {
+    let Some(command) = command.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    eprintln!("-----> Running {phase} hook");
+    container::exec_cmd_rolling(app, command, 5).map_err(|e| format!("{phase} hook failed: {e}"))
+}
+
 pub fn deploy(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
@@ -1193,11 +1201,14 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Pushing code to container");
     container::push_code(app, &code_dir.to_string_lossy())?;
     persist_start_command(app, &config.start_command)?;
+    run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
 
     if !config.install_command.is_empty() {
         eprintln!("-----> Installing dependencies");
         container::exec_cmd_rolling(app, &config.install_command, 5)?;
     }
+
+    run_hook(app, "postinstall", config.postinstall_command.as_deref())?;
 
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
@@ -2830,7 +2841,11 @@ devices:
                 .arg(file_name)
                 .status()
                 .unwrap();
-            assert!(status.success(), "failed to build tarball {}", tar_path.display());
+            assert!(
+                status.success(),
+                "failed to build tarball {}",
+                tar_path.display()
+            );
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2911,12 +2926,18 @@ devices:
             .arg(&script)
             .env("PATH", &test_path)
             .env("PSHT_FORGE_URL", "https://example.com/org/repo")
-            .env("PSHT_TEST_SHELL_BIN", shell_bin.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_SHELL_BIN",
+                shell_bin.to_string_lossy().to_string(),
+            )
             .env(
                 "PSHT_TEST_SERVER_TARBALL",
                 server_tar.to_string_lossy().to_string(),
             )
-            .env("PSHT_TEST_CLI_TARBALL", cli_tar.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_CLI_TARBALL",
+                cli_tar.to_string_lossy().to_string(),
+            )
             .output()
             .unwrap();
         assert!(
@@ -2937,12 +2958,18 @@ devices:
             .arg(&script)
             .env("PATH", &test_path)
             .env("PSHT_FORGE_URL", "https://example.com/org/repo")
-            .env("PSHT_TEST_SHELL_BIN", shell_bin.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_SHELL_BIN",
+                shell_bin.to_string_lossy().to_string(),
+            )
             .env(
                 "PSHT_TEST_SERVER_TARBALL",
                 server_tar.to_string_lossy().to_string(),
             )
-            .env("PSHT_TEST_CLI_TARBALL", cli_tar.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_CLI_TARBALL",
+                cli_tar.to_string_lossy().to_string(),
+            )
             .output()
             .unwrap();
         assert!(
@@ -2978,7 +3005,11 @@ devices:
                 .arg(file_name)
                 .status()
                 .unwrap();
-            assert!(status.success(), "failed to build tarball {}", tar_path.display());
+            assert!(
+                status.success(),
+                "failed to build tarball {}",
+                tar_path.display()
+            );
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3059,12 +3090,18 @@ devices:
             .arg(&script)
             .env("PATH", &test_path)
             .env("PSHT_FORGE_URL", "https://example.com/org/repo")
-            .env("PSHT_TEST_SHELL_BIN", shell_bin.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_SHELL_BIN",
+                shell_bin.to_string_lossy().to_string(),
+            )
             .env(
                 "PSHT_TEST_SERVER_TARBALL",
                 server_tar.to_string_lossy().to_string(),
             )
-            .env("PSHT_TEST_CLI_TARBALL", cli_tar.to_string_lossy().to_string())
+            .env(
+                "PSHT_TEST_CLI_TARBALL",
+                cli_tar.to_string_lossy().to_string(),
+            )
             .output()
             .unwrap();
 
@@ -3259,5 +3296,11 @@ devices:
         let cmd = write_start_command_cmd("./app --flag").unwrap();
         assert!(cmd.contains(START_COMMAND_PATH));
         assert!(cmd.contains("printf '%s\\n'"));
+    }
+
+    #[test]
+    fn run_hook_skips_missing_or_blank_commands() {
+        run_hook("myapp", "preinstall", None).unwrap();
+        run_hook("myapp", "postinstall", Some(" \n\t ")).unwrap();
     }
 }

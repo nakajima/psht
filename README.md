@@ -40,11 +40,13 @@ psht setup
 psht deploy # first run creates psht.toml (release URL + start command)
 ```
 
-`psht.toml` (project root) is used for release deploys:
+`psht.toml` (project root) is used for release deploys and optional deploy hooks:
 
 ```toml
 url = "https://github.com/org/repo/releases/download/v1.2.3/my-app-linux-amd64.tar.gz"
 start = "./my-app --port $PORT"
 app = "my-app" # optional override for derived app name
 bin = "my-app" # optional path inside archive when needed
+preinstall = "echo preparing deploy" # optional, runs before dependency install
+postinstall = "npm run migrate" # optional, runs after dependency install and before start
 ```

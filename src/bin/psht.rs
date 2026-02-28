@@ -85,6 +85,10 @@ struct ProjectConfig {
     app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preinstall: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    postinstall: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -231,10 +235,35 @@ fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
     let start_cmd = format!("./{}", file_name.to_string_lossy());
-    stage_binary_dir_with_start(binary_path, &start_cmd)
+    stage_binary_dir_with_start(binary_path, &start_cmd, None, None)
 }
 
-fn stage_binary_dir_with_start(binary_path: &Path, start: &str) -> Result<PathBuf, String> {
+fn write_deploy_hooks_config(
+    staging: &Path,
+    preinstall: Option<&str>,
+    postinstall: Option<&str>,
+) -> Result<(), String> {
+    let cfg = ProjectConfig {
+        preinstall: normalize_opt(preinstall),
+        postinstall: normalize_opt(postinstall),
+        ..ProjectConfig::default()
+    };
+    if cfg.preinstall.is_none() && cfg.postinstall.is_none() {
+        return Ok(());
+    }
+
+    let content = toml::to_string_pretty(&cfg)
+        .map_err(|e| format!("failed to serialize {PROJECT_CONFIG_FILE}: {e}"))?;
+    fs::write(staging.join(PROJECT_CONFIG_FILE), content)
+        .map_err(|e| format!("failed to write staged {PROJECT_CONFIG_FILE}: {e}"))
+}
+
+fn stage_binary_dir_with_start(
+    binary_path: &Path,
+    start: &str,
+    preinstall: Option<&str>,
+    postinstall: Option<&str>,
+) -> Result<PathBuf, String> {
     let file_name = binary_path
         .file_name()
         .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
@@ -257,11 +286,26 @@ fn stage_binary_dir_with_start(binary_path: &Path, start: &str) -> Result<PathBu
 
     fs::write(staging.join(".psht-start-command"), format!("{start}\n"))
         .map_err(|e| format!("failed to write .psht-start-command: {e}"))?;
+    write_deploy_hooks_config(&staging, preinstall, postinstall)?;
     Ok(staging)
 }
 
-fn deploy_binary(host: &str, app: &str, binary_path: &Path) -> Result<(), String> {
-    let staging = stage_binary_dir(binary_path)?;
+fn deploy_binary(
+    host: &str,
+    app: &str,
+    binary_path: &Path,
+    preinstall: Option<&str>,
+    postinstall: Option<&str>,
+) -> Result<(), String> {
+    let staging = if preinstall.is_none() && postinstall.is_none() {
+        stage_binary_dir(binary_path)?
+    } else {
+        let file_name = binary_path
+            .file_name()
+            .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
+        let start_cmd = format!("./{}", file_name.to_string_lossy());
+        stage_binary_dir_with_start(binary_path, &start_cmd, preinstall, postinstall)?
+    };
     let result = deploy_from_dir(host, app, &staging, false);
     let _ = fs::remove_dir_all(&staging);
     result
@@ -334,7 +378,13 @@ fn deploy(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
     deploy_from_dir(host, app, cwd, true)
 }
 
-fn deploy_with_app_or_binary(host: &str, cwd: &Path, value: Option<&str>) -> Result<(), String> {
+fn deploy_with_app_or_binary(
+    host: &str,
+    cwd: &Path,
+    value: Option<&str>,
+    preinstall: Option<&str>,
+    postinstall: Option<&str>,
+) -> Result<(), String> {
     if let Some(arg) = value
         && looks_like_path(arg)
     {
@@ -344,7 +394,8 @@ fn deploy_with_app_or_binary(host: &str, cwd: &Path, value: Option<&str>) -> Res
         }
         let name = app_name(None, cwd);
         app_name::validate_app_name(&name)?;
-        return deploy_binary(host, &name, &binary_path);
+        eprintln!("-----> Deploying via binary");
+        return deploy_binary(host, &name, &binary_path, preinstall, postinstall);
     }
     let name = app_name(value, cwd);
     app_name::validate_app_name(&name)?;
@@ -352,6 +403,7 @@ fn deploy_with_app_or_binary(host: &str, cwd: &Path, value: Option<&str>) -> Res
         eprintln!("-----> Deploying via git");
         return deploy_from_git(host, &name, cwd);
     }
+    eprintln!("-----> Deploying via tar");
     deploy(host, &name, cwd)
 }
 
@@ -506,7 +558,13 @@ fn resolve_binary_from_archive(extracted_dir: &Path, bin: Option<&str>) -> Resul
     Err("multiple executable files found; set `bin` in psht.toml to choose one".to_string())
 }
 
-fn stage_binary_from_url(url: &str, start: &str, bin: Option<&str>) -> Result<PathBuf, String> {
+fn stage_binary_from_url(
+    url: &str,
+    start: &str,
+    bin: Option<&str>,
+    preinstall: Option<&str>,
+    postinstall: Option<&str>,
+) -> Result<PathBuf, String> {
     let tmp = mktemp_dir("psht-release")?;
     let archive_path = tmp.join("asset");
     let extract_dir = tmp.join("extract");
@@ -517,7 +575,7 @@ fn stage_binary_from_url(url: &str, start: &str, bin: Option<&str>) -> Result<Pa
     download_url_to_file(url, &archive_path)?;
     extract_archive(&archive_path, &extract_dir, fmt)?;
     let binary = resolve_binary_from_archive(&extract_dir, bin)?;
-    let staged = stage_binary_dir_with_start(&binary, start);
+    let staged = stage_binary_dir_with_start(&binary, start, preinstall, postinstall);
     let _ = fs::remove_dir_all(&tmp);
     staged
 }
@@ -674,6 +732,8 @@ fn cli_release_settings(
         start: normalize_opt(start),
         app: normalize_opt(app),
         bin: normalize_opt(bin),
+        preinstall: None,
+        postinstall: None,
     }
 }
 
@@ -779,6 +839,8 @@ fn bootstrap_project_config(
         start: Some(start),
         app: Some(app),
         bin: defaults.bin.clone(),
+        preinstall: defaults.preinstall.clone(),
+        postinstall: defaults.postinstall.clone(),
     };
 
     let preview = toml::to_string_pretty(&cfg)
@@ -815,7 +877,14 @@ fn deploy_from_release_config(host: &str, cfg: &ProjectConfig) -> Result<(), Str
     };
     app_name::validate_app_name(&app)?;
 
-    let staging = stage_binary_from_url(url, start, cfg.bin.as_deref())?;
+    eprintln!("-----> Deploying via release-url");
+    let staging = stage_binary_from_url(
+        url,
+        start,
+        cfg.bin.as_deref(),
+        cfg.preinstall.as_deref(),
+        cfg.postinstall.as_deref(),
+    )?;
     let result = deploy_from_dir(host, &app, &staging, false);
     let _ = fs::remove_dir_all(&staging);
     result
@@ -854,11 +923,17 @@ fn deploy_with_project_config(
                 ));
             }
 
-            deploy_with_app_or_binary(host, cwd, app)
+            deploy_with_app_or_binary(
+                host,
+                cwd,
+                app,
+                file_cfg.preinstall.as_deref(),
+                file_cfg.postinstall.as_deref(),
+            )
         }
         None => {
             if app.is_some() && !has_release_settings(&cli_cfg) {
-                return deploy_with_app_or_binary(host, cwd, app);
+                return deploy_with_app_or_binary(host, cwd, app, None, None);
             }
 
             let cfg = bootstrap_project_config(&config_path, &cli_cfg)?;
@@ -1028,13 +1103,15 @@ mod tests {
         let path = dir.path().join("psht.toml");
         fs::write(
             &path,
-            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\n",
+            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\npreinstall = \"echo pre\"\npostinstall = \"echo post\"\n",
         )
         .unwrap();
         let cfg = load_project_config(&path).unwrap().unwrap();
         assert_eq!(cfg.url.as_deref(), Some("https://example.com/app.tar.gz"));
         assert_eq!(cfg.start.as_deref(), Some("./app"));
         assert_eq!(cfg.app.as_deref(), Some("demo"));
+        assert_eq!(cfg.preinstall.as_deref(), Some("echo pre"));
+        assert_eq!(cfg.postinstall.as_deref(), Some("echo post"));
     }
 
     #[test]
@@ -1046,6 +1123,8 @@ mod tests {
             start: Some("./app".to_string()),
             app: Some("demo".to_string()),
             bin: Some("bin/app".to_string()),
+            preinstall: Some("echo pre".to_string()),
+            postinstall: Some("echo post".to_string()),
         };
         save_project_config(&path, &cfg).unwrap();
         let loaded = load_project_config(&path).unwrap().unwrap();
@@ -1228,9 +1307,18 @@ mod tests {
         fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let staged = stage_binary_dir_with_start(&bin, "./mybin --debug").unwrap();
+        let staged = stage_binary_dir_with_start(
+            &bin,
+            "./mybin --debug",
+            Some("echo pre"),
+            Some("echo post"),
+        )
+        .unwrap();
         let marker = fs::read_to_string(staged.join(".psht-start-command")).unwrap();
         assert_eq!(marker.trim(), "./mybin --debug");
+        let hooks = fs::read_to_string(staged.join(PROJECT_CONFIG_FILE)).unwrap();
+        assert!(hooks.contains("preinstall = \"echo pre\""));
+        assert!(hooks.contains("postinstall = \"echo post\""));
         let _ = fs::remove_dir_all(staged);
     }
 
@@ -1240,7 +1328,7 @@ mod tests {
         let bin = tmp.path().join("mybin");
         fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        let err = stage_binary_dir_with_start(&bin, "  ").unwrap_err();
+        let err = stage_binary_dir_with_start(&bin, "  ", None, None).unwrap_err();
         assert!(err.contains("start command is empty"));
     }
 
@@ -1248,7 +1336,8 @@ mod tests {
     fn deploy_with_path_errors_when_binary_missing() {
         let cwd = tempdir().unwrap();
         let err =
-            deploy_with_app_or_binary("example.com", cwd.path(), Some("bin/missing")).unwrap_err();
+            deploy_with_app_or_binary("example.com", cwd.path(), Some("bin/missing"), None, None)
+                .unwrap_err();
         assert!(err.contains("binary not found"));
     }
 
@@ -1362,15 +1451,29 @@ mod tests {
             start: Some("./app".to_string()),
             app: Some("myapp".to_string()),
             bin: None,
+            preinstall: None,
+            postinstall: None,
         };
         let cli = ProjectConfig {
             url: Some("https://b".to_string()),
             start: Some("./app".to_string()),
             app: None,
             bin: None,
+            preinstall: None,
+            postinstall: None,
         };
         let err = ensure_no_release_conflicts(&file, &cli).unwrap_err();
         assert!(err.contains("url"));
+    }
+
+    #[test]
+    fn has_release_settings_ignores_hook_only_config() {
+        let cfg = ProjectConfig {
+            preinstall: Some("echo pre".to_string()),
+            postinstall: Some("echo post".to_string()),
+            ..ProjectConfig::default()
+        };
+        assert!(!has_release_settings(&cfg));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use serde::Deserialize;
+
 #[derive(Debug, PartialEq)]
 pub enum AppType {
     Binary,
@@ -17,6 +19,8 @@ pub struct AppConfig {
     pub app_type: AppType,
     pub start_command: String,
     pub install_command: String,
+    pub preinstall_command: Option<String>,
+    pub postinstall_command: Option<String>,
 }
 
 impl AppType {
@@ -64,11 +68,15 @@ impl AppConfig {
 }
 
 pub fn detect(dir: &Path) -> Result<AppConfig, String> {
+    let hooks = read_deploy_hooks(dir)?;
+
     if let Some(start_command) = read_start_command_file(dir)? {
         return Ok(AppConfig {
             app_type: AppType::Binary,
             start_command,
             install_command: "".to_string(),
+            preinstall_command: hooks.preinstall,
+            postinstall_command: hooks.postinstall,
         });
     }
 
@@ -87,6 +95,8 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
             app_type: AppType::Bun,
             start_command: start,
             install_command: install.to_string(),
+            preinstall_command: hooks.preinstall.clone(),
+            postinstall_command: hooks.postinstall.clone(),
         });
     }
 
@@ -111,6 +121,8 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
                 app_type: *app_type,
                 start_command: start,
                 install_command: install.to_string(),
+                preinstall_command: hooks.preinstall.clone(),
+                postinstall_command: hooks.postinstall.clone(),
             });
         }
     }
@@ -148,6 +160,47 @@ fn read_procfile(dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Default)]
+struct DeployHooks {
+    preinstall: Option<String>,
+    postinstall: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HookConfig {
+    #[serde(default)]
+    preinstall: Option<String>,
+    #[serde(default)]
+    postinstall: Option<String>,
+}
+
+fn normalize_hook(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn read_deploy_hooks(dir: &Path) -> Result<DeployHooks, String> {
+    let path = dir.join("psht.toml");
+    if !path.exists() {
+        return Ok(DeployHooks::default());
+    }
+
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let cfg: HookConfig =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+
+    Ok(DeployHooks {
+        preinstall: normalize_hook(cfg.preinstall),
+        postinstall: normalize_hook(cfg.postinstall),
+    })
 }
 
 // AppType needs Copy since we iterate over references
@@ -294,6 +347,43 @@ mod tests {
         fs::write(tmp.path().join(".psht-start-command"), "\n  \n").unwrap();
         let err = detect(tmp.path()).unwrap_err();
         assert!(err.contains(".psht-start-command is empty"));
+    }
+
+    #[test]
+    fn detect_reads_hooks_from_psht_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            tmp.path().join("psht.toml"),
+            "preinstall = \"echo pre\"\npostinstall = \"echo post\"\n",
+        )
+        .unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.preinstall_command.as_deref(), Some("echo pre"));
+        assert_eq!(config.postinstall_command.as_deref(), Some("echo post"));
+    }
+
+    #[test]
+    fn detect_treats_blank_hooks_as_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(
+            tmp.path().join("psht.toml"),
+            "preinstall = \"   \"\npostinstall = \"\\n\\t\"\n",
+        )
+        .unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert!(config.preinstall_command.is_none());
+        assert!(config.postinstall_command.is_none());
+    }
+
+    #[test]
+    fn detect_errors_on_invalid_psht_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("psht.toml"), "preinstall = [").unwrap();
+        let err = detect(tmp.path()).unwrap_err();
+        assert!(err.contains("failed to parse"));
     }
 
     #[test]
