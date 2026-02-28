@@ -1280,7 +1280,7 @@ install_cli() {{
   target=$(detect_target)
   asset_url="$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz"
   tmpdir=$(mktemp -d)
-  if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"; then
+  if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
     tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
     install -m 755 "$tmpdir/psht" "$install_dir/psht"
     rm -rf "$tmpdir"
@@ -1295,6 +1295,7 @@ install_cli() {{
   fi
 
   source_root="$tmpdir/source-root"
+  echo "-----> building psht from source (this can take a few minutes)" >&2
   cargo install --git "$SOURCE_URL" --tag "v$VERSION" --root "$source_root" --bin psht
   install -m 755 "$source_root/bin/psht" "$install_dir/psht"
   rm -rf "$tmpdir"
@@ -1371,7 +1372,7 @@ asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 candidate="$tmpdir/psht"
-if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"; then
+if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
   tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
 else
   echo "warning: no prebuilt psht release for $target at $asset_url" >&2
@@ -1380,6 +1381,7 @@ else
     exit 1
   fi
   source_root="$tmpdir/source-root"
+  echo "-----> building psht from source (this can take a few minutes)" >&2
   cargo install --git "$SOURCE_URL" --tag "v{version}" --root "$source_root" --bin psht
   candidate="$source_root/bin/psht"
 fi
@@ -2085,12 +2087,16 @@ mod tests {
             "script should download CLI tarball from forge releases"
         );
         assert!(
-            script.contains("curl -fsSL \"$asset_url\""),
+            script.contains("curl -fsSL \"$asset_url\" -o \"$tmpdir/psht.tar.gz\" 2>/dev/null"),
             "script should fetch CLI with curl"
         );
         assert!(
             script.contains("cargo install --git \"$SOURCE_URL\" --tag \"v$VERSION\" --root \"$source_root\" --bin psht"),
             "script should fall back to building from source when prebuilt CLI is missing"
+        );
+        assert!(
+            script.contains("building psht from source (this can take a few minutes)"),
+            "script should explain source fallback duration"
         );
         assert!(
             script.contains("tar xzf \"$tmpdir/psht.tar.gz\""),
@@ -2140,12 +2146,16 @@ mod tests {
             "should build release asset URL from forge"
         );
         assert!(
-            script.contains("curl -fsSL \"$asset_url\""),
+            script.contains("curl -fsSL \"$asset_url\" -o \"$tmpdir/psht.tar.gz\" 2>/dev/null"),
             "should download CLI tarball from forge"
         );
         assert!(
             script.contains("cargo install --git \"$SOURCE_URL\" --tag \"v"),
             "should fall back to source build when prebuilt CLI asset is missing"
+        );
+        assert!(
+            script.contains("building psht from source (this can take a few minutes)"),
+            "should explain source fallback duration"
         );
         assert!(
             script.contains("Darwin/aarch64|Darwin/arm64"),
