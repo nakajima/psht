@@ -25,7 +25,7 @@ const STACKS: &[(&str, &str)] = &[
     ("static", include_str!("../stacks/static.sh")),
 ];
 
-const DEFAULT_FORGE_URL: &str = "https://git.fishmt.net/nakajima/psht";
+const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
 const START_COMMAND_PATH: &str = "/etc/psht-start-command";
 
 fn home_dir() -> PathBuf {
@@ -2061,6 +2061,7 @@ mod tests {
     #[test]
     fn setup_script_installs_cli() {
         let script = setup_script("example.com");
+        let expected_forge = format!("FORGE_URL=\"${{PSHT_FORGE_URL:-{}}}\"", DEFAULT_FORGE_URL);
         assert!(
             script.contains("Install psht CLI"),
             "script should install the CLI"
@@ -2072,6 +2073,10 @@ mod tests {
         assert!(
             script.contains("PSHT_SOURCE_URL"),
             "script should support overriding source URL via PSHT_SOURCE_URL"
+        );
+        assert!(
+            script.contains(&expected_forge),
+            "script should default forge URL to the configured default"
         );
         assert!(
             script.contains(
@@ -2117,6 +2122,7 @@ mod tests {
     #[test]
     fn update_script_downloads_binary_from_forge() {
         let script = update_script("example.com");
+        let expected_forge = format!("FORGE_URL=\"${{PSHT_FORGE_URL:-{}}}\"", DEFAULT_FORGE_URL);
         assert!(
             script.contains("PSHT_FORGE_URL"),
             "should support overriding forge URL via PSHT_FORGE_URL"
@@ -2124,6 +2130,10 @@ mod tests {
         assert!(
             script.contains("PSHT_SOURCE_URL"),
             "should support overriding source URL via PSHT_SOURCE_URL"
+        );
+        assert!(
+            script.contains(&expected_forge),
+            "should default forge URL to the configured default"
         );
         assert!(
             script.contains("asset_url=\"$FORGE_URL/releases/download/v"),
@@ -2145,6 +2155,11 @@ mod tests {
             script.contains("Darwin/x86_64|Darwin/amd64"),
             "update script should support macOS x86_64 target detection"
         );
+    }
+
+    #[test]
+    fn default_forge_url_points_to_github() {
+        assert_eq!(DEFAULT_FORGE_URL, "https://github.com/nakajima/psht");
     }
 
     #[test]
