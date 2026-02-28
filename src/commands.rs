@@ -1260,13 +1260,18 @@ set -e
 VERSION="{version}"
 FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
 FORGE_URL="${{FORGE_URL%/}}"
+SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
+SOURCE_URL="${{SOURCE_URL%/}}"
 
 detect_target() {{
+  os=$(uname -s)
   arch=$(uname -m)
-  case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
-    *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+  case "$os/$arch" in
+    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
+    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
+    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
   esac
 }}
 
@@ -1275,9 +1280,23 @@ install_cli() {{
   target=$(detect_target)
   asset_url="$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz"
   tmpdir=$(mktemp -d)
-  curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"
-  tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
-  install -m 755 "$tmpdir/psht" "$install_dir/psht"
+  if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"; then
+    tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
+    install -m 755 "$tmpdir/psht" "$install_dir/psht"
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+
+  source_root="$tmpdir/source-root"
+  cargo install --git "$SOURCE_URL" --tag "v$VERSION" --root "$source_root" --bin psht
+  install -m 755 "$source_root/bin/psht" "$install_dir/psht"
   rm -rf "$tmpdir"
 }}
 
@@ -1326,13 +1345,18 @@ set -e
 PSHT_BIN=$(command -v psht) || {{ echo "psht not found. Run: ssh psht@{hostname} setup | sh" >&2; exit 1; }}
 FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
 FORGE_URL="${{FORGE_URL%/}}"
+SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
+SOURCE_URL="${{SOURCE_URL%/}}"
 
 detect_target() {{
+  os=$(uname -s)
   arch=$(uname -m)
-  case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
-    *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+  case "$os/$arch" in
+    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
+    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
+    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
   esac
 }}
 
@@ -1346,9 +1370,19 @@ target=$(detect_target)
 asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
-curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"
-tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
 candidate="$tmpdir/psht"
+if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz"; then
+  tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
+else
+  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
+    exit 1
+  fi
+  source_root="$tmpdir/source-root"
+  cargo install --git "$SOURCE_URL" --tag "v{version}" --root "$source_root" --bin psht
+  candidate="$source_root/bin/psht"
+fi
 if [ ! -x "$candidate" ]; then
   echo "error: downloaded archive missing executable psht binary" >&2
   exit 1
@@ -2036,6 +2070,10 @@ mod tests {
             "script should support overriding forge URL via PSHT_FORGE_URL"
         );
         assert!(
+            script.contains("PSHT_SOURCE_URL"),
+            "script should support overriding source URL via PSHT_SOURCE_URL"
+        );
+        assert!(
             script.contains(
                 "asset_url=\"$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz\""
             ),
@@ -2046,12 +2084,24 @@ mod tests {
             "script should fetch CLI with curl"
         );
         assert!(
+            script.contains("cargo install --git \"$SOURCE_URL\" --tag \"v$VERSION\" --root \"$source_root\" --bin psht"),
+            "script should fall back to building from source when prebuilt CLI is missing"
+        );
+        assert!(
             script.contains("tar xzf \"$tmpdir/psht.tar.gz\""),
             "script should extract downloaded CLI tarball"
         );
         assert!(
             script.contains("install -m 755 \"$tmpdir/psht\" \"$install_dir/psht\""),
             "script should install CLI binary"
+        );
+        assert!(
+            script.contains("Darwin/aarch64|Darwin/arm64"),
+            "script should support macOS arm64 target detection"
+        );
+        assert!(
+            script.contains("Darwin/x86_64|Darwin/amd64"),
+            "script should support macOS x86_64 target detection"
         );
     }
 
@@ -2072,12 +2122,28 @@ mod tests {
             "should support overriding forge URL via PSHT_FORGE_URL"
         );
         assert!(
+            script.contains("PSHT_SOURCE_URL"),
+            "should support overriding source URL via PSHT_SOURCE_URL"
+        );
+        assert!(
             script.contains("asset_url=\"$FORGE_URL/releases/download/v"),
             "should build release asset URL from forge"
         );
         assert!(
             script.contains("curl -fsSL \"$asset_url\""),
             "should download CLI tarball from forge"
+        );
+        assert!(
+            script.contains("cargo install --git \"$SOURCE_URL\" --tag \"v"),
+            "should fall back to source build when prebuilt CLI asset is missing"
+        );
+        assert!(
+            script.contains("Darwin/aarch64|Darwin/arm64"),
+            "update script should support macOS arm64 target detection"
+        );
+        assert!(
+            script.contains("Darwin/x86_64|Darwin/amd64"),
+            "update script should support macOS x86_64 target detection"
         );
     }
 
