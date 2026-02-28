@@ -171,7 +171,7 @@ wait_for_release_id() {
 }
 
 upload_asset() {
-  local api_base="$1"
+  local upload_base="$1"
   local token="$2"
   local release_id="$3"
   local file="$4"
@@ -183,7 +183,7 @@ upload_asset() {
     -H "Authorization: token $token" \
     -H "Content-Type: application/octet-stream" \
     --data-binary @"$file" \
-    "$api_base/releases/$release_id/assets?name=$name")" || return 1
+    "$upload_base/releases/$release_id/assets?name=$name")" || return 1
 
   case "$status" in
     200|201)
@@ -205,11 +205,24 @@ parse_succeeded_targets() {
   sed -n 's/.*Succeeded:[[:space:]]*\([A-Za-z0-9._-]\+\).*/\1/p' "$log_file" | awk '!seen[$0]++'
 }
 
+can_build_target_on_host() {
+  local target="$1"
+  case "$target" in
+    *-apple-darwin)
+      [[ "$(uname -s)" == "Darwin" ]]
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 upload_cli_assets() {
   local api_base="$1"
-  local token="$2"
-  local version="$3"
-  shift 3
+  local upload_base="$2"
+  local token="$3"
+  local version="$4"
+  shift 4
 
   local release_id
   release_id="$(wait_for_release_id "$api_base" "$token" "$version" 12 1)" || {
@@ -230,6 +243,11 @@ upload_cli_assets() {
   local failed=0
 
   for target in "${targets[@]}"; do
+    if ! can_build_target_on_host "$target"; then
+      echo "-----> skipping $target (requires macOS host toolchain)" >&2
+      continue
+    fi
+
     echo "-----> building psht for $target"
     if ! cargo build --release --bin psht --target "$target"; then
       echo "-----> failed to build psht for $target (skipping)" >&2
@@ -248,7 +266,7 @@ upload_cli_assets() {
     local tarball="$tmpdir/$asset_name"
     tar -C "$(dirname "$bin_path")" -czf "$tarball" "$(basename "$bin_path")"
 
-    if upload_asset "$api_base" "$token" "$release_id" "$tarball" "$asset_name" "$tmpdir/upload.json"; then
+    if upload_asset "$upload_base" "$token" "$release_id" "$tarball" "$asset_name" "$tmpdir/upload.json"; then
       echo "-----> uploaded $asset_name"
       uploaded=$((uploaded + 1))
     else
@@ -290,10 +308,12 @@ base_url_no_scheme="${base_url#*://}"
 base_host="${base_url_no_scheme%%/*}"
 if [[ "$base_host" == "github.com" || "$base_host" == "www.github.com" ]]; then
   api_base="https://api.github.com/repos/$repo"
+  upload_base="https://uploads.github.com/repos/$repo"
   token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
   [[ -n "$token" ]] || err "set GITHUB_TOKEN (or GITEA_TOKEN) for GitHub release operations"
 else
   api_base="${base_url%/}/api/v1/repos/$repo"
+  upload_base="$api_base"
   token="${GITEA_TOKEN:-${GITHUB_TOKEN:-}}"
   [[ -n "$token" ]] || err "set GITEA_TOKEN (or GITHUB_TOKEN) for release operations"
 fi
@@ -310,7 +330,7 @@ trap 'rm -f "$log_file"' EXIT
 
 if run_releasor "$log_file" "${FORWARDED_ARGS[@]}"; then
   mapfile -t succeeded_targets < <(parse_succeeded_targets "$log_file")
-  upload_cli_assets "$api_base" "$token" "$version" "${succeeded_targets[@]}"
+  upload_cli_assets "$api_base" "$upload_base" "$token" "$version" "${succeeded_targets[@]}"
   exit 0
 fi
 
@@ -321,5 +341,5 @@ fi
 
 echo "-----> release conflict for version $version; using existing release to upload CLI assets" >&2
 mapfile -t succeeded_targets < <(parse_succeeded_targets "$log_file")
-upload_cli_assets "$api_base" "$token" "$version" "${succeeded_targets[@]}"
+upload_cli_assets "$api_base" "$upload_base" "$token" "$version" "${succeeded_targets[@]}"
 exit 0
