@@ -750,12 +750,103 @@ fn push_conflict(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseUrlIdentity {
+    host: String,
+    owner: String,
+    repo: String,
+    asset_name: String,
+}
+
+fn normalize_release_asset_name(asset: &str) -> Option<String> {
+    let stripped = strip_archive_suffix(asset);
+    let stripped = strip_arch_suffix(stripped);
+    let stripped = strip_version_suffix(stripped);
+    let normalized = sanitize_app_name(stripped);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn parse_release_url_identity(url: &str) -> Option<ReleaseUrlIdentity> {
+    let path = path_from_url(url).trim();
+    let (scheme, rest) = path.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+
+    let (host, path) = match rest.split_once('/') {
+        Some((host, path)) => (host, path),
+        None => (rest, ""),
+    };
+    if host.trim().is_empty() {
+        return None;
+    }
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() != 6 {
+        return None;
+    }
+    if !segments[2].eq_ignore_ascii_case("releases")
+        || !segments[3].eq_ignore_ascii_case("download")
+        || segments[4].is_empty()
+    {
+        return None;
+    }
+
+    let asset_name = normalize_release_asset_name(segments[5])?;
+    Some(ReleaseUrlIdentity {
+        host: host.to_ascii_lowercase(),
+        owner: segments[0].to_string(),
+        repo: segments[1].to_string(),
+        asset_name,
+    })
+}
+
+fn is_same_project_release_url(file_url: &str, cli_url: &str) -> bool {
+    let file_identity = match parse_release_url_identity(file_url) {
+        Some(identity) => identity,
+        None => return false,
+    };
+    let cli_identity = match parse_release_url_identity(cli_url) {
+        Some(identity) => identity,
+        None => return false,
+    };
+    file_identity == cli_identity
+}
+
+fn reconcile_release_url_override(
+    config_path: &Path,
+    file_cfg: &ProjectConfig,
+    cli_cfg: &ProjectConfig,
+) -> Result<ProjectConfig, String> {
+    let mut merged = file_cfg.clone();
+    let file_url = file_cfg.url.as_deref().map(str::trim);
+    let cli_url = cli_cfg.url.as_deref().map(str::trim);
+
+    if let (Some(file_url), Some(cli_url)) = (file_url, cli_url)
+        && file_url != cli_url
+    {
+        if !is_same_project_release_url(file_url, cli_url) {
+            return Err(format!(
+                "release URL override is allowed only for same-project version bumps; edit {} to change projects",
+                PROJECT_CONFIG_FILE
+            ));
+        }
+        merged.url = Some(cli_url.to_string());
+        save_project_config(config_path, &merged)?;
+        eprintln!("Updated {PROJECT_CONFIG_FILE} `url` from CLI for this version bump.");
+    }
+
+    Ok(merged)
+}
+
 fn ensure_no_release_conflicts(
     file_cfg: &ProjectConfig,
     cli_cfg: &ProjectConfig,
 ) -> Result<(), String> {
     let mut conflicts = Vec::new();
-    push_conflict(&mut conflicts, "url", &file_cfg.url, &cli_cfg.url);
     push_conflict(&mut conflicts, "start", &file_cfg.start, &cli_cfg.start);
     push_conflict(&mut conflicts, "app", &file_cfg.app, &cli_cfg.app);
     push_conflict(&mut conflicts, "bin", &file_cfg.bin, &cli_cfg.bin);
@@ -906,14 +997,15 @@ fn deploy_with_project_config(
     match file_cfg {
         Some(file_cfg) => {
             if file_cfg.url.is_some() {
-                ensure_no_release_conflicts(&file_cfg, &cli_cfg)?;
+                let merged_cfg = reconcile_release_url_override(&config_path, &file_cfg, &cli_cfg)?;
+                ensure_no_release_conflicts(&merged_cfg, &cli_cfg)?;
                 if app.is_some() {
                     return Err(format!(
                         "positional deploy target cannot be used when {} has `url`; set `app` in {} instead",
                         PROJECT_CONFIG_FILE, PROJECT_CONFIG_FILE
                     ));
                 }
-                return deploy_from_release_config(host, &file_cfg);
+                return deploy_from_release_config(host, &merged_cfg);
             }
 
             if has_release_settings(&cli_cfg) {
@@ -1445,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_no_release_conflicts_detects_mismatch() {
+    fn ensure_no_release_conflicts_detects_non_url_mismatch() {
         let file = ProjectConfig {
             url: Some("https://a".to_string()),
             start: Some("./app".to_string()),
@@ -1456,14 +1548,42 @@ mod tests {
         };
         let cli = ProjectConfig {
             url: Some("https://b".to_string()),
-            start: Some("./app".to_string()),
+            start: Some("./other".to_string()),
             app: None,
             bin: None,
             preinstall: None,
             postinstall: None,
         };
         let err = ensure_no_release_conflicts(&file, &cli).unwrap_err();
-        assert!(err.contains("url"));
+        assert!(err.contains("start"));
+    }
+
+    #[test]
+    fn is_same_project_release_url_accepts_version_bump() {
+        let old_url = "https://github.com/org/repo/releases/download/v0.0.3/hyperlinked-0.0.3-x86_64-unknown-linux-gnu.tar.gz";
+        let new_url = "https://github.com/org/repo/releases/download/v0.0.4/hyperlinked-0.0.4-x86_64-unknown-linux-gnu.tar.gz";
+        assert!(is_same_project_release_url(old_url, new_url));
+    }
+
+    #[test]
+    fn is_same_project_release_url_rejects_repo_change() {
+        let old_url = "https://github.com/org/repo/releases/download/v0.0.3/hyperlinked-0.0.3-x86_64-unknown-linux-gnu.tar.gz";
+        let new_url = "https://github.com/org/other/releases/download/v0.0.4/hyperlinked-0.0.4-x86_64-unknown-linux-gnu.tar.gz";
+        assert!(!is_same_project_release_url(old_url, new_url));
+    }
+
+    #[test]
+    fn is_same_project_release_url_rejects_asset_name_change() {
+        let old_url = "https://github.com/org/repo/releases/download/v0.0.3/hyperlinked-0.0.3-x86_64-unknown-linux-gnu.tar.gz";
+        let new_url = "https://github.com/org/repo/releases/download/v0.0.4/another-app-0.0.4-x86_64-unknown-linux-gnu.tar.gz";
+        assert!(!is_same_project_release_url(old_url, new_url));
+    }
+
+    #[test]
+    fn is_same_project_release_url_rejects_non_release_download_shape() {
+        let old_url = "https://github.com/org/repo/releases/download/v0.0.3/hyperlinked-0.0.3-x86_64-unknown-linux-gnu.tar.gz";
+        let new_url = "https://github.com/org/repo/releases/tag/v0.0.4";
+        assert!(!is_same_project_release_url(old_url, new_url));
     }
 
     #[test]
