@@ -1335,7 +1335,7 @@ pub fn deploy(app: &str) -> Result<(), String> {
     deploy_from(app, &build_dir)
 }
 
-pub fn push(app: &str) -> Result<(), String> {
+pub fn push(app: &str, force: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
 
@@ -1360,8 +1360,12 @@ pub fn push(app: &str) -> Result<(), String> {
     let candidate_hash = binary_payload_hash(&code_dir)?;
     if let Some(hash) = candidate_hash.as_deref() {
         if container::exists(app) && read_binary_hash(app).as_deref() == Some(hash) {
-            eprintln!("-----> Binary unchanged ({hash}), skipping deploy");
-            return Ok(());
+            if force {
+                eprintln!("-----> Binary unchanged ({hash}), forcing deploy");
+            } else {
+                eprintln!("-----> Binary unchanged ({hash}), skipping deploy");
+                return Ok(());
+            }
         }
     }
 
@@ -3641,7 +3645,7 @@ devices:
     fn command_entrypoints_reject_invalid_app_name() {
         for result in [
             deploy("bad/name"),
-            push("bad/name"),
+            push("bad/name", false),
             logs("bad/name", false),
             stop("bad/name"),
             start("bad/name"),

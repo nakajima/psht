@@ -42,6 +42,8 @@ psht setup
 psht deploy # first run creates psht.toml (release URL + start command)
 ```
 
+Use `psht deploy --force` to force a deploy even when the binary payload hash is unchanged.
+
 `psht.toml` (project root) is used for release deploys and optional deploy hooks:
 
 ```toml

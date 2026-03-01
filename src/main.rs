@@ -61,7 +61,11 @@ enum Command {
     #[command(hide = true)]
     Deploy { app: String },
     #[command(hide = true)]
-    Push { app: String },
+    Push {
+        app: String,
+        #[arg(long)]
+        force: bool,
+    },
     #[command(name = "git-receive-pack", hide = true)]
     GitReceivePack { app: String },
     #[command(name = "git-upload-pack", hide = true)]
@@ -125,9 +129,9 @@ fn run() -> Result<(), String> {
             app_name::validate_app_name(&app)?;
             commands::deploy(&app)
         }
-        Command::Push { app } => {
+        Command::Push { app, force } => {
             app_name::validate_app_name(&app)?;
-            commands::push(&app)
+            commands::push(&app, force)
         }
         Command::Env { app, assignments } => {
             app_name::validate_app_name(&app)?;
@@ -299,7 +303,20 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Push {
-                app: "myapp".to_string()
+                app: "myapp".to_string(),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_push_force() {
+        let cli = parse_cli(&["psht-server", "push", "--force", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Push {
+                app: "myapp".to_string(),
+                force: true,
             }
         );
     }

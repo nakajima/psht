@@ -45,6 +45,9 @@ enum CliCommand {
         /// Path to binary inside archive
         #[arg(long)]
         bin: Option<String>,
+        /// Force deploy even when payload hash is unchanged
+        #[arg(long)]
+        force: bool,
     },
     /// List running apps
     Ps,
@@ -256,6 +259,7 @@ fn deploy_from_dir(
     app: &str,
     source_dir: &Path,
     exclude_git: bool,
+    force: bool,
 ) -> Result<(), String> {
     let mut tar_cmd = Command::new("tar");
     if exclude_git {
@@ -273,9 +277,15 @@ fn deploy_from_dir(
         .take()
         .ok_or_else(|| "failed to capture tar stdout".to_string())?;
 
+    let mut push_args = vec!["push".to_string()];
+    if force {
+        push_args.push("--force".to_string());
+    }
+    push_args.push(app.to_string());
+
     let status = Command::new("ssh")
         .arg(format!("psht@{host}"))
-        .args(["push", app])
+        .args(&push_args)
         .stdin(tar_stdout)
         .stderr(std::process::Stdio::inherit())
         .status()
@@ -421,6 +431,7 @@ fn deploy_binary(
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
     required_env: Option<&[String]>,
+    force: bool,
 ) -> Result<(), String> {
     let staging = if preinstall.is_none()
         && postinstall.is_none()
@@ -442,7 +453,7 @@ fn deploy_binary(
             required_env,
         )?
     };
-    let result = deploy_from_dir(host, app, &staging, false);
+    let result = deploy_from_dir(host, app, &staging, false, force);
     let _ = fs::remove_dir_all(&staging);
     result
 }
@@ -510,8 +521,8 @@ fn deploy_from_git(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn deploy(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
-    deploy_from_dir(host, app, cwd, true)
+fn deploy(host: &str, app: &str, cwd: &Path, force: bool) -> Result<(), String> {
+    deploy_from_dir(host, app, cwd, true, force)
 }
 
 fn deploy_with_app_or_binary(
@@ -523,6 +534,7 @@ fn deploy_with_app_or_binary(
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
     required_env: Option<&[String]>,
+    force: bool,
 ) -> Result<(), String> {
     let default_app = default_app.map(str::trim).filter(|v| !v.is_empty());
     if let Some(value) = value
@@ -554,6 +566,7 @@ fn deploy_with_app_or_binary(
             postinstall,
             apt_packages,
             required_env,
+            force,
         );
     }
     let name = if let Some(value) = value {
@@ -569,7 +582,7 @@ fn deploy_with_app_or_binary(
         return deploy_from_git(host, &name, cwd);
     }
     eprintln!("-----> Deploying via tar");
-    deploy(host, &name, cwd)
+    deploy(host, &name, cwd, force)
 }
 
 fn path_from_url(url: &str) -> &str {
@@ -1125,7 +1138,7 @@ fn bootstrap_project_config(
     Ok(cfg)
 }
 
-fn deploy_from_release_config(host: &str, cfg: &ProjectConfig) -> Result<(), String> {
+fn deploy_from_release_config(host: &str, cfg: &ProjectConfig, force: bool) -> Result<(), String> {
     let url = cfg
         .url
         .as_deref()
@@ -1156,7 +1169,7 @@ fn deploy_from_release_config(host: &str, cfg: &ProjectConfig) -> Result<(), Str
         cfg.apt_packages.as_deref(),
         cfg.required_env.as_deref(),
     )?;
-    let result = deploy_from_dir(host, &app, &staging, false);
+    let result = deploy_from_dir(host, &app, &staging, false, force);
     let _ = fs::remove_dir_all(&staging);
     result
 }
@@ -1169,6 +1182,7 @@ fn deploy_with_project_config(
     start: Option<&str>,
     app_flag: Option<&str>,
     bin: Option<&str>,
+    force: bool,
 ) -> Result<(), String> {
     let config_path = project_config_path(cwd);
     let file_cfg = load_project_config(&config_path)?;
@@ -1185,7 +1199,7 @@ fn deploy_with_project_config(
                         PROJECT_CONFIG_FILE, PROJECT_CONFIG_FILE
                     ));
                 }
-                return deploy_from_release_config(host, &merged_cfg);
+                return deploy_from_release_config(host, &merged_cfg, force);
             }
 
             if has_release_settings(&cli_cfg) {
@@ -1204,11 +1218,14 @@ fn deploy_with_project_config(
                 file_cfg.postinstall.as_deref(),
                 file_cfg.apt_packages.as_deref(),
                 file_cfg.required_env.as_deref(),
+                force,
             )
         }
         None => {
             if app.is_some() && !has_release_settings(&cli_cfg) {
-                return deploy_with_app_or_binary(host, cwd, app, None, None, None, None, None);
+                return deploy_with_app_or_binary(
+                    host, cwd, app, None, None, None, None, None, force,
+                );
             }
 
             if app.is_none() && !has_release_settings(&cli_cfg) {
@@ -1218,7 +1235,7 @@ fn deploy_with_project_config(
             }
 
             let cfg = bootstrap_project_config(&config_path, &cli_cfg)?;
-            deploy_from_release_config(host, &cfg)
+            deploy_from_release_config(host, &cfg, force)
         }
     }
 }
@@ -1340,6 +1357,7 @@ fn run() -> Result<(), String> {
             start,
             app_flag,
             bin,
+            force,
         } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             let (app, url) = normalize_deploy_target(app, url)?;
@@ -1351,6 +1369,7 @@ fn run() -> Result<(), String> {
                 start.as_deref(),
                 app_flag.as_deref(),
                 bin.as_deref(),
+                force,
             )
         }
         CliCommand::Ps => {
@@ -1620,13 +1639,34 @@ mod tests {
                 start,
                 app_flag,
                 bin,
+                force,
             } => {
                 assert!(app.is_none());
                 assert_eq!(url.as_deref(), Some("https://example.com/app.tar.gz"));
                 assert_eq!(start.as_deref(), Some("./app --port $PORT"));
                 assert_eq!(app_flag.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("dist/app"));
+                assert!(!force);
             }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_force_flag_parse() {
+        let cli = Cli::try_parse_from([
+            "psht",
+            "deploy",
+            "--force",
+            "--url",
+            "https://example.com/app.tar.gz",
+            "--start",
+            "./app",
+        ])
+        .expect("deploy should parse");
+
+        match cli.command {
+            CliCommand::Deploy { force, .. } => assert!(force),
             _ => panic!("expected deploy command"),
         }
     }
@@ -1740,6 +1780,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("binary not found"));
@@ -1757,6 +1798,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("does not match"));

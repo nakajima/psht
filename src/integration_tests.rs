@@ -31,6 +31,26 @@ impl Drop for ContainerGuard {
     }
 }
 
+struct StorageVolumeGuard {
+    pool: String,
+    volume: String,
+}
+
+impl StorageVolumeGuard {
+    fn new(pool: impl Into<String>, volume: impl Into<String>) -> Self {
+        Self {
+            pool: pool.into(),
+            volume: volume.into(),
+        }
+    }
+}
+
+impl Drop for StorageVolumeGuard {
+    fn drop(&mut self) {
+        let _ = delete_storage_volume_if_exists(&self.pool, &self.volume);
+    }
+}
+
 fn exec_output(app: &str, cmd: &str) -> Result<String, String> {
     let name = format!("psht-{app}");
     let output = Command::new("incus")
@@ -53,6 +73,89 @@ fn wait_for_container_network(app: &str) -> Result<(), String> {
         thread::sleep(Duration::from_secs(1));
     }
     Err(format!("container {app} network not ready after 30s"))
+}
+
+fn default_storage_pool_name() -> Result<String, String> {
+    let output = Command::new("incus")
+        .args(["profile", "device", "get", "default", "root", "pool"])
+        .output()
+        .map_err(|e| format!("failed to get default root pool: {e}"))?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+
+    let output = Command::new("incus")
+        .args(["storage", "list", "--format=json"])
+        .output()
+        .map_err(|e| format!("failed to list storage pools: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to list storage pools: {}", stderr.trim()));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("failed to parse storage list: {e}"))?;
+    let pools = value
+        .as_array()
+        .ok_or_else(|| "unexpected storage list response".to_string())?;
+    for pool in pools {
+        if let Some(name) = pool.get("name").and_then(serde_json::Value::as_str)
+            && !name.is_empty()
+        {
+            return Ok(name.to_string());
+        }
+    }
+    Err("no storage pool found".to_string())
+}
+
+fn storage_volume_name(app: &str) -> String {
+    format!("psht-storage-{app}")
+}
+
+fn storage_volume_exists(pool: &str, volume: &str) -> bool {
+    Command::new("incus")
+        .args(["storage", "volume", "show", pool, volume])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn ensure_storage_volume(pool: &str, volume: &str) -> Result<(), String> {
+    if storage_volume_exists(pool, volume) {
+        return Ok(());
+    }
+    let output = Command::new("incus")
+        .args(["storage", "volume", "create", pool, volume])
+        .output()
+        .map_err(|e| format!("failed to create storage volume {pool}/{volume}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "failed to create storage volume {pool}/{volume}: {}",
+        stderr.trim()
+    ))
+}
+
+fn delete_storage_volume_if_exists(pool: &str, volume: &str) -> Result<(), String> {
+    if !storage_volume_exists(pool, volume) {
+        return Ok(());
+    }
+    let output = Command::new("incus")
+        .args(["storage", "volume", "delete", pool, volume])
+        .output()
+        .map_err(|e| format!("failed to delete storage volume {pool}/{volume}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "failed to delete storage volume {pool}/{volume}: {}",
+        stderr.trim()
+    ))
 }
 
 fn container_ip(app: &str) -> Result<String, String> {
@@ -835,4 +938,58 @@ fn integration_start_launches_app_process_from_metadata() {
     )
     .expect("app process not running");
     assert_eq!(alive.trim(), "ok");
+}
+
+#[test]
+fn integration_storage_persists_across_container_rebuild() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-storage-persist");
+    let pool = default_storage_pool_name().expect("failed to get storage pool");
+    let volume = storage_volume_name(&app);
+    delete_storage_volume_if_exists(&pool, &volume).expect("failed to clear stale storage volume");
+    let _volume_guard = StorageVolumeGuard::new(&pool, &volume);
+
+    let _guard = ContainerGuard::new(&app).expect("create container failed");
+    wait_for_container_network(&app).expect("container network not ready");
+
+    ensure_storage_volume(&pool, &volume).expect("failed to create app storage volume");
+    container::ensure_storage_mount(&app, &pool, &volume).expect("failed to attach storage");
+    container::exec_cmd(
+        &app,
+        "mkdir -p /storage && printf '%s\\n' 'sentinel' > /storage/persist.txt",
+    )
+    .expect("failed to write storage sentinel");
+
+    container::stop(&app).expect("failed to stop first container");
+    container::delete(&app).expect("failed to delete first container");
+    container::create(&app).expect("failed to recreate container");
+    wait_for_container_network(&app).expect("recreated container network not ready");
+    container::ensure_storage_mount(&app, &pool, &volume).expect("failed to reattach storage");
+
+    let value = exec_output(&app, "cat /storage/persist.txt").expect("failed to read sentinel");
+    assert_eq!(value.trim(), "sentinel");
+}
+
+#[test]
+fn integration_destroy_removes_app_storage_volume() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-storage-destroy");
+    let pool = default_storage_pool_name().expect("failed to get storage pool");
+    let volume = storage_volume_name(&app);
+    delete_storage_volume_if_exists(&pool, &volume).expect("failed to clear stale storage volume");
+
+    let _guard = ContainerGuard::new(&app).expect("create container failed");
+    wait_for_container_network(&app).expect("container network not ready");
+    ensure_storage_volume(&pool, &volume).expect("failed to create app storage volume");
+    container::ensure_storage_mount(&app, &pool, &volume).expect("failed to attach storage");
+    assert!(
+        storage_volume_exists(&pool, &volume),
+        "storage volume should exist before destroy"
+    );
+
+    commands::destroy(&app).expect("commands::destroy failed");
+    assert!(
+        !storage_volume_exists(&pool, &volume),
+        "storage volume should be removed by destroy"
+    );
 }
