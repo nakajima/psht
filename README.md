@@ -49,4 +49,5 @@ app = "my-app" # optional override for derived app name
 bin = "my-app" # optional path inside archive when needed
 preinstall = "echo preparing deploy" # optional, runs before dependency install
 postinstall = "npm run migrate" # optional, runs after dependency install and before start
+apt_packages = ["libvips", "ffmpeg"] # optional, apt packages installed in container on deploy
 ```

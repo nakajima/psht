@@ -1075,6 +1075,35 @@ fn run_hook(app: &str, phase: &str, command: Option<&str>) -> Result<(), String>
     container::exec_cmd_rolling(app, command, 5).map_err(|e| format!("{phase} hook failed: {e}"))
 }
 
+fn apt_install_command(packages: &[String]) -> Option<String> {
+    let packages: Vec<String> = packages
+        .iter()
+        .map(|pkg| pkg.trim())
+        .filter(|pkg| !pkg.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if packages.is_empty() {
+        return None;
+    }
+    let quoted = packages
+        .iter()
+        .map(|pkg| shell_quote(pkg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y -qq {quoted}"
+    ))
+}
+
+fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
+    let Some(command) = apt_install_command(packages) else {
+        return Ok(());
+    };
+    eprintln!("-----> Installing apt packages");
+    container::exec_cmd_rolling(app, &command, 5)
+        .map_err(|e| format!("apt package install failed: {e}"))
+}
+
 pub fn deploy(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
@@ -1200,6 +1229,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     eprintln!("-----> Pushing code to container");
     container::push_code(app, &code_dir.to_string_lossy())?;
+    install_apt_packages(app, &config.apt_packages)?;
     persist_start_command(app, &config.start_command)?;
     run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
 
@@ -3302,5 +3332,21 @@ devices:
     fn run_hook_skips_missing_or_blank_commands() {
         run_hook("myapp", "preinstall", None).unwrap();
         run_hook("myapp", "postinstall", Some(" \n\t ")).unwrap();
+    }
+
+    #[test]
+    fn apt_install_command_skips_empty_packages() {
+        assert!(apt_install_command(&[]).is_none());
+        assert!(apt_install_command(&["  ".to_string()]).is_none());
+    }
+
+    #[test]
+    fn apt_install_command_builds_noninteractive_install() {
+        let cmd = apt_install_command(&["curl".to_string(), "libssl-dev".to_string()]).unwrap();
+        assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
+        assert!(cmd.contains("apt-get update -qq"));
+        assert!(cmd.contains("apt-get install -y -qq"));
+        assert!(cmd.contains("'curl'"));
+        assert!(cmd.contains("'libssl-dev'"));
     }
 }

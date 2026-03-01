@@ -89,6 +89,8 @@ struct ProjectConfig {
     preinstall: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     postinstall: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apt_packages: Option<Vec<String>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -235,20 +237,42 @@ fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
     let start_cmd = format!("./{}", file_name.to_string_lossy());
-    stage_binary_dir_with_start(binary_path, &start_cmd, None, None)
+    stage_binary_dir_with_start(binary_path, &start_cmd, None, None, None)
+}
+
+fn normalize_opt_vec(values: Option<&[String]>) -> Option<Vec<String>> {
+    let values = values?;
+    let mut normalized = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized.iter().any(|v| v == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn write_deploy_hooks_config(
     staging: &Path,
     preinstall: Option<&str>,
     postinstall: Option<&str>,
+    apt_packages: Option<&[String]>,
 ) -> Result<(), String> {
     let cfg = ProjectConfig {
         preinstall: normalize_opt(preinstall),
         postinstall: normalize_opt(postinstall),
+        apt_packages: normalize_opt_vec(apt_packages),
         ..ProjectConfig::default()
     };
-    if cfg.preinstall.is_none() && cfg.postinstall.is_none() {
+    if cfg.preinstall.is_none() && cfg.postinstall.is_none() && cfg.apt_packages.is_none() {
         return Ok(());
     }
 
@@ -263,6 +287,7 @@ fn stage_binary_dir_with_start(
     start: &str,
     preinstall: Option<&str>,
     postinstall: Option<&str>,
+    apt_packages: Option<&[String]>,
 ) -> Result<PathBuf, String> {
     let file_name = binary_path
         .file_name()
@@ -286,7 +311,7 @@ fn stage_binary_dir_with_start(
 
     fs::write(staging.join(".psht-start-command"), format!("{start}\n"))
         .map_err(|e| format!("failed to write .psht-start-command: {e}"))?;
-    write_deploy_hooks_config(&staging, preinstall, postinstall)?;
+    write_deploy_hooks_config(&staging, preinstall, postinstall, apt_packages)?;
     Ok(staging)
 }
 
@@ -296,15 +321,22 @@ fn deploy_binary(
     binary_path: &Path,
     preinstall: Option<&str>,
     postinstall: Option<&str>,
+    apt_packages: Option<&[String]>,
 ) -> Result<(), String> {
-    let staging = if preinstall.is_none() && postinstall.is_none() {
+    let staging = if preinstall.is_none() && postinstall.is_none() && apt_packages.is_none() {
         stage_binary_dir(binary_path)?
     } else {
         let file_name = binary_path
             .file_name()
             .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
         let start_cmd = format!("./{}", file_name.to_string_lossy());
-        stage_binary_dir_with_start(binary_path, &start_cmd, preinstall, postinstall)?
+        stage_binary_dir_with_start(
+            binary_path,
+            &start_cmd,
+            preinstall,
+            postinstall,
+            apt_packages,
+        )?
     };
     let result = deploy_from_dir(host, app, &staging, false);
     let _ = fs::remove_dir_all(&staging);
@@ -384,6 +416,7 @@ fn deploy_with_app_or_binary(
     value: Option<&str>,
     preinstall: Option<&str>,
     postinstall: Option<&str>,
+    apt_packages: Option<&[String]>,
 ) -> Result<(), String> {
     if let Some(arg) = value
         && looks_like_path(arg)
@@ -395,7 +428,14 @@ fn deploy_with_app_or_binary(
         let name = app_name(None, cwd);
         app_name::validate_app_name(&name)?;
         eprintln!("-----> Deploying via binary");
-        return deploy_binary(host, &name, &binary_path, preinstall, postinstall);
+        return deploy_binary(
+            host,
+            &name,
+            &binary_path,
+            preinstall,
+            postinstall,
+            apt_packages,
+        );
     }
     let name = app_name(value, cwd);
     app_name::validate_app_name(&name)?;
@@ -564,6 +604,7 @@ fn stage_binary_from_url(
     bin: Option<&str>,
     preinstall: Option<&str>,
     postinstall: Option<&str>,
+    apt_packages: Option<&[String]>,
 ) -> Result<PathBuf, String> {
     let tmp = mktemp_dir("psht-release")?;
     let archive_path = tmp.join("asset");
@@ -575,7 +616,7 @@ fn stage_binary_from_url(
     download_url_to_file(url, &archive_path)?;
     extract_archive(&archive_path, &extract_dir, fmt)?;
     let binary = resolve_binary_from_archive(&extract_dir, bin)?;
-    let staged = stage_binary_dir_with_start(&binary, start, preinstall, postinstall);
+    let staged = stage_binary_dir_with_start(&binary, start, preinstall, postinstall, apt_packages);
     let _ = fs::remove_dir_all(&tmp);
     staged
 }
@@ -734,6 +775,7 @@ fn cli_release_settings(
         bin: normalize_opt(bin),
         preinstall: None,
         postinstall: None,
+        apt_packages: None,
     }
 }
 
@@ -932,6 +974,7 @@ fn bootstrap_project_config(
         bin: defaults.bin.clone(),
         preinstall: defaults.preinstall.clone(),
         postinstall: defaults.postinstall.clone(),
+        apt_packages: defaults.apt_packages.clone(),
     };
 
     let preview = toml::to_string_pretty(&cfg)
@@ -975,6 +1018,7 @@ fn deploy_from_release_config(host: &str, cfg: &ProjectConfig) -> Result<(), Str
         cfg.bin.as_deref(),
         cfg.preinstall.as_deref(),
         cfg.postinstall.as_deref(),
+        cfg.apt_packages.as_deref(),
     )?;
     let result = deploy_from_dir(host, &app, &staging, false);
     let _ = fs::remove_dir_all(&staging);
@@ -1021,11 +1065,12 @@ fn deploy_with_project_config(
                 app,
                 file_cfg.preinstall.as_deref(),
                 file_cfg.postinstall.as_deref(),
+                file_cfg.apt_packages.as_deref(),
             )
         }
         None => {
             if app.is_some() && !has_release_settings(&cli_cfg) {
-                return deploy_with_app_or_binary(host, cwd, app, None, None);
+                return deploy_with_app_or_binary(host, cwd, app, None, None, None);
             }
 
             let cfg = bootstrap_project_config(&config_path, &cli_cfg)?;
@@ -1195,7 +1240,7 @@ mod tests {
         let path = dir.path().join("psht.toml");
         fs::write(
             &path,
-            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\npreinstall = \"echo pre\"\npostinstall = \"echo post\"\n",
+            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\npreinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\n",
         )
         .unwrap();
         let cfg = load_project_config(&path).unwrap().unwrap();
@@ -1204,6 +1249,10 @@ mod tests {
         assert_eq!(cfg.app.as_deref(), Some("demo"));
         assert_eq!(cfg.preinstall.as_deref(), Some("echo pre"));
         assert_eq!(cfg.postinstall.as_deref(), Some("echo post"));
+        assert_eq!(
+            cfg.apt_packages,
+            Some(vec!["curl".to_string(), "git".to_string()])
+        );
     }
 
     #[test]
@@ -1217,6 +1266,7 @@ mod tests {
             bin: Some("bin/app".to_string()),
             preinstall: Some("echo pre".to_string()),
             postinstall: Some("echo post".to_string()),
+            apt_packages: Some(vec!["curl".to_string(), "git".to_string()]),
         };
         save_project_config(&path, &cfg).unwrap();
         let loaded = load_project_config(&path).unwrap().unwrap();
@@ -1404,6 +1454,7 @@ mod tests {
             "./mybin --debug",
             Some("echo pre"),
             Some("echo post"),
+            Some(&["curl".to_string(), "git".to_string()]),
         )
         .unwrap();
         let marker = fs::read_to_string(staged.join(".psht-start-command")).unwrap();
@@ -1411,6 +1462,9 @@ mod tests {
         let hooks = fs::read_to_string(staged.join(PROJECT_CONFIG_FILE)).unwrap();
         assert!(hooks.contains("preinstall = \"echo pre\""));
         assert!(hooks.contains("postinstall = \"echo post\""));
+        assert!(hooks.contains("apt_packages = ["));
+        assert!(hooks.contains("\"curl\""));
+        assert!(hooks.contains("\"git\""));
         let _ = fs::remove_dir_all(staged);
     }
 
@@ -1420,16 +1474,22 @@ mod tests {
         let bin = tmp.path().join("mybin");
         fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        let err = stage_binary_dir_with_start(&bin, "  ", None, None).unwrap_err();
+        let err = stage_binary_dir_with_start(&bin, "  ", None, None, None).unwrap_err();
         assert!(err.contains("start command is empty"));
     }
 
     #[test]
     fn deploy_with_path_errors_when_binary_missing() {
         let cwd = tempdir().unwrap();
-        let err =
-            deploy_with_app_or_binary("example.com", cwd.path(), Some("bin/missing"), None, None)
-                .unwrap_err();
+        let err = deploy_with_app_or_binary(
+            "example.com",
+            cwd.path(),
+            Some("bin/missing"),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("binary not found"));
     }
 
@@ -1545,6 +1605,7 @@ mod tests {
             bin: None,
             preinstall: None,
             postinstall: None,
+            apt_packages: None,
         };
         let cli = ProjectConfig {
             url: Some("https://b".to_string()),
@@ -1553,6 +1614,7 @@ mod tests {
             bin: None,
             preinstall: None,
             postinstall: None,
+            apt_packages: None,
         };
         let err = ensure_no_release_conflicts(&file, &cli).unwrap_err();
         assert!(err.contains("start"));
@@ -1591,6 +1653,7 @@ mod tests {
         let cfg = ProjectConfig {
             preinstall: Some("echo pre".to_string()),
             postinstall: Some("echo post".to_string()),
+            apt_packages: Some(vec!["curl".to_string()]),
             ..ProjectConfig::default()
         };
         assert!(!has_release_settings(&cfg));

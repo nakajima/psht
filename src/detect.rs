@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub install_command: String,
     pub preinstall_command: Option<String>,
     pub postinstall_command: Option<String>,
+    pub apt_packages: Vec<String>,
 }
 
 impl AppType {
@@ -77,6 +78,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
             install_command: "".to_string(),
             preinstall_command: hooks.preinstall,
             postinstall_command: hooks.postinstall,
+            apt_packages: hooks.apt_packages,
         });
     }
 
@@ -97,6 +99,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
             install_command: install.to_string(),
             preinstall_command: hooks.preinstall.clone(),
             postinstall_command: hooks.postinstall.clone(),
+            apt_packages: hooks.apt_packages.clone(),
         });
     }
 
@@ -123,6 +126,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
                 install_command: install.to_string(),
                 preinstall_command: hooks.preinstall.clone(),
                 postinstall_command: hooks.postinstall.clone(),
+                apt_packages: hooks.apt_packages.clone(),
             });
         }
     }
@@ -166,6 +170,7 @@ fn read_procfile(dir: &Path) -> Option<String> {
 struct DeployHooks {
     preinstall: Option<String>,
     postinstall: Option<String>,
+    apt_packages: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +179,8 @@ struct HookConfig {
     preinstall: Option<String>,
     #[serde(default)]
     postinstall: Option<String>,
+    #[serde(default, alias = "apt")]
+    apt_packages: Option<Vec<String>>,
 }
 
 fn normalize_hook(value: Option<String>) -> Option<String> {
@@ -184,6 +191,21 @@ fn normalize_hook(value: Option<String>) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn normalize_apt_packages(values: Option<Vec<String>>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values.unwrap_or_default() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized.iter().any(|v| v == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    normalized
 }
 
 fn read_deploy_hooks(dir: &Path) -> Result<DeployHooks, String> {
@@ -200,6 +222,7 @@ fn read_deploy_hooks(dir: &Path) -> Result<DeployHooks, String> {
     Ok(DeployHooks {
         preinstall: normalize_hook(cfg.preinstall),
         postinstall: normalize_hook(cfg.postinstall),
+        apt_packages: normalize_apt_packages(cfg.apt_packages),
     })
 }
 
@@ -355,12 +378,13 @@ mod tests {
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
         fs::write(
             tmp.path().join("psht.toml"),
-            "preinstall = \"echo pre\"\npostinstall = \"echo post\"\n",
+            "preinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\n",
         )
         .unwrap();
         let config = detect(tmp.path()).unwrap();
         assert_eq!(config.preinstall_command.as_deref(), Some("echo pre"));
         assert_eq!(config.postinstall_command.as_deref(), Some("echo post"));
+        assert_eq!(config.apt_packages, vec!["curl", "git"]);
     }
 
     #[test]
@@ -369,12 +393,22 @@ mod tests {
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
         fs::write(
             tmp.path().join("psht.toml"),
-            "preinstall = \"   \"\npostinstall = \"\\n\\t\"\n",
+            "preinstall = \"   \"\npostinstall = \"\\n\\t\"\napt_packages = [\" \", \"curl\", \"curl\"]\n",
         )
         .unwrap();
         let config = detect(tmp.path()).unwrap();
         assert!(config.preinstall_command.is_none());
         assert!(config.postinstall_command.is_none());
+        assert_eq!(config.apt_packages, vec!["curl"]);
+    }
+
+    #[test]
+    fn detect_reads_apt_alias_from_psht_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("psht.toml"), "apt = [\"jq\", \"zip\"]\n").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.apt_packages, vec!["jq", "zip"]);
     }
 
     #[test]
