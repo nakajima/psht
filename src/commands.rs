@@ -3200,27 +3200,57 @@ pub fn doctor() -> Result<(), String> {
     Ok(())
 }
 
-fn run_tailscale_with_optional_sudo(args: &[&str]) -> Result<(), String> {
-    let is_root = run_cmd_capture("id", &["-u"])? == "0";
-    if is_root || !command_exists("sudo") {
-        return run_cmd("tailscale", args);
+fn ensure_container_exists_for_tailscale(app: &str) -> Result<(), String> {
+    if container::exists(app) {
+        Ok(())
+    } else {
+        Err(format!("app '{app}' not found"))
+    }
+}
+
+fn ensure_container_running_for_tailscale(app: &str) -> Result<(), String> {
+    ensure_container_exists_for_tailscale(app)?;
+    if container::is_running(app)? {
+        Ok(())
+    } else {
+        Err(format!("app '{app}' is not running"))
+    }
+}
+
+pub fn tailscale_status(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    ensure_container_running_for_tailscale(app)?;
+    container::exec_cmd(app, "tailscale status")
+}
+
+pub fn tailscale_up(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    ensure_container_exists_for_tailscale(app)?;
+    if !container::is_running(app)? {
+        eprintln!("-----> Starting container");
+        container::start(app)?;
     }
 
-    let mut sudo_args = vec!["tailscale"];
-    sudo_args.extend_from_slice(args);
-    run_cmd("sudo", &sudo_args)
+    eprintln!("-----> Repairing tailscale in container");
+    tailscale::install_in_container(app)?;
+    let tailnet_hostname = tailscale::join_in_container(app)?;
+    let port = allocate_port(app);
+    if let Err(e) = tailscale::expose_http_in_container(app, port) {
+        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+    }
+    if let Some(name) = tailnet_hostname {
+        eprintln!("=====> Tailscale ready: http://{name} (also http://{name}:{port})");
+    } else {
+        eprintln!("=====> Tailscale repaired for {app}");
+    }
+    Ok(())
 }
 
-pub fn tailscale_status() -> Result<(), String> {
-    run_cmd("tailscale", &["status"])
-}
-
-pub fn tailscale_up() -> Result<(), String> {
-    run_tailscale_with_optional_sudo(&["up", "--ssh"])
-}
-
-pub fn tailscale_down() -> Result<(), String> {
-    run_tailscale_with_optional_sudo(&["down"])
+pub fn tailscale_down(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    ensure_container_running_for_tailscale(app)?;
+    eprintln!("-----> Bringing tailscale down in container");
+    container::exec_cmd(app, "tailscale down")
 }
 
 fn hostname() -> String {
@@ -4771,6 +4801,9 @@ devices:
             destroy("bad/name"),
             env_command("bad/name", &[]),
             env_unset("bad/name", &[String::from("A")]),
+            tailscale_status("bad/name"),
+            tailscale_up("bad/name"),
+            tailscale_down("bad/name"),
         ] {
             let err = result.expect_err("should reject invalid app name");
             assert!(err.contains("invalid app name"), "unexpected error: {err}");

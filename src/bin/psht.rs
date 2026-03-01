@@ -88,12 +88,12 @@ enum CliCommand {
 
 #[derive(Subcommand)]
 enum TailscaleCommand {
-    /// Show Tailscale status on the host
-    Status,
-    /// Bring Tailscale up on the host (with SSH enabled)
-    Up,
-    /// Bring Tailscale down on the host
-    Down,
+    /// Show Tailscale status for an app container
+    Status { app: Option<String> },
+    /// Repair/bring up Tailscale for an app container
+    Up { app: Option<String> },
+    /// Bring Tailscale down for an app container
+    Down { app: Option<String> },
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -1540,9 +1540,18 @@ fn run() -> Result<(), String> {
         CliCommand::Tailscale { command } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             match command {
-                TailscaleCommand::Status => ssh_cmd(&host, &["tailscale", "status"]),
-                TailscaleCommand::Up => ssh_cmd(&host, &["tailscale", "up"]),
-                TailscaleCommand::Down => ssh_cmd(&host, &["tailscale", "down"]),
+                TailscaleCommand::Status { app } => {
+                    let app = resolve_command_app(&cwd, app.as_deref())?;
+                    ssh_cmd(&host, &["tailscale", "status", &app])
+                }
+                TailscaleCommand::Up { app } => {
+                    let app = resolve_command_app(&cwd, app.as_deref())?;
+                    ssh_cmd(&host, &["tailscale", "up", &app])
+                }
+                TailscaleCommand::Down { app } => {
+                    let app = resolve_command_app(&cwd, app.as_deref())?;
+                    ssh_cmd(&host, &["tailscale", "down", &app])
+                }
             }
         }
         CliCommand::IsCli => Ok(()),
@@ -1729,7 +1738,9 @@ mod tests {
         let cli = Cli::try_parse_from(["psht", "tailscale", "status"]).unwrap();
         match cli.command {
             CliCommand::Tailscale { command } => match command {
-                TailscaleCommand::Status => {}
+                TailscaleCommand::Status { app } => {
+                    assert!(app.is_none());
+                }
                 _ => panic!("expected tailscale status"),
             },
             _ => panic!("expected tailscale command"),
@@ -1741,7 +1752,9 @@ mod tests {
         let cli = Cli::try_parse_from(["psht", "tailscale", "up"]).unwrap();
         match cli.command {
             CliCommand::Tailscale { command } => match command {
-                TailscaleCommand::Up => {}
+                TailscaleCommand::Up { app } => {
+                    assert!(app.is_none());
+                }
                 _ => panic!("expected tailscale up"),
             },
             _ => panic!("expected tailscale command"),
@@ -1753,8 +1766,24 @@ mod tests {
         let cli = Cli::try_parse_from(["psht", "tailscale", "down"]).unwrap();
         match cli.command {
             CliCommand::Tailscale { command } => match command {
-                TailscaleCommand::Down => {}
+                TailscaleCommand::Down { app } => {
+                    assert!(app.is_none());
+                }
                 _ => panic!("expected tailscale down"),
+            },
+            _ => panic!("expected tailscale command"),
+        }
+    }
+
+    #[test]
+    fn tailscale_status_with_explicit_app_parses() {
+        let cli = Cli::try_parse_from(["psht", "tailscale", "status", "demo"]).unwrap();
+        match cli.command {
+            CliCommand::Tailscale { command } => match command {
+                TailscaleCommand::Status { app } => {
+                    assert_eq!(app.as_deref(), Some("demo"));
+                }
+                _ => panic!("expected tailscale status"),
             },
             _ => panic!("expected tailscale command"),
         }
