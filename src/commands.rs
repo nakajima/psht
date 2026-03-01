@@ -1600,9 +1600,6 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
 fn wait_for_container_operation_quiet(app: &str) -> Result<(), String> {
     let mut announced_wait = false;
     for _ in 0..CONTAINER_OP_WAIT_CHECKS {
-        if !container::exists(app) {
-            return Ok(());
-        }
         if !container::has_running_operation(app)? {
             if announced_wait {
                 eprintln!("       Active operation finished");
@@ -1621,11 +1618,11 @@ fn wait_for_container_operation_quiet(app: &str) -> Result<(), String> {
 }
 
 fn cleanup_container_for_rebuild(app: &str) -> Result<(), String> {
+    wait_for_container_operation_quiet(app)?;
+
     if !container::exists(app) {
         return Ok(());
     }
-
-    wait_for_container_operation_quiet(app)?;
 
     if container::is_running(app).unwrap_or(false) {
         let _ = container::stop(app);
@@ -1758,6 +1755,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             tailscale::install_in_container(app)?;
         } else {
             eprintln!("-----> Creating container");
+            eprintln!("       First run may take a while while Ubuntu image downloads");
             container::create(app)?;
 
             eprintln!("-----> Installing tailscale");

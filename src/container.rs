@@ -2,6 +2,10 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const CONTAINER_CREATE_TIMEOUT_SECS: u64 = 300;
+const CONTAINER_CREATE_PROGRESS_SECS: u64 = 30;
 
 fn container_name(app: &str) -> String {
     format!("psht-{app}")
@@ -303,10 +307,47 @@ pub fn remove_storage_mount(app: &str) -> Result<(), String> {
 }
 
 pub fn create(app: &str) -> Result<(), String> {
-    incus()
-        .args(&["launch", "images:ubuntu/24.04"])
-        .arg(container_name(app))
-        .run()
+    let name = container_name(app);
+    let mut child = Command::new("incus")
+        .args(["launch", "images:ubuntu/24.04"])
+        .arg(&name)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to run incus launch images:ubuntu/24.04 {name}: {e}"))?;
+
+    let started_at = Instant::now();
+    let mut next_progress = CONTAINER_CREATE_PROGRESS_SECS;
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to wait for incus launch {name}: {e}"))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(format!("incus launch images:ubuntu/24.04 {name} failed"));
+        }
+
+        let elapsed = started_at.elapsed().as_secs();
+        if elapsed >= CONTAINER_CREATE_TIMEOUT_SECS {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "incus launch timed out after {}s while creating '{name}'. Check image reachability with: sudo -u psht incus image info images:ubuntu/24.04",
+                CONTAINER_CREATE_TIMEOUT_SECS
+            ));
+        }
+
+        if elapsed >= next_progress {
+            eprintln!("       Still creating container... ({elapsed}s elapsed)");
+            next_progress += CONTAINER_CREATE_PROGRESS_SECS;
+        }
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
