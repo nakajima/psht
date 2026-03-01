@@ -1718,6 +1718,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     if command_succeeds("incus", &["project", "show", &current_project]) {
         ensure_project_default_profile(&current_project)?;
     }
+    init_stacks_in(&stacks_dir())?;
 
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
