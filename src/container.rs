@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::process::{Command, Stdio};
 
@@ -18,6 +19,16 @@ struct StorageDevice {
 pub struct ContainerInfo {
     pub name: String,
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationInfo {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    status_code: i64,
+    #[serde(default)]
+    resources: HashMap<String, Vec<String>>,
 }
 
 pub struct IncusCommand {
@@ -461,6 +472,39 @@ pub fn exists(app: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn operation_resource_matches_container(resource: &str, container_name: &str) -> bool {
+    resource.contains(&format!("/instances/{container_name}"))
+        || resource.contains(&format!("/containers/{container_name}"))
+}
+
+fn has_running_operation_in(operations_json: &str, container_name: &str) -> Result<bool, String> {
+    let ops: Vec<OperationInfo> = serde_json::from_str(operations_json)
+        .map_err(|e| format!("failed to parse incus operation list: {e}"))?;
+    for op in ops {
+        let running = op.status.eq_ignore_ascii_case("running") || op.status_code == 103;
+        if !running {
+            continue;
+        }
+        for resources in op.resources.values() {
+            if resources
+                .iter()
+                .any(|resource| operation_resource_matches_container(resource, container_name))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub fn has_running_operation(app: &str) -> Result<bool, String> {
+    let name = container_name(app);
+    let operations = incus()
+        .args(&["operation", "list", "--format=json"])
+        .output()?;
+    has_running_operation_in(&operations, &name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +835,44 @@ mod tests {
         let cmd = incus().arg("start").arg(container_name("myapp")).build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec!["start", "psht-myapp"]);
+    }
+
+    #[test]
+    fn operation_resource_matches_container_handles_instance_paths() {
+        assert!(operation_resource_matches_container(
+            "/1.0/instances/psht-demo?project=user-1001",
+            "psht-demo"
+        ));
+        assert!(operation_resource_matches_container(
+            "/1.0/containers/psht-demo",
+            "psht-demo"
+        ));
+        assert!(!operation_resource_matches_container(
+            "/1.0/instances/psht-other",
+            "psht-demo"
+        ));
+    }
+
+    #[test]
+    fn has_running_operation_in_detects_busy_container() {
+        let json = r#"[{
+  "status":"Running",
+  "status_code":103,
+  "resources":{"instances":["/1.0/instances/psht-demo?project=user-1001"]}
+}]"#;
+        let busy = has_running_operation_in(json, "psht-demo").unwrap();
+        assert!(busy);
+    }
+
+    #[test]
+    fn has_running_operation_in_ignores_non_running_operations() {
+        let json = r#"[{
+  "status":"Success",
+  "status_code":200,
+  "resources":{"instances":["/1.0/instances/psht-demo?project=user-1001"]}
+}]"#;
+        let busy = has_running_operation_in(json, "psht-demo").unwrap();
+        assert!(!busy);
     }
 
     #[test]

@@ -33,6 +33,9 @@ const APP_PROCESS_POLL_SLEEP: &str = "0.2";
 const APP_PROCESS_STOP_TERM_CHECKS: u32 = 40;
 const APP_PROCESS_STOP_KILL_CHECKS: u32 = 10;
 const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
+const CONTAINER_OP_WAIT_CHECKS: u32 = 80;
+const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
+const CONTAINER_DELETE_RETRY_CHECKS: u32 = 20;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -1312,7 +1315,7 @@ fn checkout_code_in(
         }
         Some(target) => {
             let status = Command::new("git")
-                .arg("clone")
+                .args(["clone", "--no-checkout"])
                 .arg(repo_dir)
                 .arg(build_dir)
                 .status()
@@ -1594,6 +1597,61 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
         .map_err(|e| format!("apt package install failed: {e}"))
 }
 
+fn wait_for_container_operation_quiet(app: &str) -> Result<(), String> {
+    let mut announced_wait = false;
+    for _ in 0..CONTAINER_OP_WAIT_CHECKS {
+        if !container::exists(app) {
+            return Ok(());
+        }
+        if !container::has_running_operation(app)? {
+            if announced_wait {
+                eprintln!("       Active operation finished");
+            }
+            return Ok(());
+        }
+        if !announced_wait {
+            eprintln!("       Waiting for active container operation to finish...");
+            announced_wait = true;
+        }
+        thread::sleep(Duration::from_millis(CONTAINER_OP_WAIT_SLEEP_MS));
+    }
+    Err(format!(
+        "container '{app}' is busy with an active operation; retry deploy after it completes"
+    ))
+}
+
+fn cleanup_container_for_rebuild(app: &str) -> Result<(), String> {
+    if !container::exists(app) {
+        return Ok(());
+    }
+
+    wait_for_container_operation_quiet(app)?;
+
+    if container::is_running(app).unwrap_or(false) {
+        let _ = container::stop(app);
+    }
+
+    for _ in 0..CONTAINER_DELETE_RETRY_CHECKS {
+        if !container::exists(app) {
+            return Ok(());
+        }
+        if let Err(err) = container::delete(app) {
+            if !container::exists(app) {
+                return Ok(());
+            }
+            eprintln!("       Retry delete after error: {err}");
+        }
+        thread::sleep(Duration::from_millis(CONTAINER_OP_WAIT_SLEEP_MS));
+    }
+
+    if container::exists(app) {
+        return Err(format!(
+            "failed to delete container '{app}' after waiting for background operations"
+        ));
+    }
+    Ok(())
+}
+
 pub fn deploy(app: &str, git_ref: Option<&str>, git_sha: Option<&str>) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
@@ -1682,8 +1740,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             false
         } else {
             eprintln!("-----> Rebuilding container");
-            let _ = container::stop(app);
-            let _ = container::delete(app);
+            cleanup_container_for_rebuild(app)?;
             true
         }
     } else {
@@ -1691,6 +1748,8 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     };
 
     if needs_setup {
+        wait_for_container_operation_quiet(app)?;
+
         if container::image_exists(&stack, &hash) {
             eprintln!("-----> Creating container from cached image");
             container::create_from_image(app, &stack, &hash)?;
