@@ -1311,8 +1311,69 @@ fn stop_app_process_cmd() -> String {
     )
 }
 
+fn stop_port_listeners_cmd_with_limits(
+    port: u16,
+    term_checks: u32,
+    kill_checks: u32,
+    poll_sleep: &str,
+) -> String {
+    format!(
+        r#"if ! command -v ss >/dev/null 2>&1; then exit 0; fi
+pids="$(ss -ltnp "sport = :{port}" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u)"
+[ -z "$pids" ] && exit 0
+for pid in $pids; do
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+done
+i=0
+while :; do
+  remaining=""
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      remaining="$remaining $pid"
+    fi
+  done
+  [ -z "$remaining" ] && break
+  i=$((i + 1))
+  if [ "$i" -ge {term_checks} ]; then
+    for pid in $remaining; do
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    done
+    break
+  fi
+  sleep {poll_sleep}
+done
+j=0
+while :; do
+  remaining=""
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      remaining="$remaining $pid"
+    fi
+  done
+  [ -z "$remaining" ] && break
+  j=$((j + 1))
+  if [ "$j" -ge {kill_checks} ]; then
+    echo "listener process(es) on port {port} did not exit:$remaining" >&2
+    exit 1
+  fi
+  sleep {poll_sleep}
+done"#
+    )
+}
+
+fn stop_port_listeners_cmd(port: u16) -> String {
+    stop_port_listeners_cmd_with_limits(
+        port,
+        APP_PROCESS_STOP_TERM_CHECKS,
+        APP_PROCESS_STOP_KILL_CHECKS,
+        APP_PROCESS_POLL_SLEEP,
+    )
+}
+
 fn stop_app_process(app: &str) -> Result<(), String> {
-    container::exec_cmd(app, &stop_app_process_cmd())
+    container::exec_cmd(app, &stop_app_process_cmd())?;
+    let port = allocate_port(app);
+    container::exec_cmd(app, &stop_port_listeners_cmd(port))
 }
 
 fn launch_app_process(app: &str, cmd: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
@@ -3765,6 +3826,17 @@ devices:
         assert!(cmd.contains("if [ \"$i\" -ge 40 ]"));
         assert!(cmd.contains("if [ \"$j\" -ge 10 ]"));
         assert!(cmd.contains("rm -f /var/psht/app.pid"));
+    }
+
+    #[test]
+    fn stop_port_listeners_cmd_uses_ss_and_process_group_signals() {
+        let cmd = stop_port_listeners_cmd_with_limits(3430, 40, 10, "0.2");
+        assert!(cmd.contains("command -v ss"));
+        assert!(cmd.contains("sport = :3430"));
+        assert!(cmd.contains("sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p'"));
+        assert!(cmd.contains("kill -TERM -- \"-$pid\""));
+        assert!(cmd.contains("kill -KILL -- \"-$pid\""));
+        assert!(cmd.contains("listener process(es) on port 3430 did not exit"));
     }
 
     #[test]
