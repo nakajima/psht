@@ -59,7 +59,13 @@ enum Command {
     #[command(name = "print-cli", hide = true)]
     PrintCli,
     #[command(hide = true)]
-    Deploy { app: String },
+    Deploy {
+        app: String,
+        #[arg(long = "ref")]
+        ref_name: Option<String>,
+        #[arg(long)]
+        sha: Option<String>,
+    },
     #[command(hide = true)]
     Push {
         app: String,
@@ -125,9 +131,9 @@ fn run() -> Result<(), String> {
             app_name::validate_app_name(&app)?;
             git::handle_upload_pack(&app)
         }
-        Command::Deploy { app } => {
+        Command::Deploy { app, ref_name, sha } => {
             app_name::validate_app_name(&app)?;
-            commands::deploy(&app)
+            commands::deploy(&app, ref_name.as_deref(), sha.as_deref())
         }
         Command::Push { app, force } => {
             app_name::validate_app_name(&app)?;
@@ -229,7 +235,31 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Deploy {
-                app: "myapp".to_string()
+                app: "myapp".to_string(),
+                ref_name: None,
+                sha: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_deploy_with_ref_and_sha() {
+        let cli = parse_cli(&[
+            "psht-server",
+            "deploy",
+            "myapp",
+            "--ref",
+            "refs/heads/main",
+            "--sha",
+            "deadbeef",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Deploy {
+                app: "myapp".to_string(),
+                ref_name: Some("refs/heads/main".to_string()),
+                sha: Some("deadbeef".to_string()),
             }
         );
     }

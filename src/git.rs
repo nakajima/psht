@@ -48,7 +48,26 @@ fn install_hook_at(app: &str, repo: &PathBuf) -> Result<(), String> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "psht".to_string());
     let hook_content = format!(
-        "#!/bin/sh\nexec {} deploy {}\n",
+        "#!/bin/sh
+set -eu
+line_count=0
+deploy_ref=
+deploy_sha=
+while IFS=' ' read -r old new ref; do
+  [ -n \"$old\" ] || continue
+  line_count=$((line_count + 1))
+  if [ \"$line_count\" -gt 1 ]; then
+    echo \"error: push updates multiple refs; push one ref at a time\" >&2
+    exit 1
+  fi
+  deploy_ref=\"$ref\"
+  deploy_sha=\"$new\"
+done
+if [ \"$line_count\" -eq 0 ]; then
+  exit 0
+fi
+exec {} deploy {} --ref \"$deploy_ref\" --sha \"$deploy_sha\"
+",
         shell_quote(&current_exe),
         shell_quote(app)
     );
@@ -118,7 +137,9 @@ mod tests {
         let hook_path = repo.join("hooks").join("post-receive");
         assert!(hook_path.exists());
         let content = fs::read_to_string(&hook_path).unwrap();
-        assert!(content.contains("deploy 'hooktest'"));
+        assert!(content.contains("deploy 'hooktest' --ref \"$deploy_ref\" --sha \"$deploy_sha\""));
+        assert!(content.contains("while IFS=' ' read -r old new ref; do"));
+        assert!(content.contains("push updates multiple refs"));
         assert!(content.starts_with("#!/bin/sh"));
         let perms = fs::metadata(&hook_path).unwrap().permissions();
         assert_ne!(perms.mode() & 0o111, 0, "hook should be executable");

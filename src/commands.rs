@@ -382,9 +382,50 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_cmd_in(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    if !status.success() {
+        let pretty = if args.is_empty() {
+            program.to_string()
+        } else {
+            format!("{program} {}", args.join(" "))
+        };
+        return Err(format!("command failed: {pretty}"));
+    }
+    Ok(())
+}
+
 fn run_cmd_capture(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
+        .output()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let pretty = if args.is_empty() {
+            program.to_string()
+        } else {
+            format!("{program} {}", args.join(" "))
+        };
+        if stderr.is_empty() {
+            return Err(format!("command failed: {pretty}"));
+        }
+        return Err(format!("command failed: {pretty}: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_cmd_capture_in(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
         .output()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
     if !output.status.success() {
@@ -1210,25 +1251,116 @@ fn resolve_stack(
     resolve_stack_in(app, code_dir, detected_stack, &stacks_dir())
 }
 
-fn checkout_code(app: &str) -> Result<PathBuf, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCheckoutTarget {
+    ref_name: String,
+    sha: String,
+}
+
+fn parse_git_checkout_target(
+    git_ref: Option<&str>,
+    git_sha: Option<&str>,
+) -> Result<Option<GitCheckoutTarget>, String> {
+    match (git_ref, git_sha) {
+        (None, None) => Ok(None),
+        (Some(ref_name), Some(sha)) => {
+            let ref_name = ref_name.trim();
+            let sha = sha.trim();
+            if ref_name.is_empty() {
+                return Err("deploy ref is empty".to_string());
+            }
+            if sha.is_empty() {
+                return Err("deploy sha is empty".to_string());
+            }
+            Ok(Some(GitCheckoutTarget {
+                ref_name: ref_name.to_string(),
+                sha: sha.to_string(),
+            }))
+        }
+        _ => Err("deploy requires both --ref and --sha".to_string()),
+    }
+}
+
+fn checkout_ref_target(ref_name: &str) -> String {
+    if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+        return format!("origin/{branch}");
+    }
+    ref_name.to_string()
+}
+
+fn checkout_code_in(
+    repo_dir: &Path,
+    build_dir: &Path,
+    target: Option<&GitCheckoutTarget>,
+) -> Result<(), String> {
+    if build_dir.exists() {
+        fs::remove_dir_all(build_dir).map_err(|e| format!("failed to clean build dir: {e}"))?;
+    }
+    fs::create_dir_all(build_dir).map_err(|e| format!("failed to create build dir: {e}"))?;
+
+    match target {
+        None => {
+            let status = Command::new("git")
+                .args(["clone", "--depth", "1"])
+                .arg(repo_dir)
+                .arg(build_dir)
+                .status()
+                .map_err(|e| format!("failed to checkout code: {e}"))?;
+            if !status.success() {
+                return Err("git clone failed".to_string());
+            }
+        }
+        Some(target) => {
+            let status = Command::new("git")
+                .arg("clone")
+                .arg(repo_dir)
+                .arg(build_dir)
+                .status()
+                .map_err(|e| format!("failed to checkout code: {e}"))?;
+            if !status.success() {
+                return Err("git clone failed".to_string());
+            }
+
+            let checkout_target = checkout_ref_target(&target.ref_name);
+            run_cmd_in(
+                "git",
+                &["checkout", "--detach", &checkout_target],
+                build_dir,
+            )
+            .map_err(|e| format!("failed to checkout {}: {e}", target.ref_name))?;
+
+            let object_type =
+                run_cmd_capture_in("git", &["cat-file", "-t", &target.sha], build_dir)
+                    .map_err(|e| format!("failed to resolve pushed object {}: {e}", target.sha))?;
+            if object_type == "commit" {
+                let head = run_cmd_capture_in("git", &["rev-parse", "HEAD"], build_dir)?;
+                if head != target.sha {
+                    return Err(format!(
+                        "checked out commit {head} does not match pushed commit {}",
+                        target.sha
+                    ));
+                }
+            } else if object_type == "tag" {
+                let resolved =
+                    run_cmd_capture_in("git", &["rev-parse", &target.ref_name], build_dir)
+                        .map_err(|e| format!("failed to resolve {}: {e}", target.ref_name))?;
+                if resolved != target.sha {
+                    return Err(format!(
+                        "checked out ref {} resolved to {resolved}, expected {}",
+                        target.ref_name, target.sha
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn checkout_code(app: &str, target: Option<&GitCheckoutTarget>) -> Result<PathBuf, String> {
     let build_dir = builds_dir().join(app);
     let repo_dir = repos_dir().join(format!("{app}.git"));
-
-    if build_dir.exists() {
-        fs::remove_dir_all(&build_dir).map_err(|e| format!("failed to clean build dir: {e}"))?;
-    }
-    fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build dir: {e}"))?;
-
-    let status = Command::new("git")
-        .args(["clone", "--depth", "1"])
-        .arg(&repo_dir)
-        .arg(&build_dir)
-        .status()
-        .map_err(|e| format!("failed to checkout code: {e}"))?;
-    if !status.success() {
-        return Err("git clone failed".to_string());
-    }
-
+    checkout_code_in(&repo_dir, &build_dir, target)?;
     Ok(build_dir)
 }
 
@@ -1462,12 +1594,16 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
         .map_err(|e| format!("apt package install failed: {e}"))
 }
 
-pub fn deploy(app: &str) -> Result<(), String> {
+pub fn deploy(app: &str, git_ref: Option<&str>, git_sha: Option<&str>) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
+    let target = parse_git_checkout_target(git_ref, git_sha)?;
 
     eprintln!("-----> Checking out code");
-    let build_dir = checkout_code(app)?;
+    if let Some(target) = target.as_ref() {
+        eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
+    }
+    let build_dir = checkout_code(app, target.as_ref())?;
 
     deploy_from(app, &build_dir)
 }
@@ -3776,10 +3912,108 @@ devices:
         );
     }
 
+    fn run_git(args: &[&str], cwd: &Path) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {} failed", args.join(" "));
+    }
+
+    fn git_output(args: &[&str], cwd: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn seed_remote_with_branch(branch: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let remote = tmp.path().join("remote.git");
+        fs::create_dir_all(&work).unwrap();
+
+        run_git(&["init"], &work);
+        run_git(&["config", "user.name", "psht tests"], &work);
+        run_git(&["config", "user.email", "psht-tests@example.com"], &work);
+        fs::write(work.join("README.md"), "hello\n").unwrap();
+        run_git(&["add", "README.md"], &work);
+        run_git(&["commit", "-m", "init"], &work);
+        let sha = git_output(&["rev-parse", "HEAD"], &work);
+
+        let remote_str = remote.to_string_lossy().to_string();
+        run_git(&["init", "--bare", &remote_str], tmp.path());
+        run_git(&["branch", "-M", branch], &work);
+        run_git(&["remote", "add", "origin", &remote_str], &work);
+        run_git(&["push", "origin", branch], &work);
+
+        (tmp, remote, work, sha)
+    }
+
+    #[test]
+    fn parse_git_checkout_target_requires_ref_and_sha_pair() {
+        let err = parse_git_checkout_target(Some("refs/heads/main"), None).unwrap_err();
+        assert!(err.contains("both --ref and --sha"));
+        let err = parse_git_checkout_target(None, Some("deadbeef")).unwrap_err();
+        assert!(err.contains("both --ref and --sha"));
+    }
+
+    #[test]
+    fn parse_git_checkout_target_rejects_empty_fields() {
+        let err = parse_git_checkout_target(Some(" "), Some("deadbeef")).unwrap_err();
+        assert!(err.contains("deploy ref is empty"));
+        let err = parse_git_checkout_target(Some("refs/heads/main"), Some(" ")).unwrap_err();
+        assert!(err.contains("deploy sha is empty"));
+    }
+
+    #[test]
+    fn checkout_code_in_uses_branch_ref_without_bare_head_update() {
+        let (tmp, remote, _work, sha) = seed_remote_with_branch("main");
+        let build = tmp.path().join("build");
+        let target = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha,
+        };
+
+        checkout_code_in(&remote, &build, Some(&target)).unwrap();
+
+        let readme = fs::read_to_string(build.join("README.md")).unwrap();
+        assert_eq!(readme, "hello\n");
+    }
+
+    #[test]
+    fn checkout_code_in_supports_annotated_tag_refs() {
+        let (tmp, remote, work, _sha) = seed_remote_with_branch("main");
+        run_git(&["tag", "-a", "v1", "-m", "v1"], &work);
+        run_git(&["push", "origin", "refs/tags/v1"], &work);
+        let tag_oid = git_output(&["rev-parse", "refs/tags/v1"], &work);
+
+        let build = tmp.path().join("build-tag");
+        let target = GitCheckoutTarget {
+            ref_name: "refs/tags/v1".to_string(),
+            sha: tag_oid.clone(),
+        };
+        checkout_code_in(&remote, &build, Some(&target)).unwrap();
+
+        let resolved_tag = git_output(&["rev-parse", "refs/tags/v1"], &build);
+        assert_eq!(resolved_tag, tag_oid);
+    }
+
     #[test]
     fn command_entrypoints_reject_invalid_app_name() {
         for result in [
-            deploy("bad/name"),
+            deploy("bad/name", None, None),
             push("bad/name", false),
             logs("bad/name", false),
             stop("bad/name"),
