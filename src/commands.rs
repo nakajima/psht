@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,7 @@ const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
 const CONTAINER_OP_WAIT_CHECKS: u32 = 80;
 const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
 const CONTAINER_DELETE_RETRY_CHECKS: u32 = 20;
+const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -69,6 +70,14 @@ fn stacks_dir() -> PathBuf {
 
 fn git_deploy_state_dir() -> PathBuf {
     home_dir().join("deploy-state")
+}
+
+fn deploy_lock_dir() -> PathBuf {
+    home_dir().join("deploy-locks")
+}
+
+fn deploy_pending_dir() -> PathBuf {
+    home_dir().join("deploy-pending")
 }
 
 fn build_numbers_dir() -> PathBuf {
@@ -1260,8 +1269,9 @@ fn resolve_stack(
     resolve_stack_in(app, code_dir, detected_stack, &stacks_dir())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct GitCheckoutTarget {
+    #[serde(rename = "ref")]
     ref_name: String,
     sha: String,
 }
@@ -1288,6 +1298,100 @@ fn git_deploy_state_path_in(dir: &Path, app: &str) -> PathBuf {
 
 fn git_deploy_state_path(app: &str) -> PathBuf {
     git_deploy_state_path_in(&git_deploy_state_dir(), app)
+}
+
+fn deploy_lock_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.lock"))
+}
+
+fn deploy_lock_path(app: &str) -> PathBuf {
+    deploy_lock_path_in(&deploy_lock_dir(), app)
+}
+
+fn pending_git_target_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.toml"))
+}
+
+fn pending_git_target_path(app: &str) -> PathBuf {
+    pending_git_target_path_in(&deploy_pending_dir(), app)
+}
+
+struct DeployLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for DeployLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_new_lock_file(path: &Path) -> Result<(), std::io::Error> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let body = format!("pid={}\ncreated={}\n", std::process::id(), now_unix_secs());
+    file.write_all(body.as_bytes())?;
+    Ok(())
+}
+
+fn lock_file_is_stale(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let Ok(elapsed) = modified.elapsed() else {
+        return false;
+    };
+    elapsed.as_secs() > DEPLOY_LOCK_STALE_SECS
+}
+
+fn try_acquire_deploy_lock_at(path: &Path) -> Result<Option<DeployLockGuard>, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    for _ in 0..2 {
+        match write_new_lock_file(path) {
+            Ok(()) => {
+                return Ok(Some(DeployLockGuard {
+                    path: path.to_path_buf(),
+                }));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                if lock_file_is_stale(path) {
+                    match fs::remove_file(path) {
+                        Ok(()) => continue,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                        Err(err) => {
+                            return Err(format!(
+                                "failed to clear stale lock {}: {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(format!("failed to create lock {}: {e}", path.display()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn try_acquire_deploy_lock(app: &str) -> Result<Option<DeployLockGuard>, String> {
+    try_acquire_deploy_lock_at(&deploy_lock_path(app))
 }
 
 fn read_git_deploy_state_from(path: &Path) -> Result<Option<GitDeployState>, String> {
@@ -1338,6 +1442,48 @@ fn clear_git_deploy_state_at(path: &Path) -> Result<(), String> {
 
 fn clear_git_deploy_state(app: &str) -> Result<(), String> {
     clear_git_deploy_state_at(&git_deploy_state_path(app))
+}
+
+fn write_pending_git_target_to(path: &Path, target: &GitCheckoutTarget) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(target)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn write_pending_git_target(app: &str, target: &GitCheckoutTarget) -> Result<(), String> {
+    write_pending_git_target_to(&pending_git_target_path(app), target)
+}
+
+fn read_pending_git_target_from(path: &Path) -> Result<Option<GitCheckoutTarget>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let target: GitCheckoutTarget =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(target))
+}
+
+fn take_pending_git_target_from(path: &Path) -> Result<Option<GitCheckoutTarget>, String> {
+    let target = read_pending_git_target_from(path)?;
+    if target.is_none() {
+        return Ok(None);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to remove {}: {e}", path.display())),
+    }
+    Ok(target)
+}
+
+fn take_pending_git_target(app: &str) -> Result<Option<GitCheckoutTarget>, String> {
+    take_pending_git_target_from(&pending_git_target_path(app))
 }
 
 fn git_target_already_succeeded_with_state(
@@ -1772,17 +1918,8 @@ fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String>
     Ok(())
 }
 
-pub fn deploy(
-    app: &str,
-    git_ref: Option<&str>,
-    git_sha: Option<&str>,
-    force: bool,
-) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    eprintln!("-----> Deploying {app}");
-    let target = parse_git_checkout_target(git_ref, git_sha)?;
-
-    if let Some(target) = target.as_ref() {
+fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Result<(), String> {
+    if let Some(target) = target {
         if !force {
             match git_target_already_succeeded(app, target) {
                 Ok(true) => {
@@ -1801,17 +1938,17 @@ pub fn deploy(
     }
 
     eprintln!("-----> Checking out code");
-    if let Some(target) = target.as_ref() {
+    if let Some(target) = target {
         eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
     }
     let result = (|| {
-        let build_dir = checkout_code(app, target.as_ref())?;
+        let build_dir = checkout_code(app, target)?;
         deploy_from(app, &build_dir)
     })();
 
     match result {
         Ok(()) => {
-            if let Some(target) = target.as_ref() {
+            if let Some(target) = target {
                 if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Success) {
                     eprintln!(
                         "       Warning: failed to persist successful git deploy state: {err}"
@@ -1823,7 +1960,7 @@ pub fn deploy(
             Ok(())
         }
         Err(err) => {
-            if let Some(target) = target.as_ref()
+            if let Some(target) = target
                 && let Err(write_err) = write_git_deploy_state(app, target, GitDeployStatus::Failed)
             {
                 eprintln!("       Warning: failed to record failed git deploy state: {write_err}");
@@ -1833,9 +1970,64 @@ pub fn deploy(
     }
 }
 
+fn queue_pending_git_deploy(app: &str, target: &GitCheckoutTarget) -> Result<(), String> {
+    write_pending_git_target(app, target)?;
+    if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Pending) {
+        eprintln!("       Warning: failed to record pending git deploy state: {err}");
+    }
+    Ok(())
+}
+
+pub fn deploy(
+    app: &str,
+    git_ref: Option<&str>,
+    git_sha: Option<&str>,
+    force: bool,
+) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    eprintln!("-----> Deploying {app}");
+    let mut target = parse_git_checkout_target(git_ref, git_sha)?;
+
+    let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
+        if let Some(target) = target.as_ref() {
+            queue_pending_git_deploy(app, target)?;
+            eprintln!("-----> Deploy already in progress; replaced pending deploy target");
+            eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
+            return Ok(());
+        }
+        return Err(format!(
+            "deploy already in progress for '{app}'; retry after it completes"
+        ));
+    };
+
+    let mut active_force = force;
+    loop {
+        let result = deploy_once(app, target.as_ref(), active_force);
+        let Some(pending_target) = take_pending_git_target(app)? else {
+            return result;
+        };
+        if target.as_ref().map(|v| v.sha.as_str()) == Some(pending_target.sha.as_str()) {
+            return result;
+        }
+
+        eprintln!("-----> Processing pending deploy target");
+        eprintln!(
+            "       Ref: {} ({})",
+            pending_target.ref_name, pending_target.sha
+        );
+        target = Some(pending_target);
+        active_force = false;
+    }
+}
+
 pub fn push(app: &str, force: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
+    let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
+        return Err(format!(
+            "deploy already in progress for '{app}'; retry after it completes"
+        ));
+    };
 
     let code_dir = home_dir().join(app);
 
@@ -3359,6 +3551,71 @@ mod tests {
         clear_git_deploy_state_at(&path).unwrap();
         assert!(!path.exists());
         assert!(read_git_deploy_state_from(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_git_target_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        let target = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+        };
+        write_pending_git_target_to(&path, &target).unwrap();
+        let loaded = read_pending_git_target_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, target);
+    }
+
+    #[test]
+    fn pending_git_target_overwrite_keeps_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        let first = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+        };
+        let second = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "cafebabe".to_string(),
+        };
+        write_pending_git_target_to(&path, &first).unwrap();
+        write_pending_git_target_to(&path, &second).unwrap();
+        let loaded = read_pending_git_target_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, second);
+    }
+
+    #[test]
+    fn take_pending_git_target_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        let target = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+        };
+        write_pending_git_target_to(&path, &target).unwrap();
+        let taken = take_pending_git_target_from(&path).unwrap().unwrap();
+        assert_eq!(taken, target);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn take_pending_git_target_missing_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        assert!(take_pending_git_target_from(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn deploy_lock_is_exclusive_until_guard_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deploy_lock_path_in(tmp.path(), "myapp");
+        let guard = try_acquire_deploy_lock_at(&path).unwrap();
+        assert!(guard.is_some());
+        let second = try_acquire_deploy_lock_at(&path).unwrap();
+        assert!(second.is_none());
+        drop(guard);
+        let third = try_acquire_deploy_lock_at(&path).unwrap();
+        assert!(third.is_some());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::Deserialize;
+use toml::Value;
 
 #[derive(Debug, PartialEq)]
 pub enum AppType {
@@ -32,7 +33,7 @@ impl AppType {
             AppType::Bun => "bun run index.ts",
             AppType::Node => "npm start",
             AppType::Python => "python app.py",
-            AppType::Rust => "./target/release/app",
+            AppType::Rust => "",
             AppType::Go => "./app",
             AppType::Static => "python3 -m http.server $PORT",
         }
@@ -71,11 +72,13 @@ impl AppConfig {
 
 pub fn detect(dir: &Path) -> Result<AppConfig, String> {
     let hooks = read_deploy_hooks(dir)?;
+    let procfile_start_command = read_procfile(dir);
 
     if let Some(start_command) = read_start_command_file(dir)? {
+        let start = hooks.start.clone().unwrap_or(start_command);
         return Ok(AppConfig {
             app_type: AppType::Binary,
-            start_command,
+            start_command: start,
             install_command: "".to_string(),
             preinstall_command: hooks.preinstall,
             postinstall_command: hooks.postinstall,
@@ -84,7 +87,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
         });
     }
 
-    let start_command = read_procfile(dir);
+    let start_command = hooks.start.clone().or(procfile_start_command);
 
     if is_bun_project(dir) {
         let start = start_command
@@ -117,8 +120,10 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
 
     for (file, app_type) in markers {
         if dir.join(file).exists() {
-            let start =
-                start_command.unwrap_or_else(|| app_type.default_start_command().to_string());
+            let start = match start_command.clone() {
+                Some(start) => start,
+                None => default_start_command_for(*app_type, dir)?,
+            };
             let install = match app_type {
                 AppType::Bun if !dir.join("package.json").exists() => "",
                 _ => app_type.install_command(),
@@ -170,8 +175,75 @@ fn read_procfile(dir: &Path) -> Option<String> {
     None
 }
 
+fn default_start_command_for(app_type: AppType, dir: &Path) -> Result<String, String> {
+    match app_type {
+        AppType::Rust => rust_default_start_command(dir),
+        _ => Ok(app_type.default_start_command().to_string()),
+    }
+}
+
+fn rust_default_start_command(dir: &Path) -> Result<String, String> {
+    let cargo_toml = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml)
+        .map_err(|e| format!("failed to read {}: {e}", cargo_toml.display()))?;
+    let parsed: Value = toml::from_str(&content)
+        .map_err(|e| format!("failed to parse {}: {e}", cargo_toml.display()))?;
+
+    let package = parsed.get("package").and_then(Value::as_table);
+    let package_name = package
+        .and_then(|pkg| pkg.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let default_run = package
+        .and_then(|pkg| pkg.get("default-run"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+
+    if let Some(name) = default_run {
+        return Ok(format!("./target/release/{name}"));
+    }
+
+    let mut bin_names = Vec::new();
+    if let Some(entries) = parsed.get("bin").and_then(Value::as_array) {
+        for entry in entries {
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || bin_names.iter().any(|v| v == name) {
+                continue;
+            }
+            bin_names.push(name.to_string());
+        }
+    }
+
+    if let Some(package_name) = package_name {
+        if bin_names.is_empty() || bin_names.iter().any(|name| name == &package_name) {
+            return Ok(format!("./target/release/{package_name}"));
+        }
+        if bin_names.len() == 1 {
+            return Ok(format!("./target/release/{}", bin_names[0]));
+        }
+        return Err(
+            "could not infer Rust start binary (multiple [[bin]] entries). Set `start` in psht.toml"
+                .to_string(),
+        );
+    }
+
+    if bin_names.len() == 1 {
+        return Ok(format!("./target/release/{}", bin_names[0]));
+    }
+
+    Err("could not infer Rust start binary from Cargo.toml. Set `start` in psht.toml".to_string())
+}
+
 #[derive(Default)]
 struct DeployHooks {
+    start: Option<String>,
     preinstall: Option<String>,
     postinstall: Option<String>,
     apt_packages: Vec<String>,
@@ -180,6 +252,8 @@ struct DeployHooks {
 
 #[derive(Deserialize)]
 struct HookConfig {
+    #[serde(default)]
+    start: Option<String>,
     #[serde(default)]
     preinstall: Option<String>,
     #[serde(default)]
@@ -198,6 +272,17 @@ fn normalize_hook(value: Option<String>) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn normalize_start(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("psht.toml start is empty".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn normalize_apt_packages(values: Option<Vec<String>>) -> Vec<String> {
@@ -242,6 +327,7 @@ fn read_deploy_hooks(dir: &Path) -> Result<DeployHooks, String> {
         toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
 
     Ok(DeployHooks {
+        start: normalize_start(cfg.start)?,
         preinstall: normalize_hook(cfg.preinstall),
         postinstall: normalize_hook(cfg.postinstall),
         apt_packages: normalize_apt_packages(cfg.apt_packages),
@@ -349,9 +435,14 @@ mod tests {
     #[test]
     fn detect_rust_app() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"hyperlinked\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         let config = detect(tmp.path()).unwrap();
         assert_eq!(config.app_type, AppType::Rust);
+        assert_eq!(config.start_command, "./target/release/hyperlinked");
     }
 
     #[test]
@@ -401,10 +492,11 @@ mod tests {
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
         fs::write(
             tmp.path().join("psht.toml"),
-            "preinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\nrequired_env = [\"DATABASE_URL\", \"JWT_SECRET\"]\n",
+            "start = \"node server.js\"\npreinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\nrequired_env = [\"DATABASE_URL\", \"JWT_SECRET\"]\n",
         )
         .unwrap();
         let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.start_command, "node server.js");
         assert_eq!(config.preinstall_command.as_deref(), Some("echo pre"));
         assert_eq!(config.postinstall_command.as_deref(), Some("echo post"));
         assert_eq!(config.apt_packages, vec!["curl", "git"]);
@@ -443,6 +535,72 @@ mod tests {
         fs::write(tmp.path().join("psht.toml"), "preinstall = [").unwrap();
         let err = detect(tmp.path()).unwrap_err();
         assert!(err.contains("failed to parse"));
+    }
+
+    #[test]
+    fn psht_toml_start_overrides_start_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".psht-start-command"), "./old\n").unwrap();
+        fs::write(tmp.path().join("psht.toml"), "start = \"./new\"\n").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Binary);
+        assert_eq!(config.start_command, "./new");
+    }
+
+    #[test]
+    fn psht_toml_start_overrides_procfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("Procfile"), "web: node server.js").unwrap();
+        fs::write(tmp.path().join("psht.toml"), "start = \"node app.js\"\n").unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.app_type, AppType::Node);
+        assert_eq!(config.start_command, "node app.js");
+    }
+
+    #[test]
+    fn psht_toml_empty_start_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        fs::write(tmp.path().join("psht.toml"), "start = \"   \"\n").unwrap();
+        let err = detect(tmp.path()).unwrap_err();
+        assert!(err.contains("start is empty"));
+    }
+
+    #[test]
+    fn rust_start_prefers_default_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"hyperlinked\"\nversion = \"0.1.0\"\ndefault-run = \"worker\"\n",
+        )
+        .unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.start_command, "./target/release/worker");
+    }
+
+    #[test]
+    fn rust_start_uses_single_bin_when_package_name_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[[bin]]\nname = \"runner\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        let config = detect(tmp.path()).unwrap();
+        assert_eq!(config.start_command, "./target/release/runner");
+    }
+
+    #[test]
+    fn rust_start_errors_for_ambiguous_bins() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n[[bin]]\nname = \"api\"\n[[bin]]\nname = \"worker\"\n",
+        )
+        .unwrap();
+        let err = detect(tmp.path()).unwrap_err();
+        assert!(err.contains("could not infer Rust start binary"));
     }
 
     #[test]
