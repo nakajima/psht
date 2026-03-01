@@ -9,6 +9,8 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app_name;
 use crate::caddy;
 use crate::container;
@@ -63,6 +65,10 @@ fn repos_dir() -> PathBuf {
 
 fn stacks_dir() -> PathBuf {
     home_dir().join("stacks")
+}
+
+fn git_deploy_state_dir() -> PathBuf {
+    home_dir().join("deploy-state")
 }
 
 fn build_numbers_dir() -> PathBuf {
@@ -1260,6 +1266,102 @@ struct GitCheckoutTarget {
     sha: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum GitDeployStatus {
+    Pending,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct GitDeployState {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    sha: String,
+    status: GitDeployStatus,
+}
+
+fn git_deploy_state_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.toml"))
+}
+
+fn git_deploy_state_path(app: &str) -> PathBuf {
+    git_deploy_state_path_in(&git_deploy_state_dir(), app)
+}
+
+fn read_git_deploy_state_from(path: &Path) -> Result<Option<GitDeployState>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let state: GitDeployState =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn read_git_deploy_state(app: &str) -> Result<Option<GitDeployState>, String> {
+    read_git_deploy_state_from(&git_deploy_state_path(app))
+}
+
+fn write_git_deploy_state_to(path: &Path, state: &GitDeployState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(state)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn write_git_deploy_state(
+    app: &str,
+    target: &GitCheckoutTarget,
+    status: GitDeployStatus,
+) -> Result<(), String> {
+    let state = GitDeployState {
+        ref_name: target.ref_name.clone(),
+        sha: target.sha.clone(),
+        status,
+    };
+    write_git_deploy_state_to(&git_deploy_state_path(app), &state)
+}
+
+fn clear_git_deploy_state_at(path: &Path) -> Result<(), String> {
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn clear_git_deploy_state(app: &str) -> Result<(), String> {
+    clear_git_deploy_state_at(&git_deploy_state_path(app))
+}
+
+fn git_target_already_succeeded_with_state(
+    state: Option<&GitDeployState>,
+    target: &GitCheckoutTarget,
+) -> bool {
+    matches!(
+        state,
+        Some(GitDeployState {
+            sha,
+            status: GitDeployStatus::Success,
+            ..
+        }) if sha == &target.sha
+    )
+}
+
+fn git_target_already_succeeded(app: &str, target: &GitCheckoutTarget) -> Result<bool, String> {
+    let state = read_git_deploy_state(app)?;
+    Ok(git_target_already_succeeded_with_state(
+        state.as_ref(),
+        target,
+    ))
+}
+
 fn parse_git_checkout_target(
     git_ref: Option<&str>,
     git_sha: Option<&str>,
@@ -1670,18 +1772,65 @@ fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String>
     Ok(())
 }
 
-pub fn deploy(app: &str, git_ref: Option<&str>, git_sha: Option<&str>) -> Result<(), String> {
+pub fn deploy(
+    app: &str,
+    git_ref: Option<&str>,
+    git_sha: Option<&str>,
+    force: bool,
+) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
     let target = parse_git_checkout_target(git_ref, git_sha)?;
+
+    if let Some(target) = target.as_ref() {
+        if !force {
+            match git_target_already_succeeded(app, target) {
+                Ok(true) => {
+                    eprintln!("-----> Current git revision already deployed successfully");
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    eprintln!("       Warning: failed to read git deploy state: {err}");
+                }
+            }
+        }
+        if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Pending) {
+            eprintln!("       Warning: failed to record pending git deploy state: {err}");
+        }
+    }
 
     eprintln!("-----> Checking out code");
     if let Some(target) = target.as_ref() {
         eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
     }
-    let build_dir = checkout_code(app, target.as_ref())?;
+    let result = (|| {
+        let build_dir = checkout_code(app, target.as_ref())?;
+        deploy_from(app, &build_dir)
+    })();
 
-    deploy_from(app, &build_dir)
+    match result {
+        Ok(()) => {
+            if let Some(target) = target.as_ref() {
+                if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Success) {
+                    eprintln!(
+                        "       Warning: failed to persist successful git deploy state: {err}"
+                    );
+                }
+            } else if let Err(err) = clear_git_deploy_state(app) {
+                eprintln!("       Warning: failed to clear git deploy state: {err}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(target) = target.as_ref()
+                && let Err(write_err) = write_git_deploy_state(app, target, GitDeployStatus::Failed)
+            {
+                eprintln!("       Warning: failed to record failed git deploy state: {write_err}");
+            }
+            Err(err)
+        }
+    }
 }
 
 pub fn push(app: &str, force: bool) -> Result<(), String> {
@@ -1718,7 +1867,11 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
         }
     }
 
-    deploy_from(app, &code_dir)
+    deploy_from(app, &code_dir)?;
+    if let Err(err) = clear_git_deploy_state(app) {
+        eprintln!("       Warning: failed to clear git deploy state: {err}");
+    }
+    Ok(())
 }
 
 fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
@@ -3178,6 +3331,74 @@ mod tests {
     }
 
     #[test]
+    fn git_deploy_state_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = git_deploy_state_path_in(tmp.path(), "myapp");
+        let state = GitDeployState {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            status: GitDeployStatus::Success,
+        };
+        write_git_deploy_state_to(&path, &state).unwrap();
+        let loaded = read_git_deploy_state_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn clear_git_deploy_state_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = git_deploy_state_path_in(tmp.path(), "myapp");
+        let state = GitDeployState {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            status: GitDeployStatus::Failed,
+        };
+        write_git_deploy_state_to(&path, &state).unwrap();
+        assert!(path.exists());
+
+        clear_git_deploy_state_at(&path).unwrap();
+        assert!(!path.exists());
+        assert!(read_git_deploy_state_from(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn git_target_already_succeeded_checks_success_and_sha() {
+        let target = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+        };
+        let success_same_sha = GitDeployState {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            status: GitDeployStatus::Success,
+        };
+        let failed_same_sha = GitDeployState {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            status: GitDeployStatus::Failed,
+        };
+        let success_other_sha = GitDeployState {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "beadfeed".to_string(),
+            status: GitDeployStatus::Success,
+        };
+
+        assert!(git_target_already_succeeded_with_state(
+            Some(&success_same_sha),
+            &target
+        ));
+        assert!(!git_target_already_succeeded_with_state(
+            Some(&failed_same_sha),
+            &target
+        ));
+        assert!(!git_target_already_succeeded_with_state(
+            Some(&success_other_sha),
+            &target
+        ));
+        assert!(!git_target_already_succeeded_with_state(None, &target));
+    }
+
+    #[test]
     fn resolve_stack_uses_custom_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let code_dir = tmp.path().join("code");
@@ -4095,7 +4316,7 @@ devices:
     #[test]
     fn command_entrypoints_reject_invalid_app_name() {
         for result in [
-            deploy("bad/name", None, None),
+            deploy("bad/name", None, None, false),
             push("bad/name", false),
             logs("bad/name", false),
             stop("bad/name"),

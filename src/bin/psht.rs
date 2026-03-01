@@ -556,13 +556,8 @@ fn parse_push_updated(porcelain: &str) -> Option<bool> {
     if saw_ref_line { Some(updated) } else { None }
 }
 
-fn deploy_current_ref_over_ssh(
-    host: &str,
-    app: &str,
-    ref_name: &str,
-    sha: &str,
-) -> Result<(), String> {
-    let args = vec![
+fn deploy_ssh_args(app: &str, ref_name: &str, sha: &str, force: bool) -> Vec<String> {
+    let mut args = vec![
         "deploy".to_string(),
         app.to_string(),
         "--ref".to_string(),
@@ -570,6 +565,20 @@ fn deploy_current_ref_over_ssh(
         "--sha".to_string(),
         sha.to_string(),
     ];
+    if force {
+        args.push("--force".to_string());
+    }
+    args
+}
+
+fn deploy_current_ref_over_ssh(
+    host: &str,
+    app: &str,
+    ref_name: &str,
+    sha: &str,
+    force: bool,
+) -> Result<(), String> {
+    let args = deploy_ssh_args(app, ref_name, sha, force);
     ssh_cmd_owned(host, &args)
 }
 
@@ -598,11 +607,18 @@ fn deploy_from_git(host: &str, app: &str, cwd: &Path, force: bool) -> Result<(),
     }
 
     let pushed_updated = parse_push_updated(&stdout);
-    if force && pushed_updated == Some(false) {
-        eprintln!("-----> Forcing deploy of current git revision");
-        return deploy_current_ref_over_ssh(host, app, &ref_name, &sha);
+    if pushed_updated == Some(true) {
+        return Ok(());
     }
-    Ok(())
+
+    if force {
+        eprintln!("-----> Forcing deploy of current git revision");
+    } else if pushed_updated == Some(false) {
+        eprintln!("-----> Verifying deploy state for current git revision");
+    } else {
+        eprintln!("-----> Push status unclear, verifying current git revision");
+    }
+    deploy_current_ref_over_ssh(host, app, &ref_name, &sha, force)
 }
 
 fn deploy(host: &str, app: &str, cwd: &Path, force: bool) -> Result<(), String> {
@@ -1956,6 +1972,39 @@ mod tests {
     fn parse_push_updated_ignores_non_ref_lines() {
         let out = "To psht:app\nDone\n";
         assert_eq!(parse_push_updated(out), None);
+    }
+
+    #[test]
+    fn deploy_ssh_args_without_force() {
+        let args = deploy_ssh_args("myapp", "refs/heads/main", "deadbeef", false);
+        assert_eq!(
+            args,
+            vec![
+                "deploy".to_string(),
+                "myapp".to_string(),
+                "--ref".to_string(),
+                "refs/heads/main".to_string(),
+                "--sha".to_string(),
+                "deadbeef".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn deploy_ssh_args_with_force() {
+        let args = deploy_ssh_args("myapp", "refs/heads/main", "deadbeef", true);
+        assert_eq!(
+            args,
+            vec![
+                "deploy".to_string(),
+                "myapp".to_string(),
+                "--ref".to_string(),
+                "refs/heads/main".to_string(),
+                "--sha".to_string(),
+                "deadbeef".to_string(),
+                "--force".to_string(),
+            ]
+        );
     }
 
     #[test]

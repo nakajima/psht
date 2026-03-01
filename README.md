@@ -43,6 +43,7 @@ psht deploy # first run creates psht.toml (release URL + start command)
 ```
 
 Use `psht deploy --force` to force a deploy even when the binary payload hash is unchanged.
+For git projects, `psht deploy` now verifies the last successful deploy when `git push` is up to date, and retries automatically if the last attempt failed.
 
 `psht.toml` (project root) is used for release deploys and optional deploy hooks:
 
