@@ -39,6 +39,7 @@ const CONTAINER_OP_WAIT_CHECKS: u32 = 80;
 const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
 const CONTAINER_DELETE_RETRY_CHECKS: u32 = 20;
 const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
+const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -70,6 +71,10 @@ fn stacks_dir() -> PathBuf {
 
 fn git_deploy_state_dir() -> PathBuf {
     home_dir().join("deploy-state")
+}
+
+fn upgrade_check_state_path() -> PathBuf {
+    home_dir().join(".psht").join("upgrade-check.toml")
 }
 
 fn deploy_lock_dir() -> PathBuf {
@@ -610,6 +615,142 @@ fn parse_latest_release_version_url(url: &str) -> Option<String> {
     Some(version.to_string())
 }
 
+fn parse_version_components(version: &str) -> Option<Vec<u64>> {
+    let stripped = version
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V');
+    let core = stripped.split('+').next().unwrap_or(stripped);
+    let core = core.split('-').next().unwrap_or(core);
+    if core.is_empty() {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for piece in core.split('.') {
+        if piece.is_empty() {
+            return None;
+        }
+        let value = piece.parse::<u64>().ok()?;
+        components.push(value);
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some(components)
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let Some(latest_parts) = parse_version_components(latest) else {
+        return false;
+    };
+    let Some(current_parts) = parse_version_components(current) else {
+        return false;
+    };
+    let len = latest_parts.len().max(current_parts.len());
+    for idx in 0..len {
+        let lhs = latest_parts.get(idx).copied().unwrap_or(0);
+        let rhs = current_parts.get(idx).copied().unwrap_or(0);
+        if lhs > rhs {
+            return true;
+        }
+        if lhs < rhs {
+            return false;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct UpgradeCheckState {
+    checked_at: u64,
+    latest: String,
+}
+
+fn read_upgrade_check_state_from(path: &Path) -> Result<Option<UpgradeCheckState>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let state: UpgradeCheckState =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn write_upgrade_check_state_to(path: &Path, state: &UpgradeCheckState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(state)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn latest_release_version_with_timeouts(
+    connect_timeout_secs: &str,
+    max_time_secs: &str,
+) -> Result<String, String> {
+    let forge_url = configured_forge_url();
+    let latest_url = run_cmd_capture(
+        "curl",
+        &[
+            "-fsSL",
+            "--connect-timeout",
+            connect_timeout_secs,
+            "--max-time",
+            max_time_secs,
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            &format!("{forge_url}/releases/latest"),
+        ],
+    )?;
+    parse_latest_release_version_url(&latest_url)
+        .ok_or_else(|| format!("failed to parse latest release version from URL: {latest_url}"))
+}
+
+fn latest_release_version_for_warning() -> Option<String> {
+    let path = upgrade_check_state_path();
+    let cached = read_upgrade_check_state_from(&path).ok().flatten();
+    let now = now_unix_secs();
+
+    if let Some(state) = cached.as_ref()
+        && now.saturating_sub(state.checked_at) <= UPGRADE_CHECK_TTL_SECS
+        && !state.latest.trim().is_empty()
+    {
+        return Some(state.latest.trim().to_string());
+    }
+
+    match latest_release_version_with_timeouts("2", "3") {
+        Ok(latest) => {
+            let state = UpgradeCheckState {
+                checked_at: now,
+                latest: latest.clone(),
+            };
+            let _ = write_upgrade_check_state_to(&path, &state);
+            Some(latest)
+        }
+        Err(_) => cached
+            .map(|state| state.latest.trim().to_string())
+            .filter(|latest| !latest.is_empty()),
+    }
+}
+
+fn warn_if_upgrade_available() {
+    let current = env!("CARGO_PKG_VERSION");
+    let Some(latest) = latest_release_version_for_warning() else {
+        return;
+    };
+    if version_is_newer(&latest, current) {
+        eprintln!(
+            "       Warning: psht-server {current} is behind latest {latest}; run `sudo psht-server upgrade`"
+        );
+    }
+}
+
 fn detect_release_target() -> Result<&'static str, String> {
     let arch = run_cmd_capture("uname", &["-m"])?;
     match arch.trim() {
@@ -988,20 +1129,7 @@ fn ensure_project_default_profile(project: &str) -> Result<(), String> {
 }
 
 fn latest_release_version() -> Result<String, String> {
-    let forge_url = configured_forge_url();
-    let latest_url = run_cmd_capture(
-        "curl",
-        &[
-            "-fsSL",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{url_effective}",
-            &format!("{forge_url}/releases/latest"),
-        ],
-    )?;
-    parse_latest_release_version_url(&latest_url)
-        .ok_or_else(|| format!("failed to parse latest release version from URL: {latest_url}"))
+    latest_release_version_with_timeouts("5", "10")
 }
 
 fn release_version_candidates(current: &str, latest: Option<&str>) -> Vec<String> {
@@ -1986,6 +2114,7 @@ pub fn deploy(
 ) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
+    warn_if_upgrade_available();
     let mut target = parse_git_checkout_target(git_ref, git_sha)?;
 
     let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
@@ -2023,6 +2152,7 @@ pub fn deploy(
 pub fn push(app: &str, force: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     eprintln!("-----> Deploying {app}");
+    warn_if_upgrade_available();
     let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
         return Err(format!(
             "deploy already in progress for '{app}'; retry after it completes"
@@ -3070,6 +3200,29 @@ pub fn doctor() -> Result<(), String> {
     Ok(())
 }
 
+fn run_tailscale_with_optional_sudo(args: &[&str]) -> Result<(), String> {
+    let is_root = run_cmd_capture("id", &["-u"])? == "0";
+    if is_root || !command_exists("sudo") {
+        return run_cmd("tailscale", args);
+    }
+
+    let mut sudo_args = vec!["tailscale"];
+    sudo_args.extend_from_slice(args);
+    run_cmd("sudo", &sudo_args)
+}
+
+pub fn tailscale_status() -> Result<(), String> {
+    run_cmd("tailscale", &["status"])
+}
+
+pub fn tailscale_up() -> Result<(), String> {
+    run_tailscale_with_optional_sudo(&["up", "--ssh"])
+}
+
+pub fn tailscale_down() -> Result<(), String> {
+    run_tailscale_with_optional_sudo(&["down"])
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
@@ -3585,6 +3738,19 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_check_state_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("upgrade-check.toml");
+        let state = UpgradeCheckState {
+            checked_at: 123,
+            latest: "0.3.0".to_string(),
+        };
+        write_upgrade_check_state_to(&path, &state).unwrap();
+        let loaded = read_upgrade_check_state_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
     fn take_pending_git_target_removes_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = pending_git_target_path_in(tmp.path(), "myapp");
@@ -3904,6 +4070,30 @@ devices:
     fn parse_latest_release_version_url_rejects_latest_path() {
         let url = "https://example.com/org/repo/releases/latest";
         assert!(parse_latest_release_version_url(url).is_none());
+    }
+
+    #[test]
+    fn parse_version_components_handles_prefix_and_suffixes() {
+        assert_eq!(parse_version_components("v1.2.3"), Some(vec![1, 2, 3]));
+        assert_eq!(
+            parse_version_components("1.2.3-beta.1+build.7"),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn parse_version_components_rejects_invalid() {
+        assert!(parse_version_components("").is_none());
+        assert!(parse_version_components("latest").is_none());
+        assert!(parse_version_components("1..3").is_none());
+    }
+
+    #[test]
+    fn version_is_newer_compares_numeric_segments() {
+        assert!(version_is_newer("0.2.29", "0.2.28"));
+        assert!(version_is_newer("1.0.0", "0.99.99"));
+        assert!(!version_is_newer("0.2.28", "0.2.28"));
+        assert!(!version_is_newer("0.2.27", "0.2.28"));
     }
 
     #[test]

@@ -77,8 +77,23 @@ enum CliCommand {
     Setup,
     /// Update the psht CLI
     Update,
+    /// Manage host Tailscale connectivity
+    Tailscale {
+        #[command(subcommand)]
+        command: TailscaleCommand,
+    },
     #[command(name = "__is-cli", hide = true)]
     IsCli,
+}
+
+#[derive(Subcommand)]
+enum TailscaleCommand {
+    /// Show Tailscale status on the host
+    Status,
+    /// Bring Tailscale up on the host (with SSH enabled)
+    Up,
+    /// Bring Tailscale down on the host
+    Down,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -1522,6 +1537,14 @@ fn run() -> Result<(), String> {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             update(&host)
         }
+        CliCommand::Tailscale { command } => {
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            match command {
+                TailscaleCommand::Status => ssh_cmd(&host, &["tailscale", "status"]),
+                TailscaleCommand::Up => ssh_cmd(&host, &["tailscale", "up"]),
+                TailscaleCommand::Down => ssh_cmd(&host, &["tailscale", "down"]),
+            }
+        }
         CliCommand::IsCli => Ok(()),
     }
 }
@@ -1698,6 +1721,42 @@ mod tests {
                 assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
             }
             _ => panic!("expected env:unset command"),
+        }
+    }
+
+    #[test]
+    fn tailscale_status_command_parses() {
+        let cli = Cli::try_parse_from(["psht", "tailscale", "status"]).unwrap();
+        match cli.command {
+            CliCommand::Tailscale { command } => match command {
+                TailscaleCommand::Status => {}
+                _ => panic!("expected tailscale status"),
+            },
+            _ => panic!("expected tailscale command"),
+        }
+    }
+
+    #[test]
+    fn tailscale_up_command_parses() {
+        let cli = Cli::try_parse_from(["psht", "tailscale", "up"]).unwrap();
+        match cli.command {
+            CliCommand::Tailscale { command } => match command {
+                TailscaleCommand::Up => {}
+                _ => panic!("expected tailscale up"),
+            },
+            _ => panic!("expected tailscale command"),
+        }
+    }
+
+    #[test]
+    fn tailscale_down_command_parses() {
+        let cli = Cli::try_parse_from(["psht", "tailscale", "down"]).unwrap();
+        match cli.command {
+            CliCommand::Tailscale { command } => match command {
+                TailscaleCommand::Down => {}
+                _ => panic!("expected tailscale down"),
+            },
+            _ => panic!("expected tailscale command"),
         }
     }
 

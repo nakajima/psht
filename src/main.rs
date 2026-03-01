@@ -54,6 +54,11 @@ enum Command {
     Upgrade,
     /// Check server health
     Doctor,
+    /// Manage host tailscale
+    Tailscale {
+        #[command(subcommand)]
+        command: TailscaleCommand,
+    },
     #[command(name = "init-stacks", hide = true)]
     InitStacks,
     #[command(name = "print-cli", hide = true)]
@@ -85,6 +90,16 @@ enum Command {
     },
     #[command(name = "env-unset", hide = true)]
     EnvUnset { app: String, names: Vec<String> },
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum TailscaleCommand {
+    /// Show tailscale status
+    Status,
+    /// Bring tailscale up with SSH enabled
+    Up,
+    /// Bring tailscale down
+    Down,
 }
 
 fn strip_git_suffix(name: &str) -> String {
@@ -176,6 +191,11 @@ fn run() -> Result<(), String> {
         Command::Bootstrap => commands::bootstrap(),
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
+        Command::Tailscale { command } => match command {
+            TailscaleCommand::Status => commands::tailscale_status(),
+            TailscaleCommand::Up => commands::tailscale_up(),
+            TailscaleCommand::Down => commands::tailscale_down(),
+        },
         Command::InitStacks => commands::init_stacks(),
         Command::PrintCli => commands::print_cli(),
     }
@@ -448,6 +468,39 @@ mod tests {
     fn parse_doctor() {
         let cli = parse_cli(&["psht-server", "doctor"]).unwrap();
         assert_eq!(cli.command, Command::Doctor);
+    }
+
+    #[test]
+    fn parse_tailscale_status() {
+        let cli = parse_cli(&["psht-server", "tailscale", "status"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Tailscale {
+                command: TailscaleCommand::Status
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tailscale_up() {
+        let cli = parse_cli(&["psht-server", "tailscale", "up"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Tailscale {
+                command: TailscaleCommand::Up
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tailscale_down() {
+        let cli = parse_cli(&["psht-server", "tailscale", "down"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Tailscale {
+                command: TailscaleCommand::Down
+            }
+        );
     }
 
     #[test]
