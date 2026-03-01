@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,8 @@ const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
 const CONTAINER_DELETE_RETRY_CHECKS: u32 = 20;
 const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
+const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
+const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -545,6 +547,142 @@ fn parse_tailscale_dns_name(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let name = value.pointer("/Self/DNSName")?.as_str()?;
     Some(name.trim_end_matches('.').to_string())
+}
+
+fn tailscale_self_health_from_json(json: &str) -> Result<(String, bool, Vec<String>), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
+    let backend_state = value
+        .get("BackendState")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let online = value
+        .pointer("/Self/Online")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let health = value
+        .get("Health")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((backend_state, online, health))
+}
+
+fn wait_for_tailscale_online(
+    app: &str,
+    timeout: Duration,
+) -> Result<(String, bool, Vec<String>), String> {
+    let start = Instant::now();
+    let mut last_snapshot: Option<(String, bool, Vec<String>)> = None;
+
+    loop {
+        if start.elapsed() >= timeout {
+            if let Some((last_state, last_online, last_health)) = last_snapshot {
+                let mut detail = format!("State: {last_state}\nOnline: {last_online}");
+                if !last_health.is_empty() {
+                    detail.push_str(&format!("\nHealth: {}", last_health.join(" | ")));
+                }
+                return Err(format!(
+                    "timed out waiting for tailscale to become healthy:\n{detail}"
+                ));
+            }
+            return Err("timed out waiting for tailscale status".to_string());
+        }
+
+        match container::exec_output(app, "tailscale status --json") {
+            Ok(status_json) => match tailscale_self_health_from_json(&status_json) {
+                Ok((backend_state, online, health)) => {
+                    let healthy = backend_state == "Running" && online;
+                    last_snapshot = Some((backend_state.clone(), online, health.clone()));
+                    if healthy {
+                        return Ok((backend_state, online, health));
+                    }
+                }
+                Err(e) => {
+                    last_snapshot = Some((format!("error: {e}"), false, Vec::new()));
+                }
+            },
+            Err(e) => {
+                last_snapshot = Some((format!("error: {e}"), false, Vec::new()));
+            }
+        }
+
+        thread::sleep(Duration::from_millis(TAILSCALE_ONLINE_WAIT_POLL_MS));
+    }
+}
+
+fn tailscale_self_status_summary_from_json(app: &str, json: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
+
+    let self_value = value
+        .get("Self")
+        .ok_or_else(|| "missing Self in tailscale status".to_string())?;
+    let host = self_value
+        .get("HostName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let dns = self_value
+        .get("DNSName")
+        .and_then(serde_json::Value::as_str)
+        .map(|name| name.trim_end_matches('.').to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let online = self_value
+        .get("Online")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let ips = self_value
+        .get("TailscaleIPs")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|joined| !joined.is_empty())
+        .unwrap_or_else(|| "-".to_string());
+    let backend_state = value
+        .get("BackendState")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let health: Vec<String> = value
+        .get("Health")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        format!("App: {app}"),
+        format!("Host: {host}"),
+        format!("DNS: {dns}"),
+        format!("State: {backend_state}"),
+        format!("Online: {}", if online { "yes" } else { "no" }),
+        format!("IPs: {ips}"),
+    ];
+    if !health.is_empty() {
+        lines.push(format!("Health: {}", health.join(" | ")));
+    }
+    if backend_state != "Running" || !online || !health.is_empty() {
+        lines.push(format!("Repair: psht tailscale up {app}"));
+    }
+
+    Ok(lines.join("\n"))
 }
 
 fn tailscale_ssh_enabled() -> Result<bool, String> {
@@ -3220,7 +3358,10 @@ fn ensure_container_running_for_tailscale(app: &str) -> Result<(), String> {
 pub fn tailscale_status(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     ensure_container_running_for_tailscale(app)?;
-    container::exec_cmd(app, "tailscale status")
+    let status = container::exec_output(app, "tailscale status --json")?;
+    let summary = tailscale_self_status_summary_from_json(app, &status)?;
+    println!("{summary}");
+    Ok(())
 }
 
 pub fn tailscale_up(app: &str) -> Result<(), String> {
@@ -3233,10 +3374,17 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
 
     eprintln!("-----> Repairing tailscale in container");
     tailscale::install_in_container(app)?;
+    let _ = container::exec_cmd(app, "tailscale down >/dev/null 2>&1 || true");
     let tailnet_hostname = tailscale::join_in_container(app)?;
+    let _ = container::exec_cmd(app, "tailscale serve reset >/dev/null 2>&1 || true");
     let port = allocate_port(app);
     if let Err(e) = tailscale::expose_http_in_container(app, port) {
         eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+    }
+    let (_, _, health) =
+        wait_for_tailscale_online(app, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))?;
+    if !health.is_empty() {
+        eprintln!("       Warning: {}", health.join(" | "));
     }
     if let Some(name) = tailnet_hostname {
         eprintln!("=====> Tailscale ready: http://{name} (also http://{name}:{port})");
@@ -4085,6 +4233,48 @@ devices:
             parse_tailscale_dns_name(json),
             Some("psht.tailnet.ts.net".to_string())
         );
+    }
+
+    #[test]
+    fn tailscale_self_status_summary_outputs_self_only_fields() {
+        let json = r#"{
+            "BackendState":"Running",
+            "Self":{
+                "HostName":"hyperlinked",
+                "DNSName":"hyperlinked.tail.ts.net.",
+                "Online":true,
+                "TailscaleIPs":["100.64.1.2"]
+            },
+            "Peer":{
+                "abc":{"HostName":"other","DNSName":"other.tail.ts.net.","Online":true}
+            }
+        }"#;
+        let summary = tailscale_self_status_summary_from_json("hyperlinked", json).unwrap();
+        assert!(summary.contains("App: hyperlinked"));
+        assert!(summary.contains("Host: hyperlinked"));
+        assert!(summary.contains("DNS: hyperlinked.tail.ts.net"));
+        assert!(summary.contains("State: Running"));
+        assert!(summary.contains("Online: yes"));
+        assert!(summary.contains("IPs: 100.64.1.2"));
+        assert!(!summary.contains("other.tail.ts.net"));
+    }
+
+    #[test]
+    fn tailscale_self_status_summary_includes_repair_hint_when_unhealthy() {
+        let json = r#"{
+            "BackendState":"NeedsLogin",
+            "Self":{
+                "HostName":"hyperlinked",
+                "DNSName":"hyperlinked.tail.ts.net.",
+                "Online":false,
+                "TailscaleIPs":["100.64.1.2"]
+            },
+            "Health":["not logged in"]
+        }"#;
+        let summary = tailscale_self_status_summary_from_json("hyperlinked", json).unwrap();
+        assert!(summary.contains("Online: no"));
+        assert!(summary.contains("Health: not logged in"));
+        assert!(summary.contains("Repair: psht tailscale up hyperlinked"));
     }
 
     #[test]
