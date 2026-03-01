@@ -508,15 +508,99 @@ fn ensure_psht_git_remote(host: &str, app: &str, cwd: &Path) -> Result<(), Strin
     Ok(())
 }
 
-fn deploy_from_git(host: &str, app: &str, cwd: &Path) -> Result<(), String> {
-    ensure_psht_git_remote(host, app, cwd)?;
-    let status = Command::new("git")
-        .args(["push", "psht", "HEAD"])
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
         .current_dir(cwd)
-        .status()
+        .output()
+        .map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!("git {} failed", args.join(" ")));
+        }
+        return Err(format!("git {} failed: {stderr}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn current_git_deploy_target(cwd: &Path) -> Result<(String, String), String> {
+    let sha = git_output(cwd, &["rev-parse", "HEAD"])?;
+    let ref_name = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|out| !out.is_empty())
+        .unwrap_or_else(|| sha.clone());
+    Ok((ref_name, sha))
+}
+
+fn parse_push_updated(porcelain: &str) -> Option<bool> {
+    let mut saw_ref_line = false;
+    let mut updated = false;
+    for line in porcelain.lines() {
+        let Some(flag) = line.chars().next() else {
+            continue;
+        };
+        if !matches!(flag, '=' | '*' | '+' | '-' | ' ') {
+            continue;
+        }
+        saw_ref_line = true;
+        if flag != '=' {
+            updated = true;
+        }
+    }
+    if saw_ref_line { Some(updated) } else { None }
+}
+
+fn deploy_current_ref_over_ssh(
+    host: &str,
+    app: &str,
+    ref_name: &str,
+    sha: &str,
+) -> Result<(), String> {
+    let args = vec![
+        "deploy".to_string(),
+        app.to_string(),
+        "--ref".to_string(),
+        ref_name.to_string(),
+        "--sha".to_string(),
+        sha.to_string(),
+    ];
+    ssh_cmd_owned(host, &args)
+}
+
+fn deploy_from_git(host: &str, app: &str, cwd: &Path, force: bool) -> Result<(), String> {
+    ensure_psht_git_remote(host, app, cwd)?;
+
+    let (ref_name, sha) = current_git_deploy_target(cwd)?;
+    let output = Command::new("git")
+        .args(["push", "--porcelain", "psht", "HEAD"])
+        .current_dir(cwd)
+        .output()
         .map_err(|e| format!("failed to run git push: {e}"))?;
-    if !status.success() {
-        return Err(format!("git push failed with status {status}"));
+
+    // Preserve git push output so users can still see transport details.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.is_empty() {
+        print!("{stdout}");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+
+    if !output.status.success() {
+        return Err(format!("git push failed with status {}", output.status));
+    }
+
+    let pushed_updated = parse_push_updated(&stdout);
+    if force && pushed_updated == Some(false) {
+        eprintln!("-----> Forcing deploy of current git revision");
+        return deploy_current_ref_over_ssh(host, app, &ref_name, &sha);
     }
     Ok(())
 }
@@ -579,7 +663,7 @@ fn deploy_with_app_or_binary(
     app_name::validate_app_name(&name)?;
     if value.is_none() && is_git_worktree(cwd) {
         eprintln!("-----> Deploying via git");
-        return deploy_from_git(host, &name, cwd);
+        return deploy_from_git(host, &name, cwd, force);
     }
     eprintln!("-----> Deploying via tar");
     deploy(host, &name, cwd, force)
@@ -1852,6 +1936,26 @@ mod tests {
             String::from_utf8(output.stdout).unwrap().trim(),
             "psht@host-b:demo"
         );
+    }
+
+    #[test]
+    fn parse_push_updated_reports_up_to_date() {
+        let out = "= refs/heads/main:refs/heads/main [up to date]\nDone\n";
+        assert_eq!(parse_push_updated(out), Some(false));
+    }
+
+    #[test]
+    fn parse_push_updated_reports_changed_refs() {
+        let out = "  refs/heads/main:refs/heads/main abc..def\nDone\n";
+        assert_eq!(parse_push_updated(out), Some(true));
+        let out = "* refs/heads/main:refs/heads/main [new branch]\nDone\n";
+        assert_eq!(parse_push_updated(out), Some(true));
+    }
+
+    #[test]
+    fn parse_push_updated_ignores_non_ref_lines() {
+        let out = "To psht:app\nDone\n";
+        assert_eq!(parse_push_updated(out), None);
     }
 
     #[test]
