@@ -1560,12 +1560,21 @@ fn read_start_command(app: &str) -> Result<String, String> {
     Ok(cmd)
 }
 
+fn app_workdir_command(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() {
+        None
+    } else {
+        Some(format!("cd /app && {command}"))
+    }
+}
+
 fn run_hook(app: &str, phase: &str, command: Option<&str>) -> Result<(), String> {
-    let Some(command) = command.map(str::trim).filter(|v| !v.is_empty()) else {
+    let Some(command) = command.and_then(app_workdir_command) else {
         return Ok(());
     };
     eprintln!("-----> Running {phase} hook");
-    container::exec_cmd_rolling(app, command, 5).map_err(|e| format!("{phase} hook failed: {e}"))
+    container::exec_cmd_rolling(app, &command, 5).map_err(|e| format!("{phase} hook failed: {e}"))
 }
 
 fn apt_install_command(packages: &[String]) -> Option<String> {
@@ -1807,9 +1816,9 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     persist_required_env(app, &config.required_env)?;
     run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
 
-    if !config.install_command.is_empty() {
+    if let Some(command) = app_workdir_command(&config.install_command) {
         eprintln!("-----> Installing dependencies");
-        container::exec_cmd_rolling(app, &config.install_command, 5)?;
+        container::exec_cmd_rolling(app, &command, 5)?;
     }
 
     run_hook(app, "postinstall", config.postinstall_command.as_deref())?;
@@ -4202,6 +4211,17 @@ devices:
     fn run_hook_skips_missing_or_blank_commands() {
         run_hook("myapp", "preinstall", None).unwrap();
         run_hook("myapp", "postinstall", Some(" \n\t ")).unwrap();
+    }
+
+    #[test]
+    fn app_workdir_command_wraps_nonempty_command() {
+        let cmd = app_workdir_command("cargo build --release").unwrap();
+        assert_eq!(cmd, "cd /app && cargo build --release");
+    }
+
+    #[test]
+    fn app_workdir_command_skips_blank_command() {
+        assert!(app_workdir_command(" \n\t ").is_none());
     }
 
     #[test]
