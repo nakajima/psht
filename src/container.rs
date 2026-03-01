@@ -6,6 +6,14 @@ fn container_name(app: &str) -> String {
     format!("psht-{app}")
 }
 
+#[derive(Debug, PartialEq)]
+struct StorageDevice {
+    dev_type: String,
+    path: String,
+    pool: String,
+    source: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ContainerInfo {
     pub name: String,
@@ -175,6 +183,114 @@ fn truncate_line(line: &str, max: usize) -> String {
     line[..end].to_string()
 }
 
+fn is_missing_device_error(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("device")
+        && (lowered.contains("not found") || lowered.contains("doesn't exist"))
+}
+
+fn device_value(app: &str, device: &str, key: &str) -> Result<Option<String>, String> {
+    let name = container_name(app);
+    let output = incus()
+        .args(&["config", "device", "get"])
+        .arg(&name)
+        .arg(device)
+        .arg(key)
+        .build()
+        .output()
+        .map_err(|e| format!("failed to run incus config device get {name} {device} {key}: {e}"))?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(value));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if is_missing_device_error(&stderr) {
+        return Ok(None);
+    }
+    Err(format!(
+        "incus config device get {name} {device} {key} failed: {stderr}"
+    ))
+}
+
+fn storage_device(app: &str) -> Result<Option<StorageDevice>, String> {
+    let Some(path) = device_value(app, "storage", "path")? else {
+        return Ok(None);
+    };
+    let dev_type = device_value(app, "storage", "type")?.unwrap_or_default();
+    let pool = device_value(app, "storage", "pool")?.unwrap_or_default();
+    let source = device_value(app, "storage", "source")?.unwrap_or_default();
+    Ok(Some(StorageDevice {
+        dev_type,
+        path,
+        pool,
+        source,
+    }))
+}
+
+pub fn ensure_storage_mount(app: &str, pool: &str, volume: &str) -> Result<(), String> {
+    let expected = StorageDevice {
+        dev_type: "disk".to_string(),
+        path: "/storage".to_string(),
+        pool: pool.to_string(),
+        source: volume.to_string(),
+    };
+
+    if let Some(current) = storage_device(app)? {
+        if current == expected {
+            return Ok(());
+        }
+        return Err(format!(
+            "container '{app}' has conflicting storage device config: expected type=disk path=/storage pool={pool} source={volume}, got type={} path={} pool={} source={}",
+            current.dev_type, current.path, current.pool, current.source
+        ));
+    }
+
+    let name = container_name(app);
+    incus()
+        .args(&["config", "device", "add"])
+        .arg(&name)
+        .arg("storage")
+        .arg("disk")
+        .arg("path=/storage")
+        .arg(format!("pool={pool}"))
+        .arg(format!("source={volume}"))
+        .run()?;
+
+    if let Some(current) = storage_device(app)? {
+        if current == expected {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "failed to verify storage device for container '{app}' after attaching volume '{volume}'"
+    ))
+}
+
+pub fn remove_storage_mount(app: &str) -> Result<(), String> {
+    let name = container_name(app);
+    let output = incus()
+        .args(&["config", "device", "remove"])
+        .arg(&name)
+        .arg("storage")
+        .build()
+        .output()
+        .map_err(|e| format!("failed to run incus config device remove {name} storage: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if is_missing_device_error(&stderr) {
+        return Ok(());
+    }
+    Err(format!(
+        "incus config device remove {name} storage failed: {stderr}"
+    ))
+}
+
 pub fn create(app: &str) -> Result<(), String> {
     incus()
         .args(&["launch", "images:ubuntu/24.04"])
@@ -286,6 +402,16 @@ pub fn list() -> Result<Vec<ContainerInfo>, String> {
         .into_iter()
         .filter(|c| c.name.starts_with("psht-"))
         .collect())
+}
+
+pub fn is_running(app: &str) -> Result<bool, String> {
+    let target = container_name(app);
+    let containers = list()?;
+    Ok(containers
+        .into_iter()
+        .find(|c| c.name == target)
+        .map(|c| c.status.eq_ignore_ascii_case("running"))
+        .unwrap_or(false))
 }
 
 fn stack_image_alias(stack: &str, hash: &str) -> String {
@@ -440,6 +566,50 @@ mod tests {
                 "listen=tcp:0.0.0.0:3001",
                 "connect=tcp:127.0.0.1:3001"
             ]
+        );
+    }
+
+    #[test]
+    fn incus_storage_add_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "add"])
+            .arg(&name)
+            .arg("storage")
+            .arg("disk")
+            .arg("path=/storage")
+            .arg("pool=default")
+            .arg("source=psht-storage-myapp")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "config",
+                "device",
+                "add",
+                "psht-myapp",
+                "storage",
+                "disk",
+                "path=/storage",
+                "pool=default",
+                "source=psht-storage-myapp"
+            ]
+        );
+    }
+
+    #[test]
+    fn incus_storage_remove_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "remove"])
+            .arg(&name)
+            .arg("storage")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["config", "device", "remove", "psht-myapp", "storage"]
         );
     }
 

@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub preinstall_command: Option<String>,
     pub postinstall_command: Option<String>,
     pub apt_packages: Vec<String>,
+    pub required_env: Vec<String>,
 }
 
 impl AppType {
@@ -79,6 +80,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
             preinstall_command: hooks.preinstall,
             postinstall_command: hooks.postinstall,
             apt_packages: hooks.apt_packages,
+            required_env: hooks.required_env,
         });
     }
 
@@ -100,6 +102,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
             preinstall_command: hooks.preinstall.clone(),
             postinstall_command: hooks.postinstall.clone(),
             apt_packages: hooks.apt_packages.clone(),
+            required_env: hooks.required_env.clone(),
         });
     }
 
@@ -127,6 +130,7 @@ pub fn detect(dir: &Path) -> Result<AppConfig, String> {
                 preinstall_command: hooks.preinstall.clone(),
                 postinstall_command: hooks.postinstall.clone(),
                 apt_packages: hooks.apt_packages.clone(),
+                required_env: hooks.required_env.clone(),
             });
         }
     }
@@ -171,6 +175,7 @@ struct DeployHooks {
     preinstall: Option<String>,
     postinstall: Option<String>,
     apt_packages: Vec<String>,
+    required_env: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +186,8 @@ struct HookConfig {
     postinstall: Option<String>,
     #[serde(default, alias = "apt")]
     apt_packages: Option<Vec<String>>,
+    #[serde(default)]
+    required_env: Option<Vec<String>>,
 }
 
 fn normalize_hook(value: Option<String>) -> Option<String> {
@@ -194,6 +201,21 @@ fn normalize_hook(value: Option<String>) -> Option<String> {
 }
 
 fn normalize_apt_packages(values: Option<Vec<String>>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values.unwrap_or_default() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized.iter().any(|v| v == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    normalized
+}
+
+fn normalize_required_env(values: Option<Vec<String>>) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values.unwrap_or_default() {
         let trimmed = value.trim();
@@ -223,6 +245,7 @@ fn read_deploy_hooks(dir: &Path) -> Result<DeployHooks, String> {
         preinstall: normalize_hook(cfg.preinstall),
         postinstall: normalize_hook(cfg.postinstall),
         apt_packages: normalize_apt_packages(cfg.apt_packages),
+        required_env: normalize_required_env(cfg.required_env),
     })
 }
 
@@ -378,13 +401,14 @@ mod tests {
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
         fs::write(
             tmp.path().join("psht.toml"),
-            "preinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\n",
+            "preinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\nrequired_env = [\"DATABASE_URL\", \"JWT_SECRET\"]\n",
         )
         .unwrap();
         let config = detect(tmp.path()).unwrap();
         assert_eq!(config.preinstall_command.as_deref(), Some("echo pre"));
         assert_eq!(config.postinstall_command.as_deref(), Some("echo post"));
         assert_eq!(config.apt_packages, vec!["curl", "git"]);
+        assert_eq!(config.required_env, vec!["DATABASE_URL", "JWT_SECRET"]);
     }
 
     #[test]
@@ -393,13 +417,14 @@ mod tests {
         fs::write(tmp.path().join("package.json"), "{}").unwrap();
         fs::write(
             tmp.path().join("psht.toml"),
-            "preinstall = \"   \"\npostinstall = \"\\n\\t\"\napt_packages = [\" \", \"curl\", \"curl\"]\n",
+            "preinstall = \"   \"\npostinstall = \"\\n\\t\"\napt_packages = [\" \", \"curl\", \"curl\"]\nrequired_env = [\"  \", \"A\", \"A\", \"B\"]\n",
         )
         .unwrap();
         let config = detect(tmp.path()).unwrap();
         assert!(config.preinstall_command.is_none());
         assert!(config.postinstall_command.is_none());
         assert_eq!(config.apt_packages, vec!["curl"]);
+        assert_eq!(config.required_env, vec!["A", "B"]);
     }
 
     #[test]

@@ -50,15 +50,26 @@ enum CliCommand {
     Ps,
     /// Show app logs
     Logs {
-        app: String,
+        app: Option<String>,
         /// Follow log output
         #[arg(short, long)]
         follow: bool,
     },
     /// Stop an app
-    Stop { app: String },
+    Stop { app: Option<String> },
     /// Stop and remove an app (Caddy routing cleanup is experimental)
-    Destroy { app: String },
+    Destroy { app: Option<String> },
+    /// Manage environment variables for the project app
+    Env {
+        #[arg(value_name = "KEY=value")]
+        assignments: Vec<String>,
+    },
+    /// Unset one or more environment variables for the project app
+    #[command(name = "env:unset")]
+    EnvUnset {
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+    },
     /// Set up project for deployment
     Setup,
     /// Update the psht CLI
@@ -91,6 +102,8 @@ struct ProjectConfig {
     postinstall: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     apt_packages: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_env: Option<Vec<String>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -151,6 +164,73 @@ fn app_name(explicit: Option<&str>, cwd: &Path) -> String {
     }
 }
 
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn parse_env_assignment(raw: &str) -> Result<(&str, &str), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid env assignment '{raw}'; expected NAME=value"))?;
+    if !is_valid_env_name(name) {
+        return Err(format!("invalid env name '{name}'"));
+    }
+    Ok((name, value))
+}
+
+fn parse_env_name(raw: &str) -> Result<&str, String> {
+    if !is_valid_env_name(raw) {
+        return Err(format!("invalid env name '{raw}'"));
+    }
+    Ok(raw)
+}
+
+fn configured_project_app(cwd: &Path) -> Result<Option<String>, String> {
+    let path = project_config_path(cwd);
+    let cfg = load_project_config(&path)?;
+    Ok(cfg
+        .and_then(|cfg| cfg.app)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty()))
+}
+
+fn resolve_command_app(cwd: &Path, explicit: Option<&str>) -> Result<String, String> {
+    let configured = configured_project_app(cwd)?;
+    if let Some(explicit) = explicit {
+        app_name::validate_app_name(explicit)?;
+        if let Some(configured) = configured
+            && configured != explicit
+        {
+            return Err(format!(
+                "app '{explicit}' does not match `{PROJECT_CONFIG_FILE}` app '{configured}'"
+            ));
+        }
+        return Ok(explicit.to_string());
+    }
+
+    if let Some(configured) = configured {
+        app_name::validate_app_name(&configured)?;
+        return Ok(configured);
+    }
+
+    Err(format!(
+        "could not resolve app name from `{PROJECT_CONFIG_FILE}`. Run `psht setup`."
+    ))
+}
+
+fn project_config_template(app: &str) -> String {
+    format!(
+        "app = \"{app}\"\n# url = \"https://github.com/org/repo/releases/download/v1.2.3/my-app-linux-amd64.tar.gz\"\n# start = \"./my-app --port $PORT\"\n# bin = \"my-app\"\n# required_env = [\"DATABASE_URL\", \"JWT_SECRET\"]\n"
+    )
+}
+
 fn ssh_cmd(host: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new("ssh")
         .arg(format!("psht@{host}"))
@@ -164,6 +244,11 @@ fn ssh_cmd(host: &str, args: &[&str]) -> Result<(), String> {
         return Err(format!("ssh exited with status {}", status));
     }
     Ok(())
+}
+
+fn ssh_cmd_owned(host: &str, args: &[String]) -> Result<(), String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    ssh_cmd(host, &refs)
 }
 
 fn deploy_from_dir(
@@ -237,7 +322,7 @@ fn stage_binary_dir(binary_path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("invalid binary path: {}", binary_path.display()))?;
     let start_cmd = format!("./{}", file_name.to_string_lossy());
-    stage_binary_dir_with_start(binary_path, &start_cmd, None, None, None)
+    stage_binary_dir_with_start(binary_path, &start_cmd, None, None, None, None)
 }
 
 fn normalize_opt_vec(values: Option<&[String]>) -> Option<Vec<String>> {
@@ -265,14 +350,20 @@ fn write_deploy_hooks_config(
     preinstall: Option<&str>,
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
+    required_env: Option<&[String]>,
 ) -> Result<(), String> {
     let cfg = ProjectConfig {
         preinstall: normalize_opt(preinstall),
         postinstall: normalize_opt(postinstall),
         apt_packages: normalize_opt_vec(apt_packages),
+        required_env: normalize_opt_vec(required_env),
         ..ProjectConfig::default()
     };
-    if cfg.preinstall.is_none() && cfg.postinstall.is_none() && cfg.apt_packages.is_none() {
+    if cfg.preinstall.is_none()
+        && cfg.postinstall.is_none()
+        && cfg.apt_packages.is_none()
+        && cfg.required_env.is_none()
+    {
         return Ok(());
     }
 
@@ -288,6 +379,7 @@ fn stage_binary_dir_with_start(
     preinstall: Option<&str>,
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
+    required_env: Option<&[String]>,
 ) -> Result<PathBuf, String> {
     let file_name = binary_path
         .file_name()
@@ -311,7 +403,13 @@ fn stage_binary_dir_with_start(
 
     fs::write(staging.join(".psht-start-command"), format!("{start}\n"))
         .map_err(|e| format!("failed to write .psht-start-command: {e}"))?;
-    write_deploy_hooks_config(&staging, preinstall, postinstall, apt_packages)?;
+    write_deploy_hooks_config(
+        &staging,
+        preinstall,
+        postinstall,
+        apt_packages,
+        required_env,
+    )?;
     Ok(staging)
 }
 
@@ -322,8 +420,13 @@ fn deploy_binary(
     preinstall: Option<&str>,
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
+    required_env: Option<&[String]>,
 ) -> Result<(), String> {
-    let staging = if preinstall.is_none() && postinstall.is_none() && apt_packages.is_none() {
+    let staging = if preinstall.is_none()
+        && postinstall.is_none()
+        && apt_packages.is_none()
+        && required_env.is_none()
+    {
         stage_binary_dir(binary_path)?
     } else {
         let file_name = binary_path
@@ -336,6 +439,7 @@ fn deploy_binary(
             preinstall,
             postinstall,
             apt_packages,
+            required_env,
         )?
     };
     let result = deploy_from_dir(host, app, &staging, false);
@@ -414,10 +518,22 @@ fn deploy_with_app_or_binary(
     host: &str,
     cwd: &Path,
     value: Option<&str>,
+    default_app: Option<&str>,
     preinstall: Option<&str>,
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
+    required_env: Option<&[String]>,
 ) -> Result<(), String> {
+    let default_app = default_app.map(str::trim).filter(|v| !v.is_empty());
+    if let Some(value) = value
+        && !looks_like_path(value)
+        && let Some(default_app) = default_app
+        && value != default_app
+    {
+        return Err(format!(
+            "app '{value}' does not match `{PROJECT_CONFIG_FILE}` app '{default_app}'"
+        ));
+    }
     if let Some(arg) = value
         && looks_like_path(arg)
     {
@@ -425,7 +541,9 @@ fn deploy_with_app_or_binary(
         if !binary_path.is_file() {
             return Err(format!("binary not found: {}", binary_path.display()));
         }
-        let name = app_name(None, cwd);
+        let name = default_app.map(ToString::to_string).ok_or_else(|| {
+            format!("could not resolve app name from `{PROJECT_CONFIG_FILE}`. Run `psht setup`.")
+        })?;
         app_name::validate_app_name(&name)?;
         eprintln!("-----> Deploying via binary");
         return deploy_binary(
@@ -435,9 +553,16 @@ fn deploy_with_app_or_binary(
             preinstall,
             postinstall,
             apt_packages,
+            required_env,
         );
     }
-    let name = app_name(value, cwd);
+    let name = if let Some(value) = value {
+        value.to_string()
+    } else {
+        default_app.map(ToString::to_string).ok_or_else(|| {
+            format!("could not resolve app name from `{PROJECT_CONFIG_FILE}`. Run `psht setup`.")
+        })?
+    };
     app_name::validate_app_name(&name)?;
     if value.is_none() && is_git_worktree(cwd) {
         eprintln!("-----> Deploying via git");
@@ -605,6 +730,7 @@ fn stage_binary_from_url(
     preinstall: Option<&str>,
     postinstall: Option<&str>,
     apt_packages: Option<&[String]>,
+    required_env: Option<&[String]>,
 ) -> Result<PathBuf, String> {
     let tmp = mktemp_dir("psht-release")?;
     let archive_path = tmp.join("asset");
@@ -616,7 +742,14 @@ fn stage_binary_from_url(
     download_url_to_file(url, &archive_path)?;
     extract_archive(&archive_path, &extract_dir, fmt)?;
     let binary = resolve_binary_from_archive(&extract_dir, bin)?;
-    let staged = stage_binary_dir_with_start(&binary, start, preinstall, postinstall, apt_packages);
+    let staged = stage_binary_dir_with_start(
+        &binary,
+        start,
+        preinstall,
+        postinstall,
+        apt_packages,
+        required_env,
+    );
     let _ = fs::remove_dir_all(&tmp);
     staged
 }
@@ -776,6 +909,7 @@ fn cli_release_settings(
         preinstall: None,
         postinstall: None,
         apt_packages: None,
+        required_env: None,
     }
 }
 
@@ -975,6 +1109,7 @@ fn bootstrap_project_config(
         preinstall: defaults.preinstall.clone(),
         postinstall: defaults.postinstall.clone(),
         apt_packages: defaults.apt_packages.clone(),
+        required_env: defaults.required_env.clone(),
     };
 
     let preview = toml::to_string_pretty(&cfg)
@@ -1019,6 +1154,7 @@ fn deploy_from_release_config(host: &str, cfg: &ProjectConfig) -> Result<(), Str
         cfg.preinstall.as_deref(),
         cfg.postinstall.as_deref(),
         cfg.apt_packages.as_deref(),
+        cfg.required_env.as_deref(),
     )?;
     let result = deploy_from_dir(host, &app, &staging, false);
     let _ = fs::remove_dir_all(&staging);
@@ -1063,14 +1199,22 @@ fn deploy_with_project_config(
                 host,
                 cwd,
                 app,
+                file_cfg.app.as_deref(),
                 file_cfg.preinstall.as_deref(),
                 file_cfg.postinstall.as_deref(),
                 file_cfg.apt_packages.as_deref(),
+                file_cfg.required_env.as_deref(),
             )
         }
         None => {
             if app.is_some() && !has_release_settings(&cli_cfg) {
-                return deploy_with_app_or_binary(host, cwd, app, None, None, None);
+                return deploy_with_app_or_binary(host, cwd, app, None, None, None, None, None);
+            }
+
+            if app.is_none() && !has_release_settings(&cli_cfg) {
+                return Err(format!(
+                    "could not resolve app name from `{PROJECT_CONFIG_FILE}`. Run `psht setup`."
+                ));
             }
 
             let cfg = bootstrap_project_config(&config_path, &cli_cfg)?;
@@ -1089,11 +1233,51 @@ fn save_config(config: &Config, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn setup_project_in(host: &str, cwd: &Path, config_path: &Path) -> Result<(), String> {
-    if is_git_worktree(cwd) {
-        let app = app_name(None, cwd);
-        ensure_psht_git_remote(host, &app, cwd)?;
+fn prompt_setup_app_name(cwd: &Path, project_cfg_path: &Path) -> Result<String, String> {
+    if !is_interactive() {
+        return Err(
+            "setup requires an interactive terminal. Run `psht setup` interactively.".to_string(),
+        );
     }
+
+    let default = load_project_config(project_cfg_path)?
+        .and_then(|cfg| cfg.app)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| app_name(None, cwd));
+    let value = prompt_required("App name", Some(&default))?;
+    app_name::validate_app_name(&value)?;
+    Ok(value)
+}
+
+fn ensure_project_config_app(path: &Path, app: &str) -> Result<(), String> {
+    if !path.exists() {
+        fs::write(path, project_config_template(app))
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        return Ok(());
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let mut root: toml::Value =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    let Some(table) = root.as_table_mut() else {
+        return Err(format!("{} must contain a TOML table", path.display()));
+    };
+    table.insert("app".to_string(), toml::Value::String(app.to_string()));
+    let updated = toml::to_string_pretty(&root)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, updated).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn setup_project_in(host: &str, cwd: &Path, config_path: &Path, app: &str) -> Result<(), String> {
+    if is_git_worktree(cwd) {
+        ensure_psht_git_remote(host, app, cwd)?;
+    }
+
+    let project_cfg_path = project_config_path(cwd);
+    ensure_project_config_app(&project_cfg_path, app)?;
+
     let cwd_str = cwd.to_string_lossy().to_string();
     let mut config = load_config_from(config_path);
     if !config.projects.contains_key(&cwd_str) {
@@ -1147,7 +1331,8 @@ fn run() -> Result<(), String> {
     match cli.command {
         CliCommand::Setup => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            setup_project_in(&host, &cwd, &config_path)
+            let app = prompt_setup_app_name(&cwd, &project_config_path(&cwd))?;
+            setup_project_in(&host, &cwd, &config_path, &app)
         }
         CliCommand::Deploy {
             app,
@@ -1174,7 +1359,7 @@ fn run() -> Result<(), String> {
         }
         CliCommand::Logs { app, follow } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            app_name::validate_app_name(&app)?;
+            let app = resolve_command_app(&cwd, app.as_deref())?;
             if follow {
                 ssh_cmd(&host, &["logs", "-f", &app])
             } else {
@@ -1183,13 +1368,36 @@ fn run() -> Result<(), String> {
         }
         CliCommand::Stop { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            app_name::validate_app_name(&app)?;
+            let app = resolve_command_app(&cwd, app.as_deref())?;
             ssh_cmd(&host, &["stop", &app])
         }
         CliCommand::Destroy { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
-            app_name::validate_app_name(&app)?;
+            let app = resolve_command_app(&cwd, app.as_deref())?;
             ssh_cmd(&host, &["destroy", &app])
+        }
+        CliCommand::Env { assignments } => {
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            let app = resolve_command_app(&cwd, None)?;
+            let mut args = vec!["env".to_string(), app];
+            for assignment in &assignments {
+                parse_env_assignment(assignment)?;
+                args.push(assignment.to_string());
+            }
+            ssh_cmd_owned(&host, &args)
+        }
+        CliCommand::EnvUnset { names } => {
+            if names.is_empty() {
+                return Err("env:unset requires at least one NAME".to_string());
+            }
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            let app = resolve_command_app(&cwd, None)?;
+            let mut args = vec!["env-unset".to_string(), app];
+            for name in &names {
+                let name = parse_env_name(name)?;
+                args.push(name.to_string());
+            }
+            ssh_cmd_owned(&host, &args)
         }
         CliCommand::Update => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
@@ -1240,7 +1448,7 @@ mod tests {
         let path = dir.path().join("psht.toml");
         fs::write(
             &path,
-            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\npreinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\n",
+            "url = \"https://example.com/app.tar.gz\"\nstart = \"./app\"\napp = \"demo\"\npreinstall = \"echo pre\"\npostinstall = \"echo post\"\napt_packages = [\"curl\", \"git\"]\nrequired_env = [\"DATABASE_URL\"]\n",
         )
         .unwrap();
         let cfg = load_project_config(&path).unwrap().unwrap();
@@ -1253,6 +1461,7 @@ mod tests {
             cfg.apt_packages,
             Some(vec!["curl".to_string(), "git".to_string()])
         );
+        assert_eq!(cfg.required_env, Some(vec!["DATABASE_URL".to_string()]));
     }
 
     #[test]
@@ -1267,6 +1476,7 @@ mod tests {
             preinstall: Some("echo pre".to_string()),
             postinstall: Some("echo post".to_string()),
             apt_packages: Some(vec!["curl".to_string(), "git".to_string()]),
+            required_env: Some(vec!["DATABASE_URL".to_string()]),
         };
         save_project_config(&path, &cfg).unwrap();
         let loaded = load_project_config(&path).unwrap().unwrap();
@@ -1348,6 +1558,43 @@ mod tests {
     fn is_cli_probe_command_parses() {
         let cli = Cli::try_parse_from(["psht", "__is-cli"]).expect("probe command should parse");
         assert!(matches!(cli.command, CliCommand::IsCli));
+    }
+
+    #[test]
+    fn env_command_parses_assignments() {
+        let cli = Cli::try_parse_from(["psht", "env", "A=1", "B=two"]).unwrap();
+        match cli.command {
+            CliCommand::Env { assignments } => {
+                assert_eq!(assignments, vec!["A=1".to_string(), "B=two".to_string()]);
+            }
+            _ => panic!("expected env command"),
+        }
+    }
+
+    #[test]
+    fn env_unset_command_parses_names() {
+        let cli = Cli::try_parse_from(["psht", "env:unset", "A", "B"]).unwrap();
+        match cli.command {
+            CliCommand::EnvUnset { names } => {
+                assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
+            }
+            _ => panic!("expected env:unset command"),
+        }
+    }
+
+    #[test]
+    fn resolve_command_app_uses_project_config_when_present() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(PROJECT_CONFIG_FILE), "app = \"demo\"\n").unwrap();
+        let app = resolve_command_app(dir.path(), None).unwrap();
+        assert_eq!(app, "demo");
+    }
+
+    #[test]
+    fn resolve_command_app_errors_without_explicit_or_project_app() {
+        let dir = tempdir().unwrap();
+        let err = resolve_command_app(dir.path(), None).unwrap_err();
+        assert!(err.contains("Run `psht setup`"));
     }
 
     #[test]
@@ -1455,6 +1702,7 @@ mod tests {
             Some("echo pre"),
             Some("echo post"),
             Some(&["curl".to_string(), "git".to_string()]),
+            Some(&["DATABASE_URL".to_string()]),
         )
         .unwrap();
         let marker = fs::read_to_string(staged.join(".psht-start-command")).unwrap();
@@ -1465,6 +1713,8 @@ mod tests {
         assert!(hooks.contains("apt_packages = ["));
         assert!(hooks.contains("\"curl\""));
         assert!(hooks.contains("\"git\""));
+        assert!(hooks.contains("required_env = ["));
+        assert!(hooks.contains("\"DATABASE_URL\""));
         let _ = fs::remove_dir_all(staged);
     }
 
@@ -1474,7 +1724,7 @@ mod tests {
         let bin = tmp.path().join("mybin");
         fs::write(&bin, "#!/bin/sh\necho ok\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        let err = stage_binary_dir_with_start(&bin, "  ", None, None, None).unwrap_err();
+        let err = stage_binary_dir_with_start(&bin, "  ", None, None, None, None).unwrap_err();
         assert!(err.contains("start command is empty"));
     }
 
@@ -1485,12 +1735,31 @@ mod tests {
             "example.com",
             cwd.path(),
             Some("bin/missing"),
+            Some("myapp"),
+            None,
             None,
             None,
             None,
         )
         .unwrap_err();
         assert!(err.contains("binary not found"));
+    }
+
+    #[test]
+    fn deploy_with_explicit_app_rejects_psht_toml_mismatch() {
+        let cwd = tempdir().unwrap();
+        let err = deploy_with_app_or_binary(
+            "example.com",
+            cwd.path(),
+            Some("other"),
+            Some("myapp"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not match"));
     }
 
     #[test]
@@ -1606,6 +1875,7 @@ mod tests {
             preinstall: None,
             postinstall: None,
             apt_packages: None,
+            required_env: None,
         };
         let cli = ProjectConfig {
             url: Some("https://b".to_string()),
@@ -1615,6 +1885,7 @@ mod tests {
             preinstall: None,
             postinstall: None,
             apt_packages: None,
+            required_env: None,
         };
         let err = ensure_no_release_conflicts(&file, &cli).unwrap_err();
         assert!(err.contains("start"));
@@ -1721,7 +1992,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         fs::write(&config_path, "host = \"myhost\"\n").unwrap();
 
-        setup_project_in("myhost", dir.path(), &config_path).unwrap();
+        setup_project_in("myhost", dir.path(), &config_path, "myapp").unwrap();
 
         let output = Command::new("git")
             .args(["remote", "get-url", "psht"])
@@ -1729,10 +2000,7 @@ mod tests {
             .output()
             .unwrap();
         let url = String::from_utf8(output.stdout).unwrap();
-        let expected = format!(
-            "psht@myhost:{}",
-            dir.path().file_name().unwrap().to_string_lossy()
-        );
+        let expected = "psht@myhost:myapp";
         assert_eq!(url.trim(), expected);
     }
 
@@ -1749,8 +2017,8 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         fs::write(&config_path, "host = \"myhost\"\n").unwrap();
 
-        setup_project_in("myhost", dir.path(), &config_path).unwrap();
-        setup_project_in("myhost", dir.path(), &config_path).unwrap();
+        setup_project_in("myhost", dir.path(), &config_path, "myapp").unwrap();
+        setup_project_in("myhost", dir.path(), &config_path, "myapp").unwrap();
 
         let output = Command::new("git")
             .args(["remote", "get-url", "psht"])
@@ -1773,7 +2041,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         fs::write(&config_path, "host = \"myhost\"\n").unwrap();
 
-        setup_project_in("myhost", dir.path(), &config_path).unwrap();
+        setup_project_in("myhost", dir.path(), &config_path, "myapp").unwrap();
 
         let config = load_config_from(&config_path);
         assert!(
@@ -1792,7 +2060,7 @@ mod tests {
         let project_dir = dir.path().join("myproject");
         fs::create_dir(&project_dir).unwrap();
 
-        setup_project_in("myhost", &project_dir, &config_path).unwrap();
+        setup_project_in("myhost", &project_dir, &config_path, "myproject").unwrap();
 
         let config = load_config_from(&config_path);
         assert_eq!(
@@ -1802,6 +2070,22 @@ mod tests {
                 .map(|s| s.as_str()),
             Some("myhost")
         );
+    }
+
+    #[test]
+    fn setup_writes_psht_toml_template() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "host = \"myhost\"\n").unwrap();
+        let project_dir = dir.path().join("myproject");
+        fs::create_dir(&project_dir).unwrap();
+
+        setup_project_in("myhost", &project_dir, &config_path, "myproject").unwrap();
+
+        let psht = fs::read_to_string(project_dir.join(PROJECT_CONFIG_FILE)).unwrap();
+        assert!(psht.contains("app = \"myproject\""));
+        assert!(psht.contains("# url ="));
+        assert!(psht.contains("# required_env ="));
     }
 
     #[test]
@@ -1816,7 +2100,7 @@ mod tests {
         );
         fs::write(&config_path, &initial).unwrap();
 
-        setup_project_in("myhost", &project_dir, &config_path).unwrap();
+        setup_project_in("myhost", &project_dir, &config_path, "myproject").unwrap();
 
         let content = fs::read_to_string(&config_path).unwrap();
         assert_eq!(content, initial, "config should not be rewritten");

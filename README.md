@@ -9,7 +9,9 @@
 
 - Deploy from your app directory with one command.
 - Basic app lifecycle commands (`ps`, `logs`, `stop`, `destroy`).
+- App environment management (`env`, `env:unset`) persisted across deploys/rebuilds.
 - Host bootstrap, health checks, and upgrades.
+- Per-app persistent storage mounted at `/storage` (survives deploys/rebuilds, removed by `destroy`).
 
 ## Quickstart
 
@@ -50,4 +52,13 @@ bin = "my-app" # optional path inside archive when needed
 preinstall = "echo preparing deploy" # optional, runs before dependency install
 postinstall = "npm run migrate" # optional, runs after dependency install and before start
 apt_packages = ["libvips", "ffmpeg"] # optional, apt packages installed in container on deploy
+required_env = ["DATABASE_URL", "JWT_SECRET"] # optional, deploy/start fail if these vars are missing
+```
+
+Set project env vars:
+
+```sh
+psht env DATABASE_URL=postgres://... JWT_SECRET=...
+psht env
+psht env:unset JWT_SECRET
 ```

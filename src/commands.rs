@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -27,6 +27,7 @@ const STACKS: &[(&str, &str)] = &[
 
 const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
 const START_COMMAND_PATH: &str = "/etc/psht-start-command";
+const REQUIRED_ENV_PATH: &str = "/etc/psht-required-env";
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -34,6 +35,18 @@ fn home_dir() -> PathBuf {
 
 fn builds_dir() -> PathBuf {
     home_dir().join("builds")
+}
+
+fn env_dir() -> PathBuf {
+    home_dir().join(".psht").join("env")
+}
+
+fn env_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.toml"))
+}
+
+fn env_path(app: &str) -> PathBuf {
+    env_path_in(&env_dir(), app)
 }
 
 fn repos_dir() -> PathBuf {
@@ -121,6 +134,164 @@ fn clear_binary_hash(app: &str) -> Result<(), String> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
     }
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn parse_env_assignment(raw: &str) -> Result<(String, String), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid env assignment '{raw}'; expected NAME=value"))?;
+    if !is_valid_env_name(name) {
+        return Err(format!("invalid env name '{name}'"));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
+fn parse_env_name(raw: &str) -> Result<String, String> {
+    if !is_valid_env_name(raw) {
+        return Err(format!("invalid env name '{raw}'"));
+    }
+    Ok(raw.to_string())
+}
+
+fn read_env_vars_from(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+
+    let raw: BTreeMap<String, String> =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    let mut vars = BTreeMap::new();
+    for (name, value) in raw {
+        if !is_valid_env_name(&name) {
+            return Err(format!("invalid env name '{}' in {}", name, path.display()));
+        }
+        vars.insert(name, value);
+    }
+    Ok(vars)
+}
+
+fn read_env_vars(app: &str) -> Result<BTreeMap<String, String>, String> {
+    read_env_vars_from(&env_path(app))
+}
+
+fn write_env_vars_to(path: &Path, vars: &BTreeMap<String, String>) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(vars)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn write_env_vars(app: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
+    write_env_vars_to(&env_path(app), vars)
+}
+
+fn remove_env_vars(app: &str) -> Result<(), String> {
+    let path = env_path(app);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn parse_required_env_metadata(contents: &str) -> Result<Vec<String>, String> {
+    let mut required = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !is_valid_env_name(trimmed) {
+            return Err(format!(
+                "invalid required env name '{trimmed}' in {REQUIRED_ENV_PATH}"
+            ));
+        }
+        if required.iter().any(|name| name == trimmed) {
+            continue;
+        }
+        required.push(trimmed.to_string());
+    }
+    Ok(required)
+}
+
+fn read_required_env(app: &str) -> Result<Vec<String>, String> {
+    let raw = container::exec_output(app, &format!("cat {REQUIRED_ENV_PATH} 2>/dev/null || true"))?;
+    parse_required_env_metadata(&raw)
+}
+
+fn write_required_env_cmd(required_env: &[String]) -> Result<String, String> {
+    let mut names = Vec::new();
+    for name in required_env {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !is_valid_env_name(trimmed) {
+            return Err(format!("invalid required env name '{trimmed}'"));
+        }
+        if names.iter().any(|v| v == trimmed) {
+            continue;
+        }
+        names.push(trimmed.to_string());
+    }
+    let content = if names.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", names.join("\n"))
+    };
+    let escaped = shell_quote(&content);
+    Ok(format!(
+        "mkdir -p /etc && printf '%s' {escaped} > {REQUIRED_ENV_PATH}"
+    ))
+}
+
+fn persist_required_env(app: &str, required_env: &[String]) -> Result<(), String> {
+    let cmd = write_required_env_cmd(required_env)?;
+    container::exec_cmd(app, &cmd)
+}
+
+fn ensure_required_env_present(
+    required_env: &[String],
+    vars: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut missing = Vec::new();
+    for name in required_env {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !is_valid_env_name(trimmed) {
+            return Err(format!("invalid required env name '{trimmed}'"));
+        }
+        if !vars.contains_key(trimmed) {
+            missing.push(trimmed.to_string());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    missing.sort();
+    Err(format!(
+        "missing required env vars: {}. Set them with `psht env NAME=value`.",
+        missing.join(", ")
+    ))
 }
 
 fn binary_payload_hash(code_dir: &Path) -> Result<Option<String>, String> {
@@ -419,6 +590,44 @@ fn default_storage_pool() -> Result<String, String> {
     // Fresh Incus installs may have no storage configured yet.
     run_cmd("incus", &["storage", "create", "default", "dir"])?;
     Ok("default".to_string())
+}
+
+fn app_storage_volume_name(app: &str) -> String {
+    format!("psht-storage-{app}")
+}
+
+fn ensure_app_storage_volume(app: &str) -> Result<(String, String), String> {
+    let pool = default_storage_pool()?;
+    let volume = app_storage_volume_name(app);
+    let show_args = vec!["storage", "volume", "show", pool.as_str(), volume.as_str()];
+    if !command_succeeds("incus", &show_args) {
+        let create_args = vec![
+            "storage",
+            "volume",
+            "create",
+            pool.as_str(),
+            volume.as_str(),
+        ];
+        run_cmd("incus", &create_args)?;
+    }
+    Ok((pool, volume))
+}
+
+fn delete_app_storage_volume(app: &str) -> Result<(), String> {
+    let pool = default_storage_pool()?;
+    let volume = app_storage_volume_name(app);
+    let show_args = vec!["storage", "volume", "show", pool.as_str(), volume.as_str()];
+    if !command_succeeds("incus", &show_args) {
+        return Ok(());
+    }
+    let delete_args = vec![
+        "storage",
+        "volume",
+        "delete",
+        pool.as_str(),
+        volume.as_str(),
+    ];
+    run_cmd("incus", &delete_args)
 }
 
 fn first_managed_network_name() -> Result<Option<String>, String> {
@@ -1026,11 +1235,23 @@ fn allocate_port(app: &str) -> u16 {
     3001 + (hash % 1000) as u16
 }
 
-fn start_cmd(port: u16, cmd: &str) -> String {
+fn start_exports(port: u16, vars: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut parts = vec![format!("export PORT={port}")];
+    for (name, value) in vars {
+        if !is_valid_env_name(name) {
+            return Err(format!("invalid env name '{name}'"));
+        }
+        parts.push(format!("export {name}={}", shell_quote(value)));
+    }
+    Ok(parts.join(" && "))
+}
+
+fn start_cmd(port: u16, cmd: &str, vars: &BTreeMap<String, String>) -> Result<String, String> {
     let escaped = shell_quote(cmd);
-    format!(
-        "mkdir -p /var/psht && cd /app && export PORT={port} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > /var/psht/app.pid; }}"
-    )
+    let exports = start_exports(port, vars)?;
+    Ok(format!(
+        "mkdir -p /var/psht && cd /app && {exports} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > /var/psht/app.pid; }}"
+    ))
 }
 
 fn shell_quote(s: &str) -> String {
@@ -1157,6 +1378,8 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
     eprintln!("       Detected: {:?}", config.app_type);
+    let app_env = read_env_vars(app)?;
+    ensure_required_env_present(&config.required_env, &app_env)?;
     let binary_hash = if matches!(config.app_type, detect::AppType::Binary) {
         binary_payload_hash(code_dir)?
     } else {
@@ -1227,10 +1450,14 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
         container::add_proxy(app, port, port)?;
     }
 
+    let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
+    container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
+
     eprintln!("-----> Pushing code to container");
     container::push_code(app, &code_dir.to_string_lossy())?;
     install_apt_packages(app, &config.apt_packages)?;
     persist_start_command(app, &config.start_command)?;
+    persist_required_env(app, &config.required_env)?;
     run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
 
     if !config.install_command.is_empty() {
@@ -1242,7 +1469,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
-    let start_cmd = start_cmd(port, &config.start_command);
+    let start_cmd = start_cmd(port, &config.start_command, &app_env)?;
     container::exec_cmd(app, &start_cmd)?;
 
     tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
@@ -1269,6 +1496,116 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     }
 
     eprintln!("=====> App {app} deployed on port {port} (build {build_number})");
+    Ok(())
+}
+
+fn app_is_running(app: &str) -> Result<bool, String> {
+    if !container::exists(app) {
+        return Ok(false);
+    }
+    container::is_running(app)
+}
+
+fn restart_app_process(app: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
+    let required_env = read_required_env(app)?;
+    ensure_required_env_present(&required_env, vars)?;
+    let start = read_start_command(app)?;
+    container::exec_cmd(
+        app,
+        "kill $(cat /var/psht/app.pid 2>/dev/null) 2>/dev/null || true",
+    )?;
+    let port = allocate_port(app);
+    let command = start_cmd(port, &start, vars)?;
+    container::exec_cmd(app, &command)?;
+    if tailscale::dns_name_in_container(app).is_some()
+        && let Err(e) = tailscale::expose_http_in_container(app, port)
+    {
+        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+    }
+    Ok(())
+}
+
+pub fn env_command(app: &str, assignments: &[String]) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    let mut vars = read_env_vars(app)?;
+
+    if assignments.is_empty() {
+        if vars.is_empty() {
+            println!("No environment variables configured for {app}.");
+            return Ok(());
+        }
+        for (name, value) in &vars {
+            println!("{name}={value}");
+        }
+        return Ok(());
+    }
+
+    for assignment in assignments {
+        let (name, value) = parse_env_assignment(assignment)?;
+        vars.insert(name, value);
+    }
+
+    let running = app_is_running(app)?;
+    if running {
+        let required_env = read_required_env(app)?;
+        ensure_required_env_present(&required_env, &vars)?;
+    }
+
+    write_env_vars(app, &vars)?;
+    eprintln!("-----> Saved {} env var(s) for {app}", assignments.len());
+
+    if running {
+        eprintln!("-----> Restarting {app} to apply environment changes");
+        restart_app_process(app, &vars)?;
+        eprintln!("=====> {app} restarted");
+    } else {
+        eprintln!("       {app} is not running; changes will apply on next start/deploy");
+    }
+
+    Ok(())
+}
+
+pub fn env_unset(app: &str, names: &[String]) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    if names.is_empty() {
+        return Err("env-unset requires at least one NAME".to_string());
+    }
+
+    let mut vars = read_env_vars(app)?;
+    let mut parsed_names = Vec::new();
+    for name in names {
+        let parsed = parse_env_name(name)?;
+        if parsed_names.iter().any(|v| v == &parsed) {
+            continue;
+        }
+        parsed_names.push(parsed);
+    }
+
+    for name in &parsed_names {
+        vars.remove(name);
+    }
+
+    let running = app_is_running(app)?;
+    if running {
+        let required_env = read_required_env(app)?;
+        ensure_required_env_present(&required_env, &vars)?;
+    }
+
+    if vars.is_empty() {
+        remove_env_vars(app)?;
+    } else {
+        write_env_vars(app, &vars)?;
+    }
+    eprintln!("-----> Unset {} env var(s) for {app}", parsed_names.len());
+
+    if running {
+        eprintln!("-----> Restarting {app} to apply environment changes");
+        restart_app_process(app, &vars)?;
+        eprintln!("=====> {app} restarted");
+    } else {
+        eprintln!("       {app} is not running; changes will apply on next start/deploy");
+    }
+
     Ok(())
 }
 
@@ -2061,9 +2398,13 @@ pub fn start(app: &str) -> Result<(), String> {
     }
     eprintln!("-----> Starting {app}");
     container::start(app)?;
+    let vars = read_env_vars(app)?;
+    let required_env = read_required_env(app)?;
+    ensure_required_env_present(&required_env, &vars)?;
     let command = read_start_command(app)?;
     let port = allocate_port(app);
-    container::exec_cmd(app, &start_cmd(port, &command))?;
+    let launch = start_cmd(port, &command, &vars)?;
+    container::exec_cmd(app, &launch)?;
     if tailscale::dns_name_in_container(app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(app, port)
     {
@@ -2080,8 +2421,15 @@ pub fn destroy(app: &str) -> Result<(), String> {
     }
     eprintln!("-----> Destroying {app}");
     caddy::remove(app)?;
+    if let Err(e) = container::remove_storage_mount(app) {
+        eprintln!("       Warning: failed to remove /storage mount before destroy: {e}");
+    }
     container::stop(app)?;
     container::delete(app)?;
+    delete_app_storage_volume(app)?;
+    if let Err(e) = remove_env_vars(app) {
+        eprintln!("       Warning: failed to remove env vars: {e}");
+    }
     eprintln!("=====> {app} destroyed");
     Ok(())
 }
@@ -2648,6 +2996,12 @@ devices:
     type: disk
 "#;
         assert!(!profile_has_nic(profile));
+    }
+
+    #[test]
+    fn app_storage_volume_name_formats_correctly() {
+        assert_eq!(app_storage_volume_name("myapp"), "psht-storage-myapp");
+        assert_eq!(app_storage_volume_name("my-app"), "psht-storage-my-app");
     }
 
     #[test]
@@ -3292,6 +3646,8 @@ devices:
             stop("bad/name"),
             start("bad/name"),
             destroy("bad/name"),
+            env_command("bad/name", &[]),
+            env_unset("bad/name", &[String::from("A")]),
         ] {
             let err = result.expect_err("should reject invalid app name");
             assert!(err.contains("invalid app name"), "unexpected error: {err}");
@@ -3303,11 +3659,50 @@ devices:
         // The start command must use { } grouping so launch + PID capture are
         // synchronous, while the app process is detached in a separate session.
         // and echo writes the pid synchronously before the group exits.
-        let cmd = start_cmd(3737, "bun run index.ts");
-        assert!(cmd.starts_with("mkdir -p /var/psht && cd /app && export PORT=3737 && {"));
+        let mut vars = BTreeMap::new();
+        vars.insert("HELLO".to_string(), "world".to_string());
+        let cmd = start_cmd(3737, "bun run index.ts", &vars).unwrap();
+        assert!(cmd.starts_with(
+            "mkdir -p /var/psht && cd /app && export PORT=3737 && export HELLO='world' && {"
+        ));
         assert!(cmd.contains("export PORT=3737 &&"));
+        assert!(cmd.contains("export HELLO='world' &&"));
         assert!(cmd.contains("setsid sh -c 'bun run index.ts'"));
         assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
+    }
+
+    #[test]
+    fn parse_env_assignment_accepts_empty_value() {
+        let (name, value) = parse_env_assignment("A=").unwrap();
+        assert_eq!(name, "A");
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn parse_env_assignment_rejects_invalid_name() {
+        let err = parse_env_assignment("1BAD=value").unwrap_err();
+        assert!(err.contains("invalid env name"));
+    }
+
+    #[test]
+    fn env_vars_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = env_path_in(tmp.path(), "myapp");
+        let mut vars = BTreeMap::new();
+        vars.insert("A".to_string(), "1".to_string());
+        vars.insert("B".to_string(), "2".to_string());
+        write_env_vars_to(&path, &vars).unwrap();
+        let loaded = read_env_vars_from(&path).unwrap();
+        assert_eq!(loaded, vars);
+    }
+
+    #[test]
+    fn required_env_check_reports_missing() {
+        let required = vec!["DATABASE_URL".to_string(), "JWT_SECRET".to_string()];
+        let mut vars = BTreeMap::new();
+        vars.insert("DATABASE_URL".to_string(), "postgres://x".to_string());
+        let err = ensure_required_env_present(&required, &vars).unwrap_err();
+        assert!(err.contains("JWT_SECRET"));
     }
 
     #[test]

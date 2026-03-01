@@ -66,6 +66,13 @@ enum Command {
     GitReceivePack { app: String },
     #[command(name = "git-upload-pack", hide = true)]
     GitUploadPack { app: String },
+    #[command(hide = true)]
+    Env {
+        app: String,
+        assignments: Vec<String>,
+    },
+    #[command(name = "env-unset", hide = true)]
+    EnvUnset { app: String, names: Vec<String> },
 }
 
 fn strip_git_suffix(name: &str) -> String {
@@ -121,6 +128,14 @@ fn run() -> Result<(), String> {
         Command::Push { app } => {
             app_name::validate_app_name(&app)?;
             commands::push(&app)
+        }
+        Command::Env { app, assignments } => {
+            app_name::validate_app_name(&app)?;
+            commands::env_command(&app, &assignments)
+        }
+        Command::EnvUnset { app, names } => {
+            app_name::validate_app_name(&app)?;
+            commands::env_unset(&app, &names)
         }
         Command::Ps => commands::ps(),
         Command::Logs { app, follow } => {
@@ -285,6 +300,30 @@ mod tests {
             cli.command,
             Command::Push {
                 app: "myapp".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_env() {
+        let cli = parse_cli(&["psht-server", "env", "myapp", "A=1", "B=two"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Env {
+                app: "myapp".to_string(),
+                assignments: vec!["A=1".to_string(), "B=two".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_env_unset() {
+        let cli = parse_cli(&["psht-server", "env-unset", "myapp", "A", "B"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::EnvUnset {
+                app: "myapp".to_string(),
+                names: vec!["A".to_string(), "B".to_string()],
             }
         );
     }
