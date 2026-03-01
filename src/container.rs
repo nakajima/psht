@@ -306,12 +306,16 @@ pub fn remove_storage_mount(app: &str) -> Result<(), String> {
     ))
 }
 
-pub fn create(app: &str) -> Result<(), String> {
+fn create_with_project(app: &str, project: Option<&str>) -> Result<(), String> {
     let name = container_name(app);
-    let mut child = Command::new("incus")
+    let mut command = Command::new("incus");
+    if let Some(project) = project {
+        command.arg("--project").arg(project);
+    }
+    let mut child = command
         .args(["launch", "images:ubuntu/24.04"])
         .arg(&name)
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -335,9 +339,12 @@ pub fn create(app: &str) -> Result<(), String> {
         if elapsed >= CONTAINER_CREATE_TIMEOUT_SECS {
             let _ = child.kill();
             let _ = child.wait();
+            let project_hint = project
+                .map(|p| format!("--project {p} "))
+                .unwrap_or_default();
             return Err(format!(
-                "incus launch timed out after {}s while creating '{name}'. Check image reachability with: sudo -u psht incus image info images:ubuntu/24.04",
-                CONTAINER_CREATE_TIMEOUT_SECS
+                "incus launch timed out after {}s while creating '{name}'. Repro: sudo -u psht incus {}launch images:ubuntu/24.04 {}",
+                CONTAINER_CREATE_TIMEOUT_SECS, project_hint, name
             ));
         }
 
@@ -348,6 +355,15 @@ pub fn create(app: &str) -> Result<(), String> {
 
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+#[allow(dead_code)]
+pub fn create(app: &str) -> Result<(), String> {
+    create_with_project(app, None)
+}
+
+pub fn create_in_project(app: &str, project: &str) -> Result<(), String> {
+    create_with_project(app, Some(project))
 }
 
 pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
@@ -470,6 +486,7 @@ fn stack_image_alias(stack: &str, hash: &str) -> String {
     format!("psht-stack-{stack}-{hash}")
 }
 
+#[allow(dead_code)]
 pub fn image_exists(stack: &str, hash: &str) -> bool {
     let alias = stack_image_alias(stack, hash);
     incus()
@@ -481,6 +498,20 @@ pub fn image_exists(stack: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn image_exists_in_project(stack: &str, hash: &str, project: &str) -> bool {
+    let alias = stack_image_alias(stack, hash);
+    incus()
+        .arg("--project")
+        .arg(project)
+        .args(&["image", "info"])
+        .arg(alias)
+        .build()
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)]
 pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
     incus()
@@ -490,6 +521,23 @@ pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), Strin
         .run()
 }
 
+pub fn create_from_image_in_project(
+    app: &str,
+    stack: &str,
+    hash: &str,
+    project: &str,
+) -> Result<(), String> {
+    let alias = stack_image_alias(stack, hash);
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("launch")
+        .arg(alias)
+        .arg(container_name(app))
+        .run()
+}
+
+#[allow(dead_code)]
 pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
     let name = container_name(app);
@@ -501,6 +549,36 @@ pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
         .arg(alias)
         .run()?;
     incus().arg("start").arg(&name).run()
+}
+
+pub fn publish_image_in_project(
+    app: &str,
+    stack: &str,
+    hash: &str,
+    project: &str,
+) -> Result<(), String> {
+    let alias = stack_image_alias(stack, hash);
+    let name = container_name(app);
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("stop")
+        .arg(&name)
+        .run()?;
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("publish")
+        .arg(&name)
+        .arg("--alias")
+        .arg(alias)
+        .run()?;
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("start")
+        .arg(&name)
+        .run()
 }
 
 pub fn exists(app: &str) -> bool {
@@ -538,9 +616,20 @@ fn has_running_operation_in(operations_json: &str, container_name: &str) -> Resu
     Ok(false)
 }
 
+#[allow(dead_code)]
 pub fn has_running_operation(app: &str) -> Result<bool, String> {
     let name = container_name(app);
     let operations = incus()
+        .args(&["operation", "list", "--format=json"])
+        .output()?;
+    has_running_operation_in(&operations, &name)
+}
+
+pub fn has_running_operation_in_project(app: &str, project: &str) -> Result<bool, String> {
+    let name = container_name(app);
+    let operations = incus()
+        .arg("--project")
+        .arg(project)
         .args(&["operation", "list", "--format=json"])
         .output()?;
     has_running_operation_in(&operations, &name)

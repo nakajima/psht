@@ -1597,10 +1597,10 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
         .map_err(|e| format!("apt package install failed: {e}"))
 }
 
-fn wait_for_container_operation_quiet(app: &str) -> Result<(), String> {
+fn wait_for_container_operation_quiet(app: &str, project: &str) -> Result<(), String> {
     let mut announced_wait = false;
     for _ in 0..CONTAINER_OP_WAIT_CHECKS {
-        if !container::has_running_operation(app)? {
+        if !container::has_running_operation_in_project(app, project)? {
             if announced_wait {
                 eprintln!("       Active operation finished");
             }
@@ -1617,8 +1617,20 @@ fn wait_for_container_operation_quiet(app: &str) -> Result<(), String> {
     ))
 }
 
-fn cleanup_container_for_rebuild(app: &str) -> Result<(), String> {
-    wait_for_container_operation_quiet(app)?;
+fn ensure_create_prereqs(project: &str) -> Result<(), String> {
+    run_cmd_capture(
+        "incus",
+        &["--project", project, "profile", "show", "default"],
+    )?;
+    run_cmd_capture(
+        "incus",
+        &["--project", project, "image", "info", "images:ubuntu/24.04"],
+    )?;
+    Ok(())
+}
+
+fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String> {
+    wait_for_container_operation_quiet(app, project)?;
 
     if !container::exists(app) {
         return Ok(());
@@ -1737,7 +1749,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             false
         } else {
             eprintln!("-----> Rebuilding container");
-            cleanup_container_for_rebuild(app)?;
+            cleanup_container_for_rebuild(app, &current_project)?;
             true
         }
     } else {
@@ -1745,18 +1757,19 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     };
 
     if needs_setup {
-        wait_for_container_operation_quiet(app)?;
+        wait_for_container_operation_quiet(app, &current_project)?;
 
-        if container::image_exists(&stack, &hash) {
+        if container::image_exists_in_project(&stack, &hash, &current_project) {
             eprintln!("-----> Creating container from cached image");
-            container::create_from_image(app, &stack, &hash)?;
+            container::create_from_image_in_project(app, &stack, &hash, &current_project)?;
 
             eprintln!("-----> Installing tailscale");
             tailscale::install_in_container(app)?;
         } else {
             eprintln!("-----> Creating container");
             eprintln!("       First run may take a while while Ubuntu image downloads");
-            container::create(app)?;
+            ensure_create_prereqs(&current_project)?;
+            container::create_in_project(app, &current_project)?;
 
             eprintln!("-----> Installing tailscale");
             tailscale::install_in_container(app)?;
@@ -1766,7 +1779,9 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             container::exec_cmd_rolling(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh", 5)?;
 
             eprintln!("-----> Caching stack image");
-            if let Err(e) = container::publish_image(app, &stack, &hash) {
+            if let Err(e) =
+                container::publish_image_in_project(app, &stack, &hash, &current_project)
+            {
                 eprintln!("       Warning: failed to cache stack image: {e}");
             }
         }
