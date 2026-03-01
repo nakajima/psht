@@ -941,6 +941,35 @@ fn integration_start_launches_app_process_from_metadata() {
 }
 
 #[test]
+fn integration_start_is_noop_when_app_process_already_running() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-start-noop");
+    let _guard = ContainerGuard::new(&app).expect("create container failed");
+    wait_for_container_network(&app).expect("container network not ready");
+
+    container::exec_cmd(
+        &app,
+        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'while true; do sleep 60; done' > /app/run.sh && chmod 755 /app/run.sh",
+    )
+    .expect("failed to prepare app script");
+    container::exec_cmd(&app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
+        .expect("failed to write start metadata");
+    container::stop(&app).expect("failed to stop container before start test");
+
+    commands::start(&app).expect("first commands::start failed");
+    let first_pid = exec_output(&app, "cat /var/psht/app.pid").expect("failed to read first pid");
+
+    commands::start(&app).expect("second commands::start failed");
+    let second_pid = exec_output(&app, "cat /var/psht/app.pid").expect("failed to read second pid");
+
+    assert_eq!(
+        second_pid.trim(),
+        first_pid.trim(),
+        "start should no-op when app process is already running"
+    );
+}
+
+#[test]
 fn integration_storage_persists_across_container_rebuild() {
     let _serial = integration_test_lock();
     let app = unique_name("inttest-storage-persist");

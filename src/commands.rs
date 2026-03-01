@@ -28,6 +28,11 @@ const STACKS: &[(&str, &str)] = &[
 const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
 const START_COMMAND_PATH: &str = "/etc/psht-start-command";
 const REQUIRED_ENV_PATH: &str = "/etc/psht-required-env";
+const APP_PROCESS_PID_PATH: &str = "/var/psht/app.pid";
+const APP_PROCESS_POLL_SLEEP: &str = "0.2";
+const APP_PROCESS_STOP_TERM_CHECKS: u32 = 40;
+const APP_PROCESS_STOP_KILL_CHECKS: u32 = 10;
+const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -1250,7 +1255,78 @@ fn start_cmd(port: u16, cmd: &str, vars: &BTreeMap<String, String>) -> Result<St
     let escaped = shell_quote(cmd);
     let exports = start_exports(port, vars)?;
     Ok(format!(
-        "mkdir -p /var/psht && cd /app && {exports} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > /var/psht/app.pid; }}"
+        "mkdir -p /var/psht && cd /app && {exports} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > {APP_PROCESS_PID_PATH}; }}"
+    ))
+}
+
+fn app_process_probe_cmd() -> String {
+    format!("test -s {APP_PROCESS_PID_PATH} && kill -0 $(cat {APP_PROCESS_PID_PATH}) 2>/dev/null")
+}
+
+fn app_process_is_running(app: &str) -> Result<bool, String> {
+    let probe = app_process_probe_cmd();
+    let output = container::exec_output(app, &format!("if {probe}; then echo alive; fi; true"))?;
+    Ok(output.trim() == "alive")
+}
+
+fn stop_app_process_cmd_with_limits(
+    term_checks: u32,
+    kill_checks: u32,
+    poll_sleep: &str,
+) -> String {
+    format!(
+        r#"if [ ! -s {APP_PROCESS_PID_PATH} ]; then rm -f {APP_PROCESS_PID_PATH}; exit 0; fi
+pid="$(cat {APP_PROCESS_PID_PATH} 2>/dev/null | tr -d '[:space:]')"
+case "$pid" in
+  ''|*[!0-9]*) rm -f {APP_PROCESS_PID_PATH}; exit 0 ;;
+esac
+kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+i=0
+while kill -0 "$pid" 2>/dev/null; do
+  i=$((i + 1))
+  if [ "$i" -ge {term_checks} ]; then
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    break
+  fi
+  sleep {poll_sleep}
+done
+j=0
+while kill -0 "$pid" 2>/dev/null; do
+  j=$((j + 1))
+  if [ "$j" -ge {kill_checks} ]; then
+    echo "app process $pid did not exit after SIGTERM+SIGKILL" >&2
+    exit 1
+  fi
+  sleep {poll_sleep}
+done
+rm -f {APP_PROCESS_PID_PATH}"#
+    )
+}
+
+fn stop_app_process_cmd() -> String {
+    stop_app_process_cmd_with_limits(
+        APP_PROCESS_STOP_TERM_CHECKS,
+        APP_PROCESS_STOP_KILL_CHECKS,
+        APP_PROCESS_POLL_SLEEP,
+    )
+}
+
+fn stop_app_process(app: &str) -> Result<(), String> {
+    container::exec_cmd(app, &stop_app_process_cmd())
+}
+
+fn launch_app_process(app: &str, cmd: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
+    let port = allocate_port(app);
+    let launch = start_cmd(port, cmd, vars)?;
+    container::exec_cmd(app, &launch)?;
+    for _ in 0..APP_PROCESS_START_WAIT_CHECKS {
+        if app_process_is_running(app)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(format!(
+        "app process failed to stay up after launch; check logs with: psht logs {app}"
     ))
 }
 
@@ -1405,10 +1481,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             .to_string();
         if remote_hash == hash {
             eprintln!("-----> Reusing container");
-            container::exec_cmd(
-                app,
-                "kill $(cat /var/psht/app.pid 2>/dev/null) 2>/dev/null || true",
-            )?;
+            stop_app_process(app)?;
             false
         } else {
             eprintln!("-----> Rebuilding container");
@@ -1473,8 +1546,7 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let port = allocate_port(app);
     eprintln!("-----> Starting app");
-    let start_cmd = start_cmd(port, &config.start_command, &app_env)?;
-    container::exec_cmd(app, &start_cmd)?;
+    launch_app_process(app, &config.start_command, &app_env)?;
 
     tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
     if tailnet_hostname.is_some() {
@@ -1514,13 +1586,9 @@ fn restart_app_process(app: &str, vars: &BTreeMap<String, String>) -> Result<(),
     let required_env = read_required_env(app)?;
     ensure_required_env_present(&required_env, vars)?;
     let start = read_start_command(app)?;
-    container::exec_cmd(
-        app,
-        "kill $(cat /var/psht/app.pid 2>/dev/null) 2>/dev/null || true",
-    )?;
+    stop_app_process(app)?;
     let port = allocate_port(app);
-    let command = start_cmd(port, &start, vars)?;
-    container::exec_cmd(app, &command)?;
+    launch_app_process(app, &start, vars)?;
     if tailscale::dns_name_in_container(app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(app, port)
     {
@@ -2401,14 +2469,20 @@ pub fn start(app: &str) -> Result<(), String> {
         return Err(format!("app '{app}' not found"));
     }
     eprintln!("-----> Starting {app}");
-    container::start(app)?;
+    if !container::is_running(app)? {
+        container::start(app)?;
+    }
+    if app_process_is_running(app)? {
+        eprintln!("       {app} is already running; skipping launch");
+        eprintln!("=====> {app} started");
+        return Ok(());
+    }
     let vars = read_env_vars(app)?;
     let required_env = read_required_env(app)?;
     ensure_required_env_present(&required_env, &vars)?;
     let command = read_start_command(app)?;
     let port = allocate_port(app);
-    let launch = start_cmd(port, &command, &vars)?;
-    container::exec_cmd(app, &launch)?;
+    launch_app_process(app, &command, &vars)?;
     if tailscale::dns_name_in_container(app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(app, port)
     {
@@ -3672,7 +3746,25 @@ devices:
         assert!(cmd.contains("export PORT=3737 &&"));
         assert!(cmd.contains("export HELLO='world' &&"));
         assert!(cmd.contains("setsid sh -c 'bun run index.ts'"));
-        assert!(cmd.ends_with("& echo $! > /var/psht/app.pid; }"));
+        assert!(cmd.ends_with(&format!("& echo $! > {APP_PROCESS_PID_PATH}; }}")));
+    }
+
+    #[test]
+    fn app_process_probe_checks_pid_liveness() {
+        let cmd = app_process_probe_cmd();
+        assert!(cmd.contains(APP_PROCESS_PID_PATH));
+        assert!(cmd.contains("kill -0"));
+    }
+
+    #[test]
+    fn stop_app_process_cmd_targets_process_group_and_waits() {
+        let cmd = stop_app_process_cmd_with_limits(40, 10, "0.2");
+        assert!(cmd.contains("kill -TERM -- \"-$pid\""));
+        assert!(cmd.contains("kill -KILL -- \"-$pid\""));
+        assert!(cmd.contains("while kill -0 \"$pid\" 2>/dev/null; do"));
+        assert!(cmd.contains("if [ \"$i\" -ge 40 ]"));
+        assert!(cmd.contains("if [ \"$j\" -ge 10 ]"));
+        assert!(cmd.contains("rm -f /var/psht/app.pid"));
     }
 
     #[test]
