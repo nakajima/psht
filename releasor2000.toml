@@ -28,8 +28,8 @@ enabled = true
 # tap = "owner/homebrew-tap"
 # formula_name = "psht"
 
-[channels.cargo]
-crate-name = "psht"
+# [channels.cargo]
+# crate-name = "psht"
 
 # [channels.nix]
 # flake_repo = "owner/nix-repo"  # defaults to project repo
