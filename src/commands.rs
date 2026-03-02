@@ -47,6 +47,8 @@ const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
+const TAILSCALE_HOSTNAME_RECLAIM_TIMEOUT_SECS: u64 = 20;
+const TAILSCALE_HOSTNAME_RECLAIM_POLL_MS: u64 = 1000;
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 
@@ -649,6 +651,63 @@ fn wait_for_tailscale_online(
 
         thread::sleep(Duration::from_millis(TAILSCALE_ONLINE_WAIT_POLL_MS));
     }
+}
+
+fn join_tailnet_for_cutover_with_reclaim<FJoin, FDown, FSleep>(
+    container_app: &str,
+    app: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut join: FJoin,
+    mut down: FDown,
+    mut sleep: FSleep,
+) -> Result<Option<String>, String>
+where
+    FJoin: FnMut(&str, &str) -> Result<Option<String>, String>,
+    FDown: FnMut(&str) -> Result<(), String>,
+    FSleep: FnMut(Duration),
+{
+    let start = Instant::now();
+
+    loop {
+        let name = join(container_app, app)?;
+        let Some(dns_name) = name.as_deref() else {
+            return Ok(name);
+        };
+
+        if !tailscale_hostname_has_collision_suffix(dns_name, app) {
+            return Ok(name);
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "tailscale assigned hostname '{dns_name}' with collision suffix during cutover"
+            ));
+        }
+
+        eprintln!(
+            "       Tailscale hostname collision detected ({dns_name}); retrying to reclaim '{app}'"
+        );
+        if let Err(e) = down(container_app) {
+            eprintln!("       Warning: failed to reset tailscale before retry: {e}");
+        }
+        sleep(poll_interval);
+    }
+}
+
+fn join_tailnet_for_cutover_with_retry(
+    container_app: &str,
+    app: &str,
+) -> Result<Option<String>, String> {
+    join_tailnet_for_cutover_with_reclaim(
+        container_app,
+        app,
+        Duration::from_secs(TAILSCALE_HOSTNAME_RECLAIM_TIMEOUT_SECS),
+        Duration::from_millis(TAILSCALE_HOSTNAME_RECLAIM_POLL_MS),
+        tailscale::join_in_container,
+        |container| container::exec_cmd(container, "tailscale down >/dev/null 2>&1 || true"),
+        thread::sleep,
+    )
 }
 
 fn tailscale_self_status_summary_from_json(app: &str, json: &str) -> Result<String, String> {
@@ -2826,14 +2885,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             }
 
             eprintln!("       Connecting new active container to tailnet");
-            let name = tailscale::join_in_container(&candidate_app, app)?;
-            if let Some(ref dns_name) = name {
-                if tailscale_hostname_has_collision_suffix(dns_name, app) {
-                    return Err(format!(
-                        "tailscale assigned hostname '{dns_name}' with collision suffix during cutover"
-                    ));
-                }
-            }
+            let name = join_tailnet_for_cutover_with_retry(&candidate_app, app)?;
             if let Err(e) = tailscale::expose_http_in_container(&candidate_app, port) {
                 eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
             }
@@ -5123,6 +5175,118 @@ devices:
             "hyperlinked-build-1772439520.tailnet.ts.net",
             "hyperlinked"
         ));
+    }
+
+    #[test]
+    fn join_tailnet_for_cutover_reclaim_accepts_exact_hostname() {
+        let mut down_calls = 0usize;
+        let mut sleep_calls = 0usize;
+        let mut attempts =
+            std::collections::VecDeque::from([Some("hyperlinked.tailnet.ts.net".to_string())]);
+
+        let name = join_tailnet_for_cutover_with_reclaim(
+            "hyperlinked-build-1",
+            "hyperlinked",
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            |_container, _app| Ok(attempts.pop_front().expect("join attempt should exist")),
+            |_container| {
+                down_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tailnet.ts.net"));
+        assert_eq!(down_calls, 0);
+        assert_eq!(sleep_calls, 0);
+    }
+
+    #[test]
+    fn join_tailnet_for_cutover_reclaim_retries_collision_then_succeeds() {
+        let mut down_calls = 0usize;
+        let mut sleep_calls = 0usize;
+        let mut attempts = std::collections::VecDeque::from([
+            Some("hyperlinked-1.tailnet.ts.net".to_string()),
+            Some("hyperlinked.tailnet.ts.net".to_string()),
+        ]);
+
+        let name = join_tailnet_for_cutover_with_reclaim(
+            "hyperlinked-build-1",
+            "hyperlinked",
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            |_container, _app| Ok(attempts.pop_front().expect("join attempt should exist")),
+            |_container| {
+                down_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tailnet.ts.net"));
+        assert_eq!(down_calls, 1);
+        assert_eq!(sleep_calls, 1);
+    }
+
+    #[test]
+    fn join_tailnet_for_cutover_reclaim_allows_missing_dns_name() {
+        let mut down_calls = 0usize;
+        let mut sleep_calls = 0usize;
+
+        let name = join_tailnet_for_cutover_with_reclaim(
+            "hyperlinked-build-1",
+            "hyperlinked",
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            |_container, _app| Ok(None),
+            |_container| {
+                down_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name, None);
+        assert_eq!(down_calls, 0);
+        assert_eq!(sleep_calls, 0);
+    }
+
+    #[test]
+    fn join_tailnet_for_cutover_reclaim_fails_after_timeout_when_collision_persists() {
+        let mut down_calls = 0usize;
+
+        let err = join_tailnet_for_cutover_with_reclaim(
+            "hyperlinked-build-1",
+            "hyperlinked",
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            |_container, _app| Ok(Some("hyperlinked-1.tailnet.ts.net".to_string())),
+            |_container| {
+                down_calls += 1;
+                Ok(())
+            },
+            |duration| {
+                std::thread::sleep(duration);
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("hyperlinked-1.tailnet.ts.net"));
+        assert!(err.contains("collision suffix"));
+        assert!(
+            down_calls >= 1,
+            "expected at least one reset attempt before timeout"
+        );
     }
 
     #[test]
