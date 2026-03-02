@@ -31,10 +31,15 @@ const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
 const START_COMMAND_PATH: &str = "/etc/psht-start-command";
 const REQUIRED_ENV_PATH: &str = "/etc/psht-required-env";
 const APP_PROCESS_PID_PATH: &str = "/var/psht/app.pid";
+const APP_PROCESS_LOG_PATH: &str = "/var/psht/app.log";
+const INSTALL_LOG_PATH: &str = "/var/psht/install.log";
 const APP_PROCESS_POLL_SLEEP: &str = "0.2";
 const APP_PROCESS_STOP_TERM_CHECKS: u32 = 40;
 const APP_PROCESS_STOP_KILL_CHECKS: u32 = 10;
 const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
+const APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS: u64 = 3;
+const APP_LOG_TAIL_LINES: u32 = 40;
+const INSTALL_LOG_TAIL_LINES: u32 = 80;
 const CONTAINER_OP_WAIT_CHECKS: u32 = 80;
 const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
 const CONTAINER_DELETE_RETRY_CHECKS: u32 = 20;
@@ -2076,6 +2081,19 @@ fn wait_for_tcp_listener(
             return Ok(());
         }
         let elapsed = started.elapsed().as_secs();
+        if elapsed >= APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS && !app_process_is_running(app)? {
+            let mut message = format!(
+                "{label} failed before TCP :{port} became ready because app process exited"
+            );
+            if let Ok(command) = read_start_command(app) {
+                message.push_str(&format!("\nStart command: {}", command.trim()));
+            }
+            if let Some(log_excerpt) = app_log_tail(app, APP_LOG_TAIL_LINES) {
+                message.push_str("\nLast app log lines:\n");
+                message.push_str(&log_excerpt);
+            }
+            return Err(message);
+        }
         if elapsed >= timeout_secs {
             return Err(format!(
                 "{label} timed out after {timeout_secs}s waiting for TCP :{port}"
@@ -2104,7 +2122,7 @@ fn start_cmd(port: u16, cmd: &str, vars: &BTreeMap<String, String>) -> Result<St
     let escaped = shell_quote(cmd);
     let exports = start_exports(port, vars)?;
     Ok(format!(
-        "mkdir -p /var/psht && cd /app && {exports} && {{ setsid sh -c {escaped} > /var/psht/app.log 2>&1 < /dev/null & echo $! > {APP_PROCESS_PID_PATH}; }}"
+        "mkdir -p /var/psht && cd /app && {exports} && {{ setsid sh -c {escaped} > {APP_PROCESS_LOG_PATH} 2>&1 < /dev/null & echo $! > {APP_PROCESS_PID_PATH}; }}"
     ))
 }
 
@@ -2219,14 +2237,31 @@ fn stop_port_listeners_cmd(port: u16) -> String {
     )
 }
 
-fn stop_app_process(app: &str) -> Result<(), String> {
+fn stop_app_process_on_port(app: &str, port: u16) -> Result<(), String> {
     container::exec_cmd(app, &stop_app_process_cmd())?;
-    let port = allocate_port(app);
     container::exec_cmd(app, &stop_port_listeners_cmd(port))
 }
 
-fn launch_app_process(app: &str, cmd: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
-    let port = allocate_port(app);
+fn app_log_tail(app: &str, lines: u32) -> Option<String> {
+    let output = container::exec_output(
+        app,
+        &format!("if [ -f {APP_PROCESS_LOG_PATH} ]; then tail -n {lines} {APP_PROCESS_LOG_PATH} 2>/dev/null || true; fi"),
+    )
+    .ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn launch_app_process(
+    app: &str,
+    port: u16,
+    cmd: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), String> {
     let launch = start_cmd(port, cmd, vars)?;
     container::exec_cmd(app, &launch)?;
     for _ in 0..APP_PROCESS_START_WAIT_CHECKS {
@@ -2235,9 +2270,15 @@ fn launch_app_process(app: &str, cmd: &str, vars: &BTreeMap<String, String>) -> 
         }
         thread::sleep(Duration::from_millis(200));
     }
-    Err(format!(
-        "app process failed to stay up after launch; check logs with: psht logs {app}"
-    ))
+    let mut message = format!(
+        "app process failed to stay up after launch (start command: {}); check logs with: psht logs {app}",
+        cmd.trim()
+    );
+    if let Some(log_excerpt) = app_log_tail(app, APP_LOG_TAIL_LINES) {
+        message.push_str("\nLast app log lines:\n");
+        message.push_str(&log_excerpt);
+    }
+    Err(message)
 }
 
 fn shell_quote(s: &str) -> String {
@@ -2281,6 +2322,41 @@ fn app_workdir_command(command: &str) -> Option<String> {
     } else {
         Some(format!("cd /app && {command}"))
     }
+}
+
+fn install_log_tail(app: &str, lines: u32) -> Option<String> {
+    let output = container::exec_output(
+        app,
+        &format!(
+            "if [ -f {INSTALL_LOG_PATH} ]; then tail -n {lines} {INSTALL_LOG_PATH} 2>/dev/null || true; fi"
+        ),
+    )
+    .ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn run_install_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
+    let wrapped = format!(
+        r#"mkdir -p /var/psht
+status_file="$(mktemp)"
+( {command}; echo "$?" > "$status_file" ) 2>&1 | tee {INSTALL_LOG_PATH}
+status="$(cat "$status_file" 2>/dev/null || echo 1)"
+rm -f "$status_file"
+exit "$status""#
+    );
+    container::exec_cmd_rolling(app, &wrapped, 5).map_err(|e| {
+        let mut message = format!("{label} failed: {e}");
+        if let Some(log_excerpt) = install_log_tail(app, INSTALL_LOG_TAIL_LINES) {
+            message.push_str("\nLast install/build log lines:\n");
+            message.push_str(&log_excerpt);
+        }
+        message
+    })
 }
 
 fn run_hook(app: &str, phase: &str, command: Option<&str>) -> Result<(), String> {
@@ -2653,7 +2729,11 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
         if let Some(command) = app_workdir_command(&config.install_command) {
             eprintln!("-----> Installing candidate dependencies");
-            container::exec_cmd_rolling(&candidate_app, &command, 5)?;
+            run_install_command_with_logging(
+                &candidate_app,
+                &command,
+                "candidate dependency install",
+            )?;
         }
         run_hook(
             &candidate_app,
@@ -2677,7 +2757,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let cutover_result = (|| -> Result<Option<String>, String> {
         eprintln!("       Stopping current app process");
-        stop_app_process(&old_active_app)?;
+        stop_app_process_on_port(&old_active_app, port)?;
 
         eprintln!("       Removing old proxy device");
         container::remove_proxy(&old_active_app)?;
@@ -2698,7 +2778,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         candidate_proxy_attached = true;
 
         eprintln!("       Starting app in new active container");
-        launch_app_process(&candidate_app, &config.start_command, &app_env)?;
+        launch_app_process(&candidate_app, port, &config.start_command, &app_env)?;
 
         eprintln!("-----> Waiting for candidate readiness");
         wait_for_tcp_listener(
@@ -2749,7 +2829,8 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             }
 
             if let Ok(restored_start_command) = read_start_command(&old_active_app) {
-                let _ = launch_app_process(&old_active_app, &restored_start_command, &app_env);
+                let _ =
+                    launch_app_process(&old_active_app, port, &restored_start_command, &app_env);
             }
             if !skip_tailscale && tailscale::dns_name_in_container(&old_active_app).is_some() {
                 let _ = tailscale::expose_http_in_container(&old_active_app, port);
@@ -2829,6 +2910,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     let hash = stack_hash(&script_path)?;
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
 
+    let port = allocate_port(app);
     let mut tailnet_hostname = if skip_tailscale {
         None
     } else {
@@ -2841,7 +2923,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
             .to_string();
         if remote_hash == hash {
             eprintln!("-----> Reusing container");
-            stop_app_process(app)?;
+            stop_app_process_on_port(app, port)?;
             false
         } else {
             eprintln!("-----> Rebuilding container");
@@ -2916,14 +2998,13 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
 
     if let Some(command) = app_workdir_command(&config.install_command) {
         eprintln!("-----> Installing dependencies");
-        container::exec_cmd_rolling(app, &command, 5)?;
+        run_install_command_with_logging(app, &command, "dependency install")?;
     }
 
     run_hook(app, "postinstall", config.postinstall_command.as_deref())?;
 
-    let port = allocate_port(app);
     eprintln!("-----> Starting app");
-    launch_app_process(app, &config.start_command, &app_env)?;
+    launch_app_process(app, port, &config.start_command, &app_env)?;
 
     if !skip_tailscale {
         tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
@@ -2967,9 +3048,9 @@ fn restart_app_process(app: &str, vars: &BTreeMap<String, String>) -> Result<(),
     let required_env = read_required_env(&active_app)?;
     ensure_required_env_present(&required_env, vars)?;
     let start = read_start_command(&active_app)?;
-    stop_app_process(&active_app)?;
     let port = allocate_port(app);
-    launch_app_process(&active_app, &start, vars)?;
+    stop_app_process_on_port(&active_app, port)?;
+    launch_app_process(&active_app, port, &start, vars)?;
     if tailscale::dns_name_in_container(&active_app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
     {
@@ -3260,7 +3341,15 @@ pub fn health() -> Result<(), String> {
     let containers = container::list()?;
     let apps = app_targets_from_runtime_state(&containers)?;
     if apps.is_empty() {
-        println!("No deployed apps found.");
+        let uid = run_cmd_capture("id", &["-u"]).unwrap_or_else(|_| "?".to_string());
+        println!(
+            "No deployed apps found for uid {} (HOME={}).",
+            uid.trim(),
+            home_dir().display()
+        );
+        if uid.trim() == "0" {
+            println!("Hint: deploy state is user-scoped. Try: sudo -u psht psht-server health");
+        }
         return Ok(());
     }
 
@@ -4144,7 +4233,7 @@ pub fn start(app: &str) -> Result<(), String> {
     ensure_required_env_present(&required_env, &vars)?;
     let command = read_start_command(&active_app)?;
     let port = allocate_port(app);
-    launch_app_process(&active_app, &command, &vars)?;
+    launch_app_process(&active_app, port, &command, &vars)?;
     if tailscale::dns_name_in_container(&active_app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
     {

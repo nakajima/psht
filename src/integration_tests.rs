@@ -1159,8 +1159,8 @@ fn integration_deploy_blue_green_rolls_back_when_new_revision_fails_to_start() {
     let bad_sha = deploy_repo_commit(
         &work,
         "<html><body>ok-rollback-v2</body></html>\n",
-        Some("web: sh -c 'echo broken >&2; exit 1'"),
-        "introduce broken startup",
+        Some("web: ./target/release/definitely-missing"),
+        "introduce missing startup binary",
     )
     .expect("failed to commit broken revision");
 
@@ -1169,6 +1169,10 @@ fn integration_deploy_blue_green_rolls_back_when_new_revision_fails_to_start() {
     assert!(
         err.contains("rollback was applied"),
         "expected rollback error marker, got: {err}"
+    );
+    assert!(
+        err.contains("Last app log lines"),
+        "expected deploy error to include candidate app logs for diagnosis, got: {err}"
     );
 
     let response = wait_for_http_with_host(
