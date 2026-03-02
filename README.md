@@ -81,34 +81,7 @@ Set environment variables for the app.
 
 Update the `psht` cli to whatever is on the server.
 
-## Quickstart
-
-### 1) Prepare a host
-
-On the server:
-
-```sh
-sudo psht-server bootstrap
-psht-server doctor
-```
-
-### 2) Install the client locally
-
-On your local machine:
-
-```sh
-ssh psht@<host> setup | sh
-```
-
-This installs the `psht` cli and writes `~/.psht/config.toml`, which tracks where your `psht-server` is and what projects you have.
-
-### 3) Deploy your app
-
-```sh
-cd your-app
-psht setup
-psht deploy # first run creates psht.toml (release URL + start command)
-```
+## other stuff
 
 Use `psht deploy --force` to force a deploy even when the binary payload hash is unchanged.
 For git projects, `psht deploy` now verifies the last successful deploy when `git push` is up to date, and retries automatically if the last attempt failed.
