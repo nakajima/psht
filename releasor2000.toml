@@ -16,20 +16,20 @@ targets = [
 ]
 
 [git]
-base_url = "https://github.com"
+base-url = "https://github.com"
 # token_env = "GITEA_TOKEN"       # defaults: GITHUB_TOKEN or GITEA_TOKEN
 
 [channels.git]
 enabled = true
 
+[channels.curl]
+
 # [channels.homebrew]
 # tap = "owner/homebrew-tap"
 # formula_name = "psht"
 
-# [channels.cargo]
-# crate_name = "psht"
-
-# [channels.curl]
+[channels.cargo]
+crate-name = "psht"
 
 # [channels.nix]
 # flake_repo = "owner/nix-repo"  # defaults to project repo
