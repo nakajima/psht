@@ -462,6 +462,7 @@ pub fn remove_proxy(app: &str) -> Result<(), String> {
     ))
 }
 
+#[allow(dead_code)]
 pub fn rename_app(old_app: &str, new_app: &str) -> Result<(), String> {
     let old_name = container_name(old_app);
     let new_name = container_name(new_app);

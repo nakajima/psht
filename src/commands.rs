@@ -89,6 +89,10 @@ fn deploy_pending_dir() -> PathBuf {
     home_dir().join("deploy-pending")
 }
 
+fn app_runtime_state_dir() -> PathBuf {
+    home_dir().join(".psht").join("apps")
+}
+
 fn build_numbers_dir() -> PathBuf {
     home_dir().join("build-numbers")
 }
@@ -1560,6 +1564,156 @@ struct GitDeployState {
     status: GitDeployStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct AppRuntimeState {
+    active_instance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_instance: Option<String>,
+    updated_at: u64,
+}
+
+fn app_runtime_state_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.toml"))
+}
+
+fn app_runtime_state_path(app: &str) -> PathBuf {
+    app_runtime_state_path_in(&app_runtime_state_dir(), app)
+}
+
+fn app_ref_from_instance_name(instance: &str) -> Option<String> {
+    let trimmed = instance.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let app_ref = trimmed.strip_prefix("psht-").unwrap_or(trimmed).trim();
+    if app_ref.is_empty() {
+        return None;
+    }
+    Some(app_ref.to_string())
+}
+
+fn instance_name_from_app_ref(app_ref: &str) -> String {
+    let app_ref = app_ref.trim();
+    if app_ref.starts_with("psht-") {
+        app_ref.to_string()
+    } else {
+        format!("psht-{app_ref}")
+    }
+}
+
+fn read_app_runtime_state_from(path: &Path) -> Result<Option<AppRuntimeState>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let state: AppRuntimeState =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn read_app_runtime_state(app: &str) -> Result<Option<AppRuntimeState>, String> {
+    read_app_runtime_state_from(&app_runtime_state_path(app))
+}
+
+fn write_app_runtime_state_to(path: &Path, state: &AppRuntimeState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(state)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn write_app_runtime_state(
+    app: &str,
+    active_app_ref: &str,
+    previous_app_ref: Option<&str>,
+) -> Result<(), String> {
+    let state = AppRuntimeState {
+        active_instance: instance_name_from_app_ref(active_app_ref),
+        previous_instance: previous_app_ref.map(instance_name_from_app_ref),
+        updated_at: now_unix_secs(),
+    };
+    write_app_runtime_state_to(&app_runtime_state_path(app), &state)
+}
+
+fn clear_app_runtime_state(app: &str) -> Result<(), String> {
+    let path = app_runtime_state_path(app);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn read_all_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
+    let dir = app_runtime_state_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("failed to read {}: {e}", dir.display())),
+    };
+
+    let mut states = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if ext != "toml" {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(state) = read_app_runtime_state_from(&path)? else {
+            continue;
+        };
+        states.push((stem.to_string(), state));
+    }
+    states.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(states)
+}
+
+fn resolve_active_app_ref(app: &str) -> Result<Option<String>, String> {
+    if let Some(state) = read_app_runtime_state(app)? {
+        if let Some(active_app_ref) = app_ref_from_instance_name(&state.active_instance)
+            && container::exists(&active_app_ref)
+        {
+            return Ok(Some(active_app_ref));
+        }
+        if let Some(previous_instance) = state.previous_instance.as_deref()
+            && let Some(previous_app_ref) = app_ref_from_instance_name(previous_instance)
+            && container::exists(&previous_app_ref)
+        {
+            write_app_runtime_state(app, &previous_app_ref, None)?;
+            return Ok(Some(previous_app_ref));
+        }
+        if container::exists(app) {
+            write_app_runtime_state(app, app, None)?;
+            return Ok(Some(app.to_string()));
+        }
+        return Ok(None);
+    }
+
+    if container::exists(app) {
+        write_app_runtime_state(app, app, None)?;
+        return Ok(Some(app.to_string()));
+    }
+
+    Ok(None)
+}
+
+fn resolve_existing_active_app_ref(app: &str) -> Result<String, String> {
+    let Some(active_app_ref) = resolve_active_app_ref(app)? else {
+        return Err(format!("app '{app}' not found"));
+    };
+    Ok(active_app_ref)
+}
+
 fn git_deploy_state_path_in(dir: &Path, app: &str) -> PathBuf {
     dir.join(format!("{app}.toml"))
 }
@@ -1901,10 +2055,6 @@ fn deploy_instance_id() -> String {
 
 fn candidate_app_name(app: &str, deploy_id: &str) -> String {
     format!("{app}-build-{deploy_id}")
-}
-
-fn previous_app_name(app: &str, deploy_id: &str) -> String {
-    format!("{app}-prev-{deploy_id}")
 }
 
 fn wait_for_tcp_listener(
@@ -2367,7 +2517,8 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
 
     let candidate_hash = binary_payload_hash(&code_dir)?;
     if let Some(hash) = candidate_hash.as_deref() {
-        if container::exists(app) && read_binary_hash(app).as_deref() == Some(hash) {
+        if resolve_active_app_ref(app)?.is_some() && read_binary_hash(app).as_deref() == Some(hash)
+        {
             if force {
                 eprintln!("-----> Binary unchanged ({hash}), forcing deploy");
             } else {
@@ -2385,7 +2536,7 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
 }
 
 fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
-    if container::exists(app) {
+    if resolve_active_app_ref(app)?.is_some() {
         deploy_from_blue_green(app, code_dir)
     } else {
         deploy_from_in_place(app, code_dir)
@@ -2400,6 +2551,8 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         ensure_project_default_profile(&current_project)?;
     }
     init_stacks_in(&stacks_dir())?;
+    let old_active_app = resolve_active_app_ref(app)?
+        .ok_or_else(|| format!("app '{app}' not found for blue/green deploy"))?;
 
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
@@ -2424,19 +2577,15 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let deploy_id = deploy_instance_id();
     let candidate_app = candidate_app_name(app, &deploy_id);
-    let previous_app = previous_app_name(app, &deploy_id);
 
     if container::exists(&candidate_app) {
         let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
-    }
-    if container::exists(&previous_app) {
-        let _ = cleanup_container_for_rebuild(&previous_app, &current_project);
     }
 
     eprintln!("-----> Preparing candidate container");
     eprintln!("       Candidate: {candidate_app}");
     eprintln!("       Traffic remains on current container");
-    wait_for_container_operation_quiet(app, &current_project)?;
+    wait_for_container_operation_quiet(&old_active_app, &current_project)?;
 
     let build_candidate_result = (|| -> Result<(), String> {
         if container::image_exists_in_project(&stack, &hash, &current_project) {
@@ -2521,42 +2670,39 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
     eprintln!("-----> Switching traffic");
     eprintln!("       Traffic remains on current container until cutover is complete");
-    let mut active_renamed = false;
-    let mut candidate_promoted = false;
-    let mut failed_candidate_name: Option<String> = None;
+    let mut old_proxy_removed = false;
+    let mut old_storage_detached = false;
+    let mut candidate_storage_attached = false;
+    let mut candidate_proxy_attached = false;
 
     let cutover_result = (|| -> Result<Option<String>, String> {
         eprintln!("       Stopping current app process");
-        stop_app_process(app)?;
+        stop_app_process(&old_active_app)?;
 
         eprintln!("       Removing old proxy device");
-        container::remove_proxy(app)?;
+        container::remove_proxy(&old_active_app)?;
+        old_proxy_removed = true;
 
         eprintln!("       Detaching storage from current container");
-        if let Err(e) = container::remove_storage_mount(app) {
+        if let Err(e) = container::remove_storage_mount(&old_active_app) {
             eprintln!("       Warning: failed to detach storage from current container: {e}");
         }
+        old_storage_detached = true;
 
-        eprintln!("       Renaming active container to previous");
-        container::rename_app(app, &previous_app)?;
-        active_renamed = true;
-
-        eprintln!("       Renaming candidate to active");
-        container::rename_app(&candidate_app, app)?;
-        candidate_promoted = true;
-
-        eprintln!("       Re-attaching storage to new active container");
-        container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
+        eprintln!("       Attaching storage to candidate container");
+        container::ensure_storage_mount(&candidate_app, &storage_pool, &storage_volume)?;
+        candidate_storage_attached = true;
 
         eprintln!("       Attaching proxy to new active container");
-        container::add_proxy(app, port, port)?;
+        container::add_proxy(&candidate_app, port, port)?;
+        candidate_proxy_attached = true;
 
         eprintln!("       Starting app in new active container");
-        launch_app_process(app, &config.start_command, &app_env)?;
+        launch_app_process(&candidate_app, &config.start_command, &app_env)?;
 
         eprintln!("-----> Waiting for candidate readiness");
         wait_for_tcp_listener(
-            app,
+            &candidate_app,
             port,
             DEPLOY_TCP_READY_TIMEOUT_SECS,
             "candidate readiness",
@@ -2566,20 +2712,16 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             None
         } else {
             eprintln!("       Connecting new active container to tailnet");
-            let name = tailscale::join_in_container(app)?;
-            if let Err(e) = tailscale::expose_http_in_container(app, port) {
+            let name = tailscale::join_in_container(&candidate_app)?;
+            if let Err(e) = tailscale::expose_http_in_container(&candidate_app, port) {
                 eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
             }
             name
         };
 
         caddy::add(app, port)?;
+        write_app_runtime_state(app, &candidate_app, Some(&old_active_app))?;
 
-        eprintln!("       Cleaning up previous container");
-        if !skip_tailscale && let Err(e) = tailscale_down(&previous_app) {
-            eprintln!("       Warning: failed to bring tailscale down on previous container: {e}");
-        }
-        cleanup_container_for_rebuild(&previous_app, &current_project)?;
         Ok(tailnet_hostname)
     })();
 
@@ -2588,39 +2730,48 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         Err(err) => {
             eprintln!("-----> Cutover failed; rolling back traffic");
 
-            if candidate_promoted {
-                let failed = format!("{app}-failed-{deploy_id}");
-                let _ = container::remove_proxy(app);
-                let _ = container::remove_storage_mount(app);
-                if container::rename_app(app, &failed).is_ok() {
-                    failed_candidate_name = Some(failed);
-                }
+            if candidate_proxy_attached {
+                let _ = container::remove_proxy(&candidate_app);
             }
-            if active_renamed {
-                let _ = container::rename_app(&previous_app, app);
+            if candidate_storage_attached {
+                let _ = container::remove_storage_mount(&candidate_app);
             }
 
-            let _ = container::ensure_storage_mount(app, &storage_pool, &storage_volume);
-            let _ = container::add_proxy(app, port, port);
-            if let Ok(restored_start_command) = read_start_command(app) {
-                let _ = launch_app_process(app, &restored_start_command, &app_env);
+            if old_storage_detached {
+                let _ = container::ensure_storage_mount(
+                    &old_active_app,
+                    &storage_pool,
+                    &storage_volume,
+                );
             }
-            if !skip_tailscale && tailscale::dns_name_in_container(app).is_some() {
-                let _ = tailscale::expose_http_in_container(app, port);
+            if old_proxy_removed {
+                let _ = container::add_proxy(&old_active_app, port, port);
+            }
+
+            if let Ok(restored_start_command) = read_start_command(&old_active_app) {
+                let _ = launch_app_process(&old_active_app, &restored_start_command, &app_env);
+            }
+            if !skip_tailscale && tailscale::dns_name_in_container(&old_active_app).is_some() {
+                let _ = tailscale::expose_http_in_container(&old_active_app, port);
             }
             let _ = caddy::add(app, port);
-
-            if let Some(failed) = failed_candidate_name.as_deref() {
-                let _ = cleanup_container_for_rebuild(failed, &current_project);
-            } else {
-                let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
-            }
+            let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
 
             return Err(format!(
                 "deploy cutover failed and rollback was applied: {err}"
             ));
         }
     };
+
+    eprintln!("       Cleaning up previous active container");
+    if !skip_tailscale && let Err(e) = container::exec_cmd(&old_active_app, "tailscale down") {
+        eprintln!("       Warning: failed to bring tailscale down on previous container: {e}");
+    }
+    if let Err(e) = cleanup_container_for_rebuild(&old_active_app, &current_project) {
+        eprintln!("       Warning: failed to clean previous active container: {e}");
+    } else if let Err(e) = write_app_runtime_state(app, &candidate_app, None) {
+        eprintln!("       Warning: failed to update app runtime state after cleanup: {e}");
+    }
 
     let build_number = increment_build_number(app)?;
 
@@ -2638,7 +2789,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
     eprintln!("-----> Verifying live endpoint");
     wait_for_tcp_listener(
-        app,
+        &candidate_app,
         port,
         DEPLOY_TCP_READY_TIMEOUT_SECS,
         "post-cutover verification",
@@ -2784,6 +2935,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     }
 
     caddy::add(app, port)?;
+    write_app_runtime_state(app, app, None)?;
 
     let build_number = increment_build_number(app)?;
 
@@ -2804,21 +2956,22 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
 }
 
 fn app_is_running(app: &str) -> Result<bool, String> {
-    if !container::exists(app) {
+    let Some(active_app) = resolve_active_app_ref(app)? else {
         return Ok(false);
-    }
-    container::is_running(app)
+    };
+    container::is_running(&active_app)
 }
 
 fn restart_app_process(app: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
-    let required_env = read_required_env(app)?;
+    let active_app = resolve_existing_active_app_ref(app)?;
+    let required_env = read_required_env(&active_app)?;
     ensure_required_env_present(&required_env, vars)?;
-    let start = read_start_command(app)?;
-    stop_app_process(app)?;
+    let start = read_start_command(&active_app)?;
+    stop_app_process(&active_app)?;
     let port = allocate_port(app);
-    launch_app_process(app, &start, vars)?;
-    if tailscale::dns_name_in_container(app).is_some()
-        && let Err(e) = tailscale::expose_http_in_container(app, port)
+    launch_app_process(&active_app, &start, vars)?;
+    if tailscale::dns_name_in_container(&active_app).is_some()
+        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
     {
         eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
     }
@@ -2847,7 +3000,8 @@ pub fn env_command(app: &str, assignments: &[String]) -> Result<(), String> {
 
     let running = app_is_running(app)?;
     if running {
-        let required_env = read_required_env(app)?;
+        let active_app = resolve_existing_active_app_ref(app)?;
+        let required_env = read_required_env(&active_app)?;
         ensure_required_env_present(&required_env, &vars)?;
     }
 
@@ -2887,7 +3041,8 @@ pub fn env_unset(app: &str, names: &[String]) -> Result<(), String> {
 
     let running = app_is_running(app)?;
     if running {
-        let required_env = read_required_env(app)?;
+        let active_app = resolve_existing_active_app_ref(app)?;
+        let required_env = read_required_env(&active_app)?;
         ensure_required_env_present(&required_env, &vars)?;
     }
 
@@ -2911,14 +3066,14 @@ pub fn env_unset(app: &str, names: &[String]) -> Result<(), String> {
 
 pub fn ps() -> Result<(), String> {
     let containers = container::list()?;
-    if containers.is_empty() {
+    let apps = app_targets_from_runtime_state(&containers)?;
+    if apps.is_empty() {
         println!("No apps running.");
         return Ok(());
     }
     println!("{:<20} {:<10}", "APP", "STATUS");
-    for c in &containers {
-        let app = c.name.strip_prefix("psht-").unwrap_or(&c.name);
-        println!("{:<20} {:<10}", app, c.status);
+    for (app, _active_app, status) in apps {
+        println!("{:<20} {:<10}", app, status);
     }
     Ok(())
 }
@@ -2951,16 +3106,53 @@ fn canonical_app_name_from_container(container_name: &str) -> Option<String> {
     Some(app.to_string())
 }
 
-fn canonical_app_containers(containers: &[container::ContainerInfo]) -> Vec<(String, String)> {
-    let mut canonical: Vec<(String, String)> = containers
-        .iter()
-        .filter_map(|container| {
-            canonical_app_name_from_container(&container.name)
-                .map(|app| (app, container.status.clone()))
-        })
-        .collect();
-    canonical.sort_by(|(left, _), (right, _)| left.cmp(right));
-    canonical
+fn app_targets_from_runtime_state(
+    containers: &[container::ContainerInfo],
+) -> Result<Vec<(String, Option<String>, String)>, String> {
+    let mut status_by_name = BTreeMap::new();
+    for container in containers {
+        status_by_name.insert(container.name.clone(), container.status.clone());
+    }
+
+    let mut targets: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
+    for (app, state) in read_all_app_runtime_states()? {
+        let mut active_app_ref = app_ref_from_instance_name(&state.active_instance);
+        if active_app_ref.is_none() {
+            active_app_ref = resolve_active_app_ref(&app)?;
+        }
+
+        if let Some(active_app) = active_app_ref.as_deref() {
+            let active_instance = instance_name_from_app_ref(active_app);
+            if let Some(status) = status_by_name.get(&active_instance) {
+                targets.insert(app, (Some(active_app.to_string()), status.clone()));
+                continue;
+            }
+        }
+
+        if let Some(active_app) = resolve_active_app_ref(&app)? {
+            let active_instance = instance_name_from_app_ref(&active_app);
+            if let Some(status) = status_by_name.get(&active_instance) {
+                targets.insert(app, (Some(active_app), status.clone()));
+                continue;
+            }
+        }
+
+        targets.insert(app, (None, "Missing".to_string()));
+    }
+
+    for container in containers {
+        let Some(app) = canonical_app_name_from_container(&container.name) else {
+            continue;
+        };
+        targets
+            .entry(app.clone())
+            .or_insert((Some(app), container.status.clone()));
+    }
+
+    Ok(targets
+        .into_iter()
+        .map(|(app, (active_app, status))| (app, active_app, status))
+        .collect())
 }
 
 fn app_port_listening(app: &str, port: u16) -> Result<bool, String> {
@@ -2973,9 +3165,11 @@ fn app_port_listening(app: &str, port: u16) -> Result<bool, String> {
     Ok(output.trim() == "ready")
 }
 
-fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
+fn check_app_health(app: &str, active_app: &str, container_status: &str) -> AppHealthReport {
     let mut details = Vec::new();
     let mut healthy = true;
+    let active_instance = instance_name_from_app_ref(active_app);
+    details.push(format!("active instance: {active_instance}"));
 
     if container_status.eq_ignore_ascii_case("running") {
         details.push("container running".to_string());
@@ -2988,7 +3182,7 @@ fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
         };
     }
 
-    let app_running = match app_process_is_running(app) {
+    let app_running = match app_process_is_running(active_app) {
         Ok(true) => {
             details.push("app process running".to_string());
             true
@@ -3005,7 +3199,7 @@ fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
         }
     };
 
-    match read_start_command(app) {
+    match read_start_command(active_app) {
         Ok(command) => details.push(format!("start command: {}", command.trim())),
         Err(err) => {
             healthy = false;
@@ -3013,7 +3207,7 @@ fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
         }
     }
 
-    match read_required_env(app) {
+    match read_required_env(active_app) {
         Ok(required_env) => match read_env_vars(app) {
             Ok(vars) => {
                 if let Err(err) = ensure_required_env_present(&required_env, &vars) {
@@ -3041,7 +3235,7 @@ fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
 
     if app_running {
         let port = allocate_port(app);
-        match app_port_listening(app, port) {
+        match app_port_listening(active_app, port) {
             Ok(true) => details.push(format!("tcp :{port} listening")),
             Ok(false) => {
                 healthy = false;
@@ -3064,7 +3258,7 @@ fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
 pub fn health() -> Result<(), String> {
     eprintln!("-----> Checking app health");
     let containers = container::list()?;
-    let apps = canonical_app_containers(&containers);
+    let apps = app_targets_from_runtime_state(&containers)?;
     if apps.is_empty() {
         println!("No deployed apps found.");
         return Ok(());
@@ -3073,8 +3267,16 @@ pub fn health() -> Result<(), String> {
     println!("{:<20} {:<10} DETAILS", "APP", "STATUS");
     let mut unhealthy = Vec::new();
 
-    for (app, status) in apps {
-        let report = check_app_health(&app, &status);
+    for (app, active_app, status) in apps {
+        let report = if let Some(active_app) = active_app.as_deref() {
+            check_app_health(&app, active_app, &status)
+        } else {
+            AppHealthReport {
+                app: app.clone(),
+                healthy: false,
+                details: vec!["active container missing".to_string()],
+            }
+        };
         let health_status = if report.healthy { "ok" } else { "unhealthy" };
         println!(
             "{:<20} {:<10} {}",
@@ -3101,7 +3303,8 @@ pub fn health() -> Result<(), String> {
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    container::logs(app, follow)
+    let active_app = resolve_existing_active_app_ref(app)?;
+    container::logs(&active_app, follow)
 }
 
 fn setup_script(hostname: &str) -> String {
@@ -3850,18 +4053,14 @@ pub fn doctor() -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_container_exists_for_tailscale(app: &str) -> Result<(), String> {
-    if container::exists(app) {
-        Ok(())
-    } else {
-        Err(format!("app '{app}' not found"))
-    }
+fn resolve_active_app_for_tailscale(app: &str) -> Result<String, String> {
+    resolve_existing_active_app_ref(app)
 }
 
-fn ensure_container_running_for_tailscale(app: &str) -> Result<(), String> {
-    ensure_container_exists_for_tailscale(app)?;
-    if container::is_running(app)? {
-        Ok(())
+fn ensure_container_running_for_tailscale(app: &str) -> Result<String, String> {
+    let active_app = resolve_active_app_for_tailscale(app)?;
+    if container::is_running(&active_app)? {
+        Ok(active_app)
     } else {
         Err(format!("app '{app}' is not running"))
     }
@@ -3869,8 +4068,8 @@ fn ensure_container_running_for_tailscale(app: &str) -> Result<(), String> {
 
 pub fn tailscale_status(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    ensure_container_running_for_tailscale(app)?;
-    let status = container::exec_output(app, "tailscale status --json")?;
+    let active_app = ensure_container_running_for_tailscale(app)?;
+    let status = container::exec_output(&active_app, "tailscale status --json")?;
     let summary = tailscale_self_status_summary_from_json(app, &status)?;
     println!("{summary}");
     Ok(())
@@ -3878,23 +4077,23 @@ pub fn tailscale_status(app: &str) -> Result<(), String> {
 
 pub fn tailscale_up(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    ensure_container_exists_for_tailscale(app)?;
-    if !container::is_running(app)? {
+    let active_app = resolve_active_app_for_tailscale(app)?;
+    if !container::is_running(&active_app)? {
         eprintln!("-----> Starting container");
-        container::start(app)?;
+        container::start(&active_app)?;
     }
 
     eprintln!("-----> Repairing tailscale in container");
-    tailscale::install_in_container(app)?;
-    let _ = container::exec_cmd(app, "tailscale down >/dev/null 2>&1 || true");
-    let tailnet_hostname = tailscale::join_in_container(app)?;
-    let _ = container::exec_cmd(app, "tailscale serve reset >/dev/null 2>&1 || true");
+    tailscale::install_in_container(&active_app)?;
+    let _ = container::exec_cmd(&active_app, "tailscale down >/dev/null 2>&1 || true");
+    let tailnet_hostname = tailscale::join_in_container(&active_app)?;
+    let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
     let port = allocate_port(app);
-    if let Err(e) = tailscale::expose_http_in_container(app, port) {
+    if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
         eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
     }
     let (_, _, health) =
-        wait_for_tailscale_online(app, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))?;
+        wait_for_tailscale_online(&active_app, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))?;
     if !health.is_empty() {
         eprintln!("       Warning: {}", health.join(" | "));
     }
@@ -3908,9 +4107,9 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
 
 pub fn tailscale_down(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    ensure_container_running_for_tailscale(app)?;
+    let active_app = ensure_container_running_for_tailscale(app)?;
     eprintln!("-----> Bringing tailscale down in container");
-    container::exec_cmd(app, "tailscale down")
+    container::exec_cmd(&active_app, "tailscale down")
 }
 
 fn hostname() -> String {
@@ -3921,37 +4120,33 @@ fn hostname() -> String {
 
 pub fn stop(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    if !container::exists(app) {
-        return Err(format!("app '{app}' not found"));
-    }
+    let active_app = resolve_existing_active_app_ref(app)?;
     eprintln!("-----> Stopping {app}");
-    container::stop(app)?;
+    container::stop(&active_app)?;
     eprintln!("=====> {app} stopped");
     Ok(())
 }
 
 pub fn start(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    if !container::exists(app) {
-        return Err(format!("app '{app}' not found"));
-    }
+    let active_app = resolve_existing_active_app_ref(app)?;
     eprintln!("-----> Starting {app}");
-    if !container::is_running(app)? {
-        container::start(app)?;
+    if !container::is_running(&active_app)? {
+        container::start(&active_app)?;
     }
-    if app_process_is_running(app)? {
+    if app_process_is_running(&active_app)? {
         eprintln!("       {app} is already running; skipping launch");
         eprintln!("=====> {app} started");
         return Ok(());
     }
     let vars = read_env_vars(app)?;
-    let required_env = read_required_env(app)?;
+    let required_env = read_required_env(&active_app)?;
     ensure_required_env_present(&required_env, &vars)?;
-    let command = read_start_command(app)?;
+    let command = read_start_command(&active_app)?;
     let port = allocate_port(app);
-    launch_app_process(app, &command, &vars)?;
-    if tailscale::dns_name_in_container(app).is_some()
-        && let Err(e) = tailscale::expose_http_in_container(app, port)
+    launch_app_process(&active_app, &command, &vars)?;
+    if tailscale::dns_name_in_container(&active_app).is_some()
+        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
     {
         eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
     }
@@ -3961,19 +4156,32 @@ pub fn start(app: &str) -> Result<(), String> {
 
 pub fn destroy(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    if !container::exists(app) {
-        return Err(format!("app '{app}' not found"));
-    }
+    let active_app = resolve_existing_active_app_ref(app)?;
+    let runtime_state = read_app_runtime_state(app)?;
     eprintln!("-----> Destroying {app}");
     caddy::remove(app)?;
-    if let Err(e) = container::remove_storage_mount(app) {
+    if let Err(e) = container::remove_storage_mount(&active_app) {
         eprintln!("       Warning: failed to remove /storage mount before destroy: {e}");
     }
-    container::stop(app)?;
-    container::delete(app)?;
+    container::stop(&active_app)?;
+    container::delete(&active_app)?;
+
+    if let Some(state) = runtime_state
+        && let Some(previous_instance) = state.previous_instance
+        && let Some(previous_app) = app_ref_from_instance_name(&previous_instance)
+        && previous_app != active_app
+        && container::exists(&previous_app)
+    {
+        let _ = container::stop(&previous_app);
+        let _ = container::delete(&previous_app);
+    }
+
     delete_app_storage_volume(app)?;
     if let Err(e) = remove_env_vars(app) {
         eprintln!("       Warning: failed to remove env vars: {e}");
+    }
+    if let Err(e) = clear_app_runtime_state(app) {
+        eprintln!("       Warning: failed to clear app runtime state: {e}");
     }
     eprintln!("=====> {app} destroyed");
     Ok(())
@@ -5545,39 +5753,35 @@ devices:
     }
 
     #[test]
-    fn canonical_app_containers_filters_and_sorts() {
-        let containers = vec![
-            container::ContainerInfo {
-                name: "psht-zeta".to_string(),
-                status: "Running".to_string(),
-            },
-            container::ContainerInfo {
-                name: "psht-alpha-build-1772425113".to_string(),
-                status: "Running".to_string(),
-            },
-            container::ContainerInfo {
-                name: "psht-alpha".to_string(),
-                status: "Stopped".to_string(),
-            },
-            container::ContainerInfo {
-                name: "psht-beta-prev-1772425113".to_string(),
-                status: "Running".to_string(),
-            },
-        ];
-
-        let canonical = canonical_app_containers(&containers);
+    fn app_ref_from_instance_name_handles_prefixed_and_unprefixed_values() {
         assert_eq!(
-            canonical,
-            vec![
-                ("alpha".to_string(), "Stopped".to_string()),
-                ("zeta".to_string(), "Running".to_string())
-            ]
+            app_ref_from_instance_name("psht-hyperlinked").as_deref(),
+            Some("hyperlinked")
         );
+        assert_eq!(
+            app_ref_from_instance_name("hyperlinked-build-123").as_deref(),
+            Some("hyperlinked-build-123")
+        );
+        assert!(app_ref_from_instance_name("").is_none());
+    }
+
+    #[test]
+    fn app_runtime_state_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = app_runtime_state_path_in(tmp.path(), "myapp");
+        let state = AppRuntimeState {
+            active_instance: "psht-myapp-build-123".to_string(),
+            previous_instance: Some("psht-myapp".to_string()),
+            updated_at: 1234,
+        };
+        write_app_runtime_state_to(&path, &state).unwrap();
+        let loaded = read_app_runtime_state_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, state);
     }
 
     #[test]
     fn stopped_container_is_unhealthy() {
-        let report = check_app_health("hyperlinked", "Stopped");
+        let report = check_app_health("hyperlinked", "hyperlinked", "Stopped");
         assert!(!report.healthy);
         assert_eq!(report.app, "hyperlinked");
         assert!(

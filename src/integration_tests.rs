@@ -1101,13 +1101,19 @@ fn integration_deploy_blue_green_switches_revision_and_cleans_staging_containers
 
     let instances = app_family_instances(&app).expect("failed to list app family instances");
     assert!(
-        instances.iter().any(|name| name == &format!("psht-{app}")),
-        "expected active instance psht-{app}, got: {instances:?}"
+        instances.len() == 1,
+        "expected only one active instance after cutover, got: {instances:?}"
     );
     assert!(
-        !instances.iter().any(|name| {
-            name.contains("-build-") || name.contains("-prev-") || name.contains("-failed-")
-        }),
+        instances
+            .iter()
+            .any(|name| name.starts_with(&format!("psht-{app}-build-"))),
+        "expected active instance to be candidate-style name, got: {instances:?}"
+    );
+    assert!(
+        !instances
+            .iter()
+            .any(|name| { name.contains("-prev-") || name.contains("-failed-") }),
         "staging instances should be cleaned after successful cutover: {instances:?}"
     );
 }
@@ -1191,6 +1197,55 @@ fn integration_deploy_blue_green_rolls_back_when_new_revision_fails_to_start() {
     assert!(
         !instances.iter().any(|name| name.contains("-build-")),
         "candidate instance should be cleaned after rollback: {instances:?}"
+    );
+
+    let recovered_sha = deploy_repo_commit(
+        &work,
+        "<html><body>ok-rollback-v3</body></html>\n",
+        None,
+        "recover after failed deploy",
+    )
+    .expect("failed to commit recovery revision");
+
+    commands::deploy(&app, Some("refs/heads/main"), Some(&recovered_sha), false)
+        .expect("recovery deploy after rollback failed");
+
+    let recovered_response = wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-rollback-v3",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "recovery deploy did not restore service: {e}\n{}",
+            debug_info(&app)
+        )
+    });
+    assert!(
+        recovered_response.contains("ok-rollback-v3"),
+        "expected recovery body, got response: {recovered_response}"
+    );
+
+    let recovered_instances =
+        app_family_instances(&app).expect("failed to list app family instances after recovery");
+    assert!(
+        recovered_instances.len() == 1,
+        "expected one active instance after recovery deploy, got: {recovered_instances:?}"
+    );
+    assert!(
+        recovered_instances
+            .iter()
+            .any(|name| name.starts_with(&format!("psht-{app}-build-"))),
+        "expected active instance to be candidate-style name after recovery, got: {recovered_instances:?}"
+    );
+    assert!(
+        !recovered_instances
+            .iter()
+            .any(|name| name.contains("-failed-") || name.contains("-prev-")),
+        "stale failed/previous instances should be cleaned after recovery deploy: {recovered_instances:?}"
     );
 }
 

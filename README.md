@@ -5,9 +5,11 @@
 - `psht-server` runs on the host.
 - `psht` runs on your local machine.
 
-## What you get
+## `psht deploy`
 
-- Deploy from your app directory with one command.
+## `psht ps`
+
+## `psht logs [-f]`
 - Basic app lifecycle commands (`ps`, `logs`, `stop`, `destroy`).
 - App environment management (`env`, `env:unset`) persisted across deploys/rebuilds.
 - Host bootstrap, health checks, and upgrades.
@@ -22,6 +24,7 @@ On the server:
 ```sh
 sudo psht-server bootstrap
 psht-server doctor
+psht-server health
 ```
 
 ### 2) Install the client locally
