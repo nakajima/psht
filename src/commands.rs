@@ -2923,6 +2923,182 @@ pub fn ps() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AppHealthReport {
+    app: String,
+    healthy: bool,
+    details: Vec<String>,
+}
+
+fn has_deploy_suffix(app: &str, marker: &str) -> bool {
+    let Some((base, suffix)) = app.rsplit_once(marker) else {
+        return false;
+    };
+    !base.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_transient_deploy_app_name(app: &str) -> bool {
+    has_deploy_suffix(app, "-build-")
+        || has_deploy_suffix(app, "-prev-")
+        || has_deploy_suffix(app, "-failed-")
+}
+
+fn canonical_app_name_from_container(container_name: &str) -> Option<String> {
+    let app = container_name.strip_prefix("psht-")?;
+    if app.is_empty() || is_transient_deploy_app_name(app) {
+        return None;
+    }
+    Some(app.to_string())
+}
+
+fn canonical_app_containers(containers: &[container::ContainerInfo]) -> Vec<(String, String)> {
+    let mut canonical: Vec<(String, String)> = containers
+        .iter()
+        .filter_map(|container| {
+            canonical_app_name_from_container(&container.name)
+                .map(|app| (app, container.status.clone()))
+        })
+        .collect();
+    canonical.sort_by(|(left, _), (right, _)| left.cmp(right));
+    canonical
+}
+
+fn app_port_listening(app: &str, port: u16) -> Result<bool, String> {
+    let output = container::exec_output(
+        app,
+        &format!(
+            "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
+        ),
+    )?;
+    Ok(output.trim() == "ready")
+}
+
+fn check_app_health(app: &str, container_status: &str) -> AppHealthReport {
+    let mut details = Vec::new();
+    let mut healthy = true;
+
+    if container_status.eq_ignore_ascii_case("running") {
+        details.push("container running".to_string());
+    } else {
+        details.push(format!("container status is {container_status}"));
+        return AppHealthReport {
+            app: app.to_string(),
+            healthy: false,
+            details,
+        };
+    }
+
+    let app_running = match app_process_is_running(app) {
+        Ok(true) => {
+            details.push("app process running".to_string());
+            true
+        }
+        Ok(false) => {
+            healthy = false;
+            details.push("app process not running".to_string());
+            false
+        }
+        Err(err) => {
+            healthy = false;
+            details.push(format!("failed to check app process: {err}"));
+            false
+        }
+    };
+
+    match read_start_command(app) {
+        Ok(command) => details.push(format!("start command: {}", command.trim())),
+        Err(err) => {
+            healthy = false;
+            details.push(err);
+        }
+    }
+
+    match read_required_env(app) {
+        Ok(required_env) => match read_env_vars(app) {
+            Ok(vars) => {
+                if let Err(err) = ensure_required_env_present(&required_env, &vars) {
+                    healthy = false;
+                    details.push(err);
+                } else if required_env.is_empty() {
+                    details.push("required env: none".to_string());
+                } else {
+                    details.push(format!(
+                        "required env present ({})",
+                        required_env.join(", ")
+                    ));
+                }
+            }
+            Err(err) => {
+                healthy = false;
+                details.push(format!("failed to read env vars: {err}"));
+            }
+        },
+        Err(err) => {
+            healthy = false;
+            details.push(format!("required env metadata error: {err}"));
+        }
+    }
+
+    if app_running {
+        let port = allocate_port(app);
+        match app_port_listening(app, port) {
+            Ok(true) => details.push(format!("tcp :{port} listening")),
+            Ok(false) => {
+                healthy = false;
+                details.push(format!("tcp :{port} is not listening"));
+            }
+            Err(err) => {
+                healthy = false;
+                details.push(format!("failed to check tcp :{port}: {err}"));
+            }
+        }
+    }
+
+    AppHealthReport {
+        app: app.to_string(),
+        healthy,
+        details,
+    }
+}
+
+pub fn health() -> Result<(), String> {
+    eprintln!("-----> Checking app health");
+    let containers = container::list()?;
+    let apps = canonical_app_containers(&containers);
+    if apps.is_empty() {
+        println!("No deployed apps found.");
+        return Ok(());
+    }
+
+    println!("{:<20} {:<10} DETAILS", "APP", "STATUS");
+    let mut unhealthy = Vec::new();
+
+    for (app, status) in apps {
+        let report = check_app_health(&app, &status);
+        let health_status = if report.healthy { "ok" } else { "unhealthy" };
+        println!(
+            "{:<20} {:<10} {}",
+            report.app,
+            health_status,
+            report.details.join("; ")
+        );
+        if !report.healthy {
+            unhealthy.push(report.app);
+        }
+    }
+
+    if unhealthy.is_empty() {
+        eprintln!("=====> All app containers are healthy");
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} app(s) unhealthy: {}",
+        unhealthy.len(),
+        unhealthy.join(", ")
+    ))
+}
+
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     container::logs(app, follow)
@@ -5334,6 +5510,82 @@ devices:
             let err = result.expect_err("should reject invalid app name");
             assert!(err.contains("invalid app name"), "unexpected error: {err}");
         }
+    }
+
+    #[test]
+    fn has_deploy_suffix_requires_numeric_suffix() {
+        assert!(has_deploy_suffix("demo-build-1772425113", "-build-"));
+        assert!(has_deploy_suffix("demo-prev-1772425113", "-prev-"));
+        assert!(has_deploy_suffix("demo-failed-1772425113", "-failed-"));
+        assert!(!has_deploy_suffix("demo-build-next", "-build-"));
+        assert!(!has_deploy_suffix("demo-build-", "-build-"));
+    }
+
+    #[test]
+    fn transient_deploy_app_names_are_detected() {
+        assert!(is_transient_deploy_app_name("hyperlinked-build-1772425113"));
+        assert!(is_transient_deploy_app_name("hyperlinked-prev-1772425113"));
+        assert!(is_transient_deploy_app_name(
+            "hyperlinked-failed-1772425113"
+        ));
+        assert!(!is_transient_deploy_app_name("hyperlinked-build-cache"));
+        assert!(!is_transient_deploy_app_name("hyperlinked"));
+    }
+
+    #[test]
+    fn canonical_app_name_filters_transient_containers() {
+        assert_eq!(
+            canonical_app_name_from_container("psht-hyperlinked").as_deref(),
+            Some("hyperlinked")
+        );
+        assert!(canonical_app_name_from_container("psht-hyperlinked-build-1772425113").is_none());
+        assert!(canonical_app_name_from_container("psht-hyperlinked-prev-1772425113").is_none());
+        assert!(canonical_app_name_from_container("psht-hyperlinked-failed-1772425113").is_none());
+        assert!(canonical_app_name_from_container("other-service").is_none());
+    }
+
+    #[test]
+    fn canonical_app_containers_filters_and_sorts() {
+        let containers = vec![
+            container::ContainerInfo {
+                name: "psht-zeta".to_string(),
+                status: "Running".to_string(),
+            },
+            container::ContainerInfo {
+                name: "psht-alpha-build-1772425113".to_string(),
+                status: "Running".to_string(),
+            },
+            container::ContainerInfo {
+                name: "psht-alpha".to_string(),
+                status: "Stopped".to_string(),
+            },
+            container::ContainerInfo {
+                name: "psht-beta-prev-1772425113".to_string(),
+                status: "Running".to_string(),
+            },
+        ];
+
+        let canonical = canonical_app_containers(&containers);
+        assert_eq!(
+            canonical,
+            vec![
+                ("alpha".to_string(), "Stopped".to_string()),
+                ("zeta".to_string(), "Running".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn stopped_container_is_unhealthy() {
+        let report = check_app_health("hyperlinked", "Stopped");
+        assert!(!report.healthy);
+        assert_eq!(report.app, "hyperlinked");
+        assert!(
+            report
+                .details
+                .iter()
+                .any(|detail| detail.contains("container status is Stopped"))
+        );
     }
 
     #[test]

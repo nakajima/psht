@@ -54,6 +54,8 @@ enum Command {
     Upgrade,
     /// Check server health
     Doctor,
+    /// Check deployed app health
+    Health,
     /// Manage host tailscale
     Tailscale {
         #[command(subcommand)]
@@ -191,6 +193,7 @@ fn run() -> Result<(), String> {
         Command::Bootstrap => commands::bootstrap(),
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
+        Command::Health => commands::health(),
         Command::Tailscale { command } => match command {
             TailscaleCommand::Status { app } => {
                 app_name::validate_app_name(&app)?;
@@ -477,6 +480,12 @@ mod tests {
     fn parse_doctor() {
         let cli = parse_cli(&["psht-server", "doctor"]).unwrap();
         assert_eq!(cli.command, Command::Doctor);
+    }
+
+    #[test]
+    fn parse_health() {
+        let cli = parse_cli(&["psht-server", "health"]).unwrap();
+        assert_eq!(cli.command, Command::Health);
     }
 
     #[test]
