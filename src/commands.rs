@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::app_name;
 use crate::caddy;
 use crate::container;
+use crate::deploy_log;
 use crate::detect;
 use crate::tailscale;
 
@@ -51,6 +52,20 @@ const TAILSCALE_HOSTNAME_RECLAIM_TIMEOUT_SECS: u64 = 20;
 const TAILSCALE_HOSTNAME_RECLAIM_POLL_MS: u64 = 1000;
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
+const HEALTH_DELEGATED_ENV: &str = "PSHT_HEALTH_DELEGATED";
+const LOGS_DEPLOY_HISTORY_FILES: usize = 12;
+const LOGS_DEPLOY_HISTORY_LINES_PER_FILE: usize = 400;
+
+macro_rules! eprintln {
+    () => {
+        std::eprintln!()
+    };
+    ($($arg:tt)*) => {{
+        let rendered = format!($($arg)*);
+        std::eprintln!("{}", rendered);
+        deploy_log::append("deploy", &rendered);
+    }};
+}
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -94,6 +109,14 @@ fn deploy_lock_dir() -> PathBuf {
 
 fn deploy_pending_dir() -> PathBuf {
     home_dir().join("deploy-pending")
+}
+
+fn cleanup_job_dir() -> PathBuf {
+    home_dir().join(".psht").join("cleanup-jobs")
+}
+
+fn cleanup_lock_dir() -> PathBuf {
+    home_dir().join(".psht").join("cleanup-locks")
 }
 
 fn app_runtime_state_dir() -> PathBuf {
@@ -1600,6 +1623,33 @@ fn stack_hash(path: &Path) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+fn apt_packages_fingerprint(packages: &[String]) -> Option<String> {
+    let mut normalized: Vec<String> = packages
+        .iter()
+        .map(|pkg| pkg.trim())
+        .filter(|pkg| !pkg.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    normalized.sort();
+    normalized.dedup();
+
+    let canonical = normalized.join("\n");
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+fn setup_hash(stack_hash: &str, apt_fingerprint: Option<&str>) -> String {
+    match apt_fingerprint {
+        Some(fingerprint) => format!("{stack_hash}:{fingerprint}"),
+        None => stack_hash.to_string(),
+    }
+}
+
 fn resolve_stack_in(
     app: &str,
     code_dir: &Path,
@@ -1655,6 +1705,18 @@ struct AppRuntimeState {
     active_instance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_instance: Option<String>,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct CleanupJobState {
+    app: String,
+    active_instance_at_schedule: String,
+    scheduled_previous_instance: String,
+    attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    scheduled_at: u64,
     updated_at: u64,
 }
 
@@ -1824,11 +1886,37 @@ fn pending_git_target_path(app: &str) -> PathBuf {
     pending_git_target_path_in(&deploy_pending_dir(), app)
 }
 
+fn cleanup_job_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.toml"))
+}
+
+fn cleanup_job_path(app: &str) -> PathBuf {
+    cleanup_job_path_in(&cleanup_job_dir(), app)
+}
+
+fn cleanup_lock_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.lock"))
+}
+
+fn cleanup_lock_path(app: &str) -> PathBuf {
+    cleanup_lock_path_in(&cleanup_lock_dir(), app)
+}
+
 struct DeployLockGuard {
     path: PathBuf,
 }
 
 impl Drop for DeployLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct CleanupLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for CleanupLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
@@ -1900,6 +1988,47 @@ fn try_acquire_deploy_lock_at(path: &Path) -> Result<Option<DeployLockGuard>, St
 
 fn try_acquire_deploy_lock(app: &str) -> Result<Option<DeployLockGuard>, String> {
     try_acquire_deploy_lock_at(&deploy_lock_path(app))
+}
+
+fn try_acquire_cleanup_lock_at(path: &Path) -> Result<Option<CleanupLockGuard>, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    for _ in 0..2 {
+        match write_new_lock_file(path) {
+            Ok(()) => {
+                return Ok(Some(CleanupLockGuard {
+                    path: path.to_path_buf(),
+                }));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                if lock_file_is_stale(path) {
+                    match fs::remove_file(path) {
+                        Ok(()) => continue,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                        Err(err) => {
+                            return Err(format!(
+                                "failed to clear stale lock {}: {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(format!("failed to create lock {}: {e}", path.display()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn try_acquire_cleanup_lock(app: &str) -> Result<Option<CleanupLockGuard>, String> {
+    try_acquire_cleanup_lock_at(&cleanup_lock_path(app))
 }
 
 fn read_git_deploy_state_from(path: &Path) -> Result<Option<GitDeployState>, String> {
@@ -1992,6 +2121,107 @@ fn take_pending_git_target_from(path: &Path) -> Result<Option<GitCheckoutTarget>
 
 fn take_pending_git_target(app: &str) -> Result<Option<GitCheckoutTarget>, String> {
     take_pending_git_target_from(&pending_git_target_path(app))
+}
+
+fn read_cleanup_job_from(path: &Path) -> Result<Option<CleanupJobState>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let state: CleanupJobState =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn read_cleanup_job(app: &str) -> Result<Option<CleanupJobState>, String> {
+    read_cleanup_job_from(&cleanup_job_path(app))
+}
+
+fn write_cleanup_job_to(path: &Path, state: &CleanupJobState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(state)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn write_cleanup_job(app: &str, state: &CleanupJobState) -> Result<(), String> {
+    write_cleanup_job_to(&cleanup_job_path(app), state)
+}
+
+fn clear_cleanup_job_at(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn clear_cleanup_job(app: &str) -> Result<(), String> {
+    clear_cleanup_job_at(&cleanup_job_path(app))
+}
+
+fn spawn_cleanup_previous_worker(app: &str) -> Result<(), String> {
+    let exe = current_psht_binary()?;
+    Command::new(exe)
+        .args(["cleanup", "previous", app])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn background cleanup worker: {e}"))?;
+    Ok(())
+}
+
+fn queue_previous_cleanup(
+    app: &str,
+    active_app_ref: &str,
+    previous_app_ref: &str,
+) -> Result<(), String> {
+    let now = now_unix_secs();
+    let state = CleanupJobState {
+        app: app.to_string(),
+        active_instance_at_schedule: instance_name_from_app_ref(active_app_ref),
+        scheduled_previous_instance: instance_name_from_app_ref(previous_app_ref),
+        attempts: 0,
+        last_error: None,
+        scheduled_at: now,
+        updated_at: now,
+    };
+    write_cleanup_job(app, &state)
+}
+
+fn queue_previous_cleanup_in_background(app: &str, active_app_ref: &str, previous_app_ref: &str) {
+    if let Err(e) = queue_previous_cleanup(app, active_app_ref, previous_app_ref) {
+        eprintln!("       Warning: failed to schedule background cleanup: {e}");
+        return;
+    }
+    eprintln!("       Cleaning previous active container in background");
+    if let Err(e) = spawn_cleanup_previous_worker(app) {
+        eprintln!("       Warning: failed to start background cleanup worker: {e}");
+    }
+}
+
+fn kick_pending_cleanup_worker(app: &str) {
+    match read_cleanup_job(app) {
+        Ok(Some(_)) => {
+            if let Err(e) = spawn_cleanup_previous_worker(app) {
+                eprintln!("       Warning: failed to start pending cleanup worker: {e}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("       Warning: failed to read pending cleanup state: {e}");
+        }
+    }
+}
+
+fn current_project_name() -> Result<String, String> {
+    let uid = run_cmd_capture("id", &["-u"])?;
+    Ok(format!("user-{}", uid.trim()))
 }
 
 fn git_target_already_succeeded_with_state(
@@ -2541,6 +2771,147 @@ fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String>
     Ok(())
 }
 
+fn is_transient_deploy_app_for(app: &str, candidate: &str) -> bool {
+    let build_prefix = format!("{app}-build-");
+    if let Some(suffix) = candidate.strip_prefix(&build_prefix) {
+        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
+    }
+
+    let prev_prefix = format!("{app}-prev-");
+    if let Some(suffix) = candidate.strip_prefix(&prev_prefix) {
+        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
+    }
+
+    let failed_prefix = format!("{app}-failed-");
+    if let Some(suffix) = candidate.strip_prefix(&failed_prefix) {
+        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
+    }
+
+    false
+}
+
+fn clear_previous_runtime_reference_if_missing(app: &str) -> Result<(), String> {
+    let Some(state) = read_app_runtime_state(app)? else {
+        return Ok(());
+    };
+
+    let Some(previous_instance) = state.previous_instance.as_deref() else {
+        return Ok(());
+    };
+    let Some(previous_app_ref) = app_ref_from_instance_name(previous_instance) else {
+        return Ok(());
+    };
+    if container::exists(&previous_app_ref) {
+        return Ok(());
+    }
+
+    let Some(active_app_ref) = app_ref_from_instance_name(&state.active_instance) else {
+        return Ok(());
+    };
+    write_app_runtime_state(app, &active_app_ref, None)
+}
+
+fn record_cleanup_job_failure(
+    app: &str,
+    mut job: CleanupJobState,
+    error_message: String,
+) -> Result<(), String> {
+    job.attempts = job.attempts.saturating_add(1);
+    job.last_error = Some(error_message.clone());
+    job.updated_at = now_unix_secs();
+    write_cleanup_job(app, &job)?;
+    Err(error_message)
+}
+
+pub fn cleanup_previous(app: &str) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    let Some(_cleanup_lock) = try_acquire_cleanup_lock(app)? else {
+        return Ok(());
+    };
+
+    let Some(job) = read_cleanup_job(app)? else {
+        return Ok(());
+    };
+    if job.app != app {
+        let job_app = job.app.clone();
+        return record_cleanup_job_failure(
+            app,
+            job,
+            format!(
+                "cleanup job app mismatch: expected '{app}', found '{}'",
+                job_app
+            ),
+        );
+    }
+
+    let Some(scheduled_previous_app) = app_ref_from_instance_name(&job.scheduled_previous_instance)
+    else {
+        return record_cleanup_job_failure(
+            app,
+            job,
+            "cleanup job has invalid scheduled previous instance".to_string(),
+        );
+    };
+    if !is_transient_deploy_app_for(app, &scheduled_previous_app) {
+        clear_cleanup_job(app)?;
+        return Ok(());
+    }
+
+    let active_app = resolve_active_app_ref(app)?;
+    if active_app.as_deref() == Some(scheduled_previous_app.as_str()) {
+        eprintln!(
+            "       Skipping background cleanup because previous instance became active again"
+        );
+        clear_cleanup_job(app)?;
+        return Ok(());
+    }
+
+    if !container::exists(&scheduled_previous_app) {
+        clear_previous_runtime_reference_if_missing(app)?;
+        clear_cleanup_job(app)?;
+        return Ok(());
+    }
+
+    let project = current_project_name()?;
+    if env::var_os("PSHT_SKIP_TAILSCALE").is_none() {
+        let _ = container::exec_cmd(
+            &scheduled_previous_app,
+            "tailscale down >/dev/null 2>&1 || true",
+        );
+    }
+
+    if let Err(err) = cleanup_container_for_rebuild(&scheduled_previous_app, &project) {
+        return record_cleanup_job_failure(
+            app,
+            job,
+            format!("failed to clean previous instance '{scheduled_previous_app}': {err}"),
+        );
+    }
+
+    clear_previous_runtime_reference_if_missing(app)?;
+    clear_cleanup_job(app)?;
+    Ok(())
+}
+
+fn cleanup_pending_detail(app: &str) -> Option<String> {
+    let state = read_cleanup_job(app).ok().flatten()?;
+    let mut detail = format!("cleanup pending (attempts: {})", state.attempts);
+    if let Some(last_error) = state.last_error.as_deref() {
+        detail.push_str(&format!(", last error: {last_error}"));
+    }
+    Some(detail)
+}
+
+fn start_deploy_log_session(app: &str) -> Option<deploy_log::DeployLogSession> {
+    match deploy_log::start_for_app(app) {
+        Ok(session) => Some(session),
+        Err(err) => {
+            std::eprintln!("       Warning: failed to initialize deploy logs: {err}");
+            None
+        }
+    }
+}
+
 fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Result<(), String> {
     if let Some(target) = target {
         if !force {
@@ -2608,6 +2979,7 @@ pub fn deploy(
     force: bool,
 ) -> Result<(), String> {
     app_name::validate_app_name(app)?;
+    let _deploy_log_session = start_deploy_log_session(app);
     eprintln!("-----> Deploying {app}");
     warn_if_upgrade_available();
     let mut target = parse_git_checkout_target(git_ref, git_sha)?;
@@ -2623,6 +2995,7 @@ pub fn deploy(
             "deploy already in progress for '{app}'; retry after it completes"
         ));
     };
+    kick_pending_cleanup_worker(app);
 
     let mut active_force = force;
     loop {
@@ -2646,6 +3019,7 @@ pub fn deploy(
 
 pub fn push(app: &str, force: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
+    let _deploy_log_session = start_deploy_log_session(app);
     eprintln!("-----> Deploying {app}");
     warn_if_upgrade_available();
     let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
@@ -2653,6 +3027,7 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
             "deploy already in progress for '{app}'; retry after it completes"
         ));
     };
+    kick_pending_cleanup_worker(app);
 
     let code_dir = home_dir().join(app);
 
@@ -2728,6 +3103,8 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
     let hash = stack_hash(&script_path)?;
+    let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
+    let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
     let port = allocate_port(app);
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
     let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
@@ -2745,8 +3122,29 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     wait_for_container_operation_quiet(&old_active_app, &current_project)?;
 
     let build_candidate_result = (|| -> Result<(), String> {
-        if container::image_exists_in_project(&stack, &hash, &current_project) {
-            eprintln!("-----> Creating candidate from cached image");
+        let setup_image_cached = container::setup_image_exists_in_project(
+            &stack,
+            &hash,
+            apt_fingerprint.as_deref(),
+            &current_project,
+        );
+        if setup_image_cached {
+            eprintln!("-----> Creating candidate from cached setup image");
+            container::create_from_setup_image_in_project(
+                &candidate_app,
+                &stack,
+                &hash,
+                apt_fingerprint.as_deref(),
+                &current_project,
+            )?;
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup in candidate");
+            } else {
+                eprintln!("-----> Installing tailscale in candidate");
+                tailscale::install_in_container(&candidate_app)?;
+            }
+        } else if container::image_exists_in_project(&stack, &hash, &current_project) {
+            eprintln!("-----> Creating candidate from cached stack image");
             container::create_from_image_in_project(
                 &candidate_app,
                 &stack,
@@ -2794,12 +3192,26 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
         container::exec_cmd(
             &candidate_app,
-            &format!("echo -n '{hash}' > /etc/psht-setup-hash"),
+            &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
         )?;
 
         eprintln!("-----> Building candidate");
         container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
-        install_apt_packages(&candidate_app, &config.apt_packages)?;
+        if !setup_image_cached {
+            install_apt_packages(&candidate_app, &config.apt_packages)?;
+            if apt_fingerprint.is_some() {
+                eprintln!("-----> Caching setup image");
+                if let Err(e) = container::publish_setup_image_in_project(
+                    &candidate_app,
+                    &stack,
+                    &hash,
+                    apt_fingerprint.as_deref(),
+                    &current_project,
+                ) {
+                    eprintln!("       Warning: failed to cache setup image: {e}");
+                }
+            }
+        }
         persist_start_command(&candidate_app, &config.start_command)?;
         persist_required_env(&candidate_app, &config.required_env)?;
         run_hook(
@@ -2954,18 +3366,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         }
     };
 
-    eprintln!("       Cleaning up previous active container");
-    if !skip_tailscale
-        && !old_tailnet_disconnected
-        && let Err(e) = container::exec_cmd(&old_active_app, "tailscale down")
-    {
-        eprintln!("       Warning: failed to bring tailscale down on previous container: {e}");
-    }
-    if let Err(e) = cleanup_container_for_rebuild(&old_active_app, &current_project) {
-        eprintln!("       Warning: failed to clean previous active container: {e}");
-    } else if let Err(e) = write_app_runtime_state(app, &candidate_app, None) {
-        eprintln!("       Warning: failed to update app runtime state after cleanup: {e}");
-    }
+    queue_previous_cleanup_in_background(app, &candidate_app, &old_active_app);
 
     let build_number = increment_build_number(app)?;
 
@@ -3021,6 +3422,8 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
     let hash = stack_hash(&script_path)?;
+    let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
+    let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
 
     let port = allocate_port(app);
@@ -3034,7 +3437,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if remote_hash == hash {
+        if remote_hash == setup_hash {
             eprintln!("-----> Reusing container");
             stop_app_process_on_port(app, port)?;
             false
@@ -3050,8 +3453,30 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     if needs_setup {
         wait_for_container_operation_quiet(app, &current_project)?;
 
-        if container::image_exists_in_project(&stack, &hash, &current_project) {
-            eprintln!("-----> Creating container from cached image");
+        let setup_image_cached = container::setup_image_exists_in_project(
+            &stack,
+            &hash,
+            apt_fingerprint.as_deref(),
+            &current_project,
+        );
+        if setup_image_cached {
+            eprintln!("-----> Creating container from cached setup image");
+            container::create_from_setup_image_in_project(
+                app,
+                &stack,
+                &hash,
+                apt_fingerprint.as_deref(),
+                &current_project,
+            )?;
+
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup");
+            } else {
+                eprintln!("-----> Installing tailscale");
+                tailscale::install_in_container(app)?;
+            }
+        } else if container::image_exists_in_project(&stack, &hash, &current_project) {
+            eprintln!("-----> Creating container from cached stack image");
             container::create_from_image_in_project(app, &stack, &hash, &current_project)?;
 
             if skip_tailscale {
@@ -3085,7 +3510,26 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
             }
         }
 
-        container::exec_cmd(app, &format!("echo -n '{hash}' > /etc/psht-setup-hash"))?;
+        if !setup_image_cached {
+            install_apt_packages(app, &config.apt_packages)?;
+            if apt_fingerprint.is_some() {
+                eprintln!("-----> Caching setup image");
+                if let Err(e) = container::publish_setup_image_in_project(
+                    app,
+                    &stack,
+                    &hash,
+                    apt_fingerprint.as_deref(),
+                    &current_project,
+                ) {
+                    eprintln!("       Warning: failed to cache setup image: {e}");
+                }
+            }
+        }
+
+        container::exec_cmd(
+            app,
+            &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
+        )?;
 
         if skip_tailscale {
             eprintln!("-----> Skipping tailnet connection");
@@ -3104,7 +3548,6 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
 
     eprintln!("-----> Pushing code to container");
     container::push_code(app, &code_dir.to_string_lossy())?;
-    install_apt_packages(app, &config.apt_packages)?;
     persist_start_command(app, &config.start_command)?;
     persist_required_env(app, &config.required_env)?;
     run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
@@ -3442,6 +3885,10 @@ fn check_app_health(app: &str, active_app: &str, container_status: &str) -> AppH
         }
     }
 
+    if let Some(detail) = cleanup_pending_detail(app) {
+        details.push(detail);
+    }
+
     AppHealthReport {
         app: app.to_string(),
         healthy,
@@ -3449,20 +3896,49 @@ fn check_app_health(app: &str, active_app: &str, container_status: &str) -> AppH
     }
 }
 
+fn should_delegate_health_to_psht(
+    uid: &str,
+    already_delegated: bool,
+    psht_user_exists: bool,
+) -> bool {
+    uid.trim() == "0" && !already_delegated && psht_user_exists
+}
+
+fn delegate_health_to_psht_user() -> Result<(), String> {
+    let exe =
+        env::current_exe().map_err(|e| format!("failed to resolve current executable: {e}"))?;
+    let status = Command::new("sudo")
+        .args(["-u", "psht", "-H"])
+        .arg(exe)
+        .arg("health")
+        .env(HEALTH_DELEGATED_ENV, "1")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("failed to run delegated health check: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("delegated health check failed".to_string())
+    }
+}
+
 pub fn health() -> Result<(), String> {
+    let uid = run_cmd_capture("id", &["-u"]).unwrap_or_else(|_| "?".to_string());
+    if should_delegate_health_to_psht(
+        &uid,
+        env::var_os(HEALTH_DELEGATED_ENV).is_some(),
+        command_succeeds("id", &["psht"]),
+    ) {
+        return delegate_health_to_psht_user();
+    }
+
     eprintln!("-----> Checking app health");
     let containers = container::list()?;
     let apps = app_targets_from_runtime_state(&containers)?;
     if apps.is_empty() {
-        let uid = run_cmd_capture("id", &["-u"]).unwrap_or_else(|_| "?".to_string());
-        println!(
-            "No deployed apps found for uid {} (HOME={}).",
-            uid.trim(),
-            home_dir().display()
-        );
-        if uid.trim() == "0" {
-            println!("Hint: deploy state is user-scoped. Try: sudo -u psht psht-server health");
-        }
+        println!("No deployed apps found.");
         return Ok(());
     }
 
@@ -3505,8 +3981,47 @@ pub fn health() -> Result<(), String> {
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
-    let active_app = resolve_existing_active_app_ref(app)?;
-    container::logs(&active_app, follow)
+    let deploy_lines = deploy_log::recent_entries(
+        app,
+        LOGS_DEPLOY_HISTORY_FILES,
+        LOGS_DEPLOY_HISTORY_LINES_PER_FILE,
+    )?;
+    if !deploy_lines.is_empty() {
+        for line in &deploy_lines {
+            println!("{line}");
+        }
+    }
+
+    let active_app = resolve_active_app_ref(app)?;
+    if follow {
+        let Some(active_app) = active_app else {
+            if deploy_lines.is_empty() {
+                return Err(format!("app '{app}' not found"));
+            }
+            return Ok(());
+        };
+        return container::logs(&active_app, true);
+    }
+
+    let Some(active_app) = active_app else {
+        if deploy_lines.is_empty() {
+            return Err(format!("app '{app}' not found"));
+        }
+        return Ok(());
+    };
+
+    let app_log = container::exec_output(
+        &active_app,
+        &format!("if [ -f {APP_PROCESS_LOG_PATH} ]; then cat {APP_PROCESS_LOG_PATH}; fi"),
+    )
+    .map_err(|e| format!("failed to read app log from '{active_app}': {e}"))?;
+    for line in app_log.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        println!("{} [app] {}", deploy_log::timestamp_now(), line);
+    }
+    Ok(())
 }
 
 fn setup_script(hostname: &str) -> String {
@@ -4714,6 +5229,44 @@ mod tests {
     }
 
     #[test]
+    fn apt_packages_fingerprint_is_order_insensitive() {
+        let a = vec!["git".to_string(), "curl".to_string()];
+        let b = vec!["curl".to_string(), "git".to_string()];
+        assert_eq!(apt_packages_fingerprint(&a), apt_packages_fingerprint(&b));
+    }
+
+    #[test]
+    fn apt_packages_fingerprint_ignores_blanks_and_duplicates() {
+        let packages = vec![
+            " curl ".to_string(),
+            "".to_string(),
+            "curl".to_string(),
+            "git".to_string(),
+            "   ".to_string(),
+        ];
+        let canonical = vec!["curl".to_string(), "git".to_string()];
+        assert_eq!(
+            apt_packages_fingerprint(&packages),
+            apt_packages_fingerprint(&canonical)
+        );
+    }
+
+    #[test]
+    fn apt_packages_fingerprint_none_when_empty() {
+        let packages = vec!["".to_string(), "  ".to_string()];
+        assert!(apt_packages_fingerprint(&packages).is_none());
+    }
+
+    #[test]
+    fn setup_hash_includes_apt_fingerprint_when_present() {
+        assert_eq!(
+            setup_hash("deadbeef", Some("cafebabe")),
+            "deadbeef:cafebabe"
+        );
+        assert_eq!(setup_hash("deadbeef", None), "deadbeef");
+    }
+
+    #[test]
     fn binary_hash_cache_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = binary_hash_path_in(tmp.path(), "myapp");
@@ -4872,6 +5425,44 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_job_state_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cleanup_job_path_in(tmp.path(), "myapp");
+        let state = CleanupJobState {
+            app: "myapp".to_string(),
+            active_instance_at_schedule: "psht-myapp-build-100".to_string(),
+            scheduled_previous_instance: "psht-myapp-build-99".to_string(),
+            attempts: 2,
+            last_error: Some("busy".to_string()),
+            scheduled_at: 100,
+            updated_at: 101,
+        };
+        write_cleanup_job_to(&path, &state).unwrap();
+        let loaded = read_cleanup_job_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn clear_cleanup_job_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cleanup_job_path_in(tmp.path(), "myapp");
+        let state = CleanupJobState {
+            app: "myapp".to_string(),
+            active_instance_at_schedule: "psht-myapp-build-100".to_string(),
+            scheduled_previous_instance: "psht-myapp-build-99".to_string(),
+            attempts: 0,
+            last_error: None,
+            scheduled_at: 100,
+            updated_at: 100,
+        };
+        write_cleanup_job_to(&path, &state).unwrap();
+        assert!(path.exists());
+        clear_cleanup_job_at(&path).unwrap();
+        assert!(!path.exists());
+        assert!(read_cleanup_job_from(&path).unwrap().is_none());
+    }
+
+    #[test]
     fn deploy_lock_is_exclusive_until_guard_drops() {
         let tmp = tempfile::tempdir().unwrap();
         let path = deploy_lock_path_in(tmp.path(), "myapp");
@@ -4882,6 +5473,43 @@ mod tests {
         drop(guard);
         let third = try_acquire_deploy_lock_at(&path).unwrap();
         assert!(third.is_some());
+    }
+
+    #[test]
+    fn cleanup_lock_is_exclusive_until_guard_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cleanup_lock_path_in(tmp.path(), "myapp");
+        let guard = try_acquire_cleanup_lock_at(&path).unwrap();
+        assert!(guard.is_some());
+        let second = try_acquire_cleanup_lock_at(&path).unwrap();
+        assert!(second.is_none());
+        drop(guard);
+        let third = try_acquire_cleanup_lock_at(&path).unwrap();
+        assert!(third.is_some());
+    }
+
+    #[test]
+    fn transient_deploy_app_for_detected() {
+        assert!(is_transient_deploy_app_for(
+            "hyperlinked",
+            "hyperlinked-build-100"
+        ));
+        assert!(is_transient_deploy_app_for(
+            "hyperlinked",
+            "hyperlinked-prev-100"
+        ));
+        assert!(is_transient_deploy_app_for(
+            "hyperlinked",
+            "hyperlinked-failed-100"
+        ));
+        assert!(!is_transient_deploy_app_for(
+            "hyperlinked",
+            "hyperlinked-build-next"
+        ));
+        assert!(!is_transient_deploy_app_for(
+            "hyperlinked",
+            "other-build-100"
+        ));
     }
 
     #[test]
@@ -6052,6 +6680,14 @@ devices:
             let err = result.expect_err("should reject invalid app name");
             assert!(err.contains("invalid app name"), "unexpected error: {err}");
         }
+    }
+
+    #[test]
+    fn health_delegation_triggers_only_for_root_without_recursion() {
+        assert!(should_delegate_health_to_psht("0", false, true));
+        assert!(!should_delegate_health_to_psht("0", true, true));
+        assert!(!should_delegate_health_to_psht("1001", false, true));
+        assert!(!should_delegate_health_to_psht("0", false, false));
     }
 
     #[test]

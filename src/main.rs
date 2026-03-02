@@ -2,6 +2,7 @@ mod app_name;
 mod caddy;
 mod commands;
 mod container;
+mod deploy_log;
 mod detect;
 mod git;
 mod tailscale;
@@ -92,6 +93,11 @@ enum Command {
     },
     #[command(name = "env-unset", hide = true)]
     EnvUnset { app: String, names: Vec<String> },
+    #[command(hide = true)]
+    Cleanup {
+        #[command(subcommand)]
+        command: CleanupCommand,
+    },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -102,6 +108,11 @@ enum TailscaleCommand {
     Up { app: String },
     /// Bring tailscale down
     Down { app: String },
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum CleanupCommand {
+    Previous { app: String },
 }
 
 fn strip_git_suffix(name: &str) -> String {
@@ -171,6 +182,12 @@ fn run() -> Result<(), String> {
             app_name::validate_app_name(&app)?;
             commands::env_unset(&app, &names)
         }
+        Command::Cleanup { command } => match command {
+            CleanupCommand::Previous { app } => {
+                app_name::validate_app_name(&app)?;
+                commands::cleanup_previous(&app)
+            }
+        },
         Command::Ps => commands::ps(),
         Command::Logs { app, follow } => {
             app_name::validate_app_name(&app)?;
@@ -436,6 +453,19 @@ mod tests {
             Command::EnvUnset {
                 app: "myapp".to_string(),
                 names: vec!["A".to_string(), "B".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cleanup_previous() {
+        let cli = parse_cli(&["psht-server", "cleanup", "previous", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Cleanup {
+                command: CleanupCommand::Previous {
+                    app: "myapp".to_string()
+                }
             }
         );
     }

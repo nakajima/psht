@@ -4,8 +4,21 @@ use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::deploy_log;
+
 const CONTAINER_CREATE_TIMEOUT_SECS: u64 = 300;
 const CONTAINER_CREATE_PROGRESS_SECS: u64 = 30;
+
+macro_rules! eprintln {
+    () => {
+        std::eprintln!()
+    };
+    ($($arg:tt)*) => {{
+        let rendered = format!($($arg)*);
+        std::eprintln!("{}", rendered);
+        deploy_log::append("container", &rendered);
+    }};
+}
 
 fn container_name(app: &str) -> String {
     format!("psht-{app}")
@@ -129,6 +142,9 @@ impl IncusCommand {
 
         for line in rx {
             update_ring(&mut ring, line, window);
+            if let Some(last) = ring.last() {
+                deploy_log::append("container", last);
+            }
 
             // Move cursor up to erase previous window
             if drawn_lines > 0 {
@@ -167,7 +183,13 @@ impl IncusCommand {
         // On failure, leave the last lines visible for debugging
 
         if !status.success() {
-            return Err(format!("incus {args_display} failed"));
+            if ring.is_empty() {
+                return Err(format!("incus {args_display} failed"));
+            }
+            return Err(format!(
+                "incus {args_display} failed\nLast command output:\n{}",
+                ring.join("\n")
+            ));
         }
         Ok(())
     }
@@ -315,10 +337,41 @@ fn launch_with_project(name: &str, image: &str, project: Option<&str>) -> Result
         .args(["launch", image])
         .arg(name)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run incus launch {image} {name}: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture incus launch stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture incus launch stderr".to_string())?;
+
+    let stdout_thread = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if let Ok(line) = line {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                std::println!("{line}");
+                deploy_log::append("container", &line);
+            }
+        }
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            if let Ok(line) = line {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                eprintln!("{line}");
+            }
+        }
+    });
 
     let started_at = Instant::now();
     let mut next_progress = CONTAINER_CREATE_PROGRESS_SECS;
@@ -328,6 +381,12 @@ fn launch_with_project(name: &str, image: &str, project: Option<&str>) -> Result
             .try_wait()
             .map_err(|e| format!("failed to wait for incus launch {image} {name}: {e}"))?
         {
+            stdout_thread
+                .join()
+                .map_err(|_| "incus launch stdout reader panicked".to_string())?;
+            stderr_thread
+                .join()
+                .map_err(|_| "incus launch stderr reader panicked".to_string())?;
             if status.success() {
                 return Ok(());
             }
@@ -338,6 +397,8 @@ fn launch_with_project(name: &str, image: &str, project: Option<&str>) -> Result
         if elapsed >= CONTAINER_CREATE_TIMEOUT_SECS {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             let project_hint = project
                 .map(|p| format!("--project {p} "))
                 .unwrap_or_default();
@@ -518,6 +579,13 @@ fn stack_image_alias(stack: &str, hash: &str) -> String {
     format!("psht-stack-{stack}-{hash}")
 }
 
+fn setup_image_alias(stack: &str, stack_hash: &str, apt_fingerprint: Option<&str>) -> String {
+    match apt_fingerprint {
+        Some(fingerprint) => format!("psht-setup-{stack}-{stack_hash}-{fingerprint}"),
+        None => stack_image_alias(stack, stack_hash),
+    }
+}
+
 #[allow(dead_code)]
 pub fn image_exists(stack: &str, hash: &str) -> bool {
     let alias = stack_image_alias(stack, hash);
@@ -532,6 +600,24 @@ pub fn image_exists(stack: &str, hash: &str) -> bool {
 
 pub fn image_exists_in_project(stack: &str, hash: &str, project: &str) -> bool {
     let alias = stack_image_alias(stack, hash);
+    incus()
+        .arg("--project")
+        .arg(project)
+        .args(&["image", "info"])
+        .arg(alias)
+        .build()
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn setup_image_exists_in_project(
+    stack: &str,
+    stack_hash: &str,
+    apt_fingerprint: Option<&str>,
+    project: &str,
+) -> bool {
+    let alias = setup_image_alias(stack, stack_hash, apt_fingerprint);
     incus()
         .arg("--project")
         .arg(project)
@@ -561,6 +647,18 @@ pub fn create_from_image_in_project(
     launch_with_project(&name, &alias, Some(project))
 }
 
+pub fn create_from_setup_image_in_project(
+    app: &str,
+    stack: &str,
+    stack_hash: &str,
+    apt_fingerprint: Option<&str>,
+    project: &str,
+) -> Result<(), String> {
+    let alias = setup_image_alias(stack, stack_hash, apt_fingerprint);
+    let name = container_name(app);
+    launch_with_project(&name, &alias, Some(project))
+}
+
 #[allow(dead_code)]
 pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
@@ -582,6 +680,37 @@ pub fn publish_image_in_project(
     project: &str,
 ) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
+    let name = container_name(app);
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("stop")
+        .arg(&name)
+        .run()?;
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("publish")
+        .arg(&name)
+        .arg("--alias")
+        .arg(alias)
+        .run()?;
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("start")
+        .arg(&name)
+        .run()
+}
+
+pub fn publish_setup_image_in_project(
+    app: &str,
+    stack: &str,
+    stack_hash: &str,
+    apt_fingerprint: Option<&str>,
+    project: &str,
+) -> Result<(), String> {
+    let alias = setup_image_alias(stack, stack_hash, apt_fingerprint);
     let name = container_name(app);
     incus()
         .arg("--project")
@@ -944,6 +1073,18 @@ mod tests {
     }
 
     #[test]
+    fn setup_image_alias_format() {
+        assert_eq!(
+            setup_image_alias("node", "abc123", None),
+            "psht-stack-node-abc123"
+        );
+        assert_eq!(
+            setup_image_alias("node", "abc123", Some("cafebabe")),
+            "psht-setup-node-abc123-cafebabe"
+        );
+    }
+
+    #[test]
     fn image_exists_command_builds_correctly() {
         let alias = stack_image_alias("node", "abc123");
         let cmd = incus().args(&["image", "info"]).arg(&alias).build();
@@ -958,6 +1099,18 @@ mod tests {
         let cmd = incus().arg("launch").arg(&alias).arg(&name).build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec!["launch", "psht-stack-node-abc123", "psht-myapp"]);
+    }
+
+    #[test]
+    fn create_from_setup_image_command_builds_correctly() {
+        let alias = setup_image_alias("node", "abc123", Some("cafebabe"));
+        let name = container_name("myapp");
+        let cmd = incus().arg("launch").arg(&alias).arg(&name).build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["launch", "psht-setup-node-abc123-cafebabe", "psht-myapp"]
+        );
     }
 
     #[test]

@@ -906,6 +906,40 @@ fn deploy_port(app: &str) -> u16 {
     3001 + (hash % 1000) as u16
 }
 
+fn single_active_app_ref(app: &str) -> Result<String, String> {
+    let instances = app_family_instances(app)?;
+    if instances.len() != 1 {
+        return Err(format!(
+            "expected exactly one active instance for {app}, got: {instances:?}"
+        ));
+    }
+    let instance = &instances[0];
+    let Some(app_ref) = instance.strip_prefix("psht-") else {
+        return Err(format!("unexpected instance name format: {instance}"));
+    };
+    Ok(app_ref.to_string())
+}
+
+fn apt_install_count(app_ref: &str, package: &str) -> Result<u32, String> {
+    let needle = format!("Commandline: apt-get install -y -qq {package}");
+    let command = format!(
+        "if [ -f /var/log/apt/history.log ]; then grep -F {} /var/log/apt/history.log | wc -l; else echo 0; fi",
+        shell_escape(&needle)
+    );
+    let output = exec_output(app_ref, &command)?;
+    output
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("failed to parse apt install count '{output}': {e}"))
+}
+
+fn apt_history_tail(app_ref: &str, lines: u32) -> String {
+    let command = format!(
+        "if [ -f /var/log/apt/history.log ]; then tail -n {lines} /var/log/apt/history.log; fi"
+    );
+    exec_output(app_ref, &command).unwrap_or_default()
+}
+
 #[test]
 fn integration_caddy_end_to_end_with_real_container() {
     let _serial = integration_test_lock();
@@ -1115,6 +1149,102 @@ fn integration_deploy_blue_green_switches_revision_and_cleans_staging_containers
             .iter()
             .any(|name| { name.contains("-prev-") || name.contains("-failed-") }),
         "staging instances should be cleaned after successful cutover: {instances:?}"
+    );
+}
+
+#[test]
+fn integration_deploy_blue_green_reuses_apt_layer_when_apt_packages_unchanged() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-deploy-apt-cache");
+    let home = tempfile::tempdir().expect("failed to create temp HOME");
+    let _env = DeployEnvGuard::set(home.path());
+    let _family_guard = AppFamilyGuard::new(&app);
+
+    if let Err(e) = ensure_user_project_exists() {
+        eprintln!("skipping blue/green apt-cache integration test: {e}");
+        return;
+    }
+
+    let pool = default_storage_pool_name().expect("failed to get storage pool");
+    let volume = storage_volume_name(&app);
+    delete_storage_volume_if_exists(&pool, &volume).expect("failed to clear stale storage volume");
+    let _volume_guard = StorageVolumeGuard::new(&pool, &volume);
+
+    let (work, _) = deploy_repo_init(
+        home.path(),
+        &app,
+        "<html><body>ok-apt-cache-v1</body></html>\n",
+    )
+    .expect("failed to initialize deploy repository");
+
+    fs::write(work.join("psht.toml"), "apt_packages = [\"jq\"]\n")
+        .expect("failed to write psht.toml");
+    run_git(&["add", "psht.toml"], &work).expect("failed to stage psht.toml");
+    run_git(&["commit", "-m", "add apt packages"], &work).expect("failed to commit psht.toml");
+    run_git(&["push", "origin", "main"], &work).expect("failed to push apt config");
+    let first_sha = git_output(&["rev-parse", "HEAD"], &work).expect("failed to read first sha");
+
+    commands::deploy(&app, Some("refs/heads/main"), Some(&first_sha), true)
+        .expect("initial deploy failed");
+    let port = deploy_port(&app);
+    wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-apt-cache-v1",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| panic!("initial revision not reachable: {e}\n{}", debug_info(&app)));
+
+    let active_after_first = single_active_app_ref(&app).expect("failed to resolve active app");
+    let jq_installs_after_first =
+        apt_install_count(&active_after_first, "jq").expect("failed to read apt install count");
+    assert_eq!(
+        jq_installs_after_first,
+        1,
+        "expected one jq install entry after first deploy, got {jq_installs_after_first}\n{}",
+        apt_history_tail(&active_after_first, 80)
+    );
+
+    let second_sha = deploy_repo_commit(
+        &work,
+        "<html><body>ok-apt-cache-v2</body></html>\n",
+        None,
+        "update to v2",
+    )
+    .expect("failed to commit second revision");
+
+    commands::deploy(&app, Some("refs/heads/main"), Some(&second_sha), false)
+        .expect("blue/green deploy failed");
+
+    let response = wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-apt-cache-v2",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| panic!("second revision not reachable: {e}\n{}", debug_info(&app)));
+    assert!(
+        response.contains("ok-apt-cache-v2"),
+        "expected v2 body, got response: {response}"
+    );
+
+    let active_after_second = single_active_app_ref(&app).expect("failed to resolve active app");
+    assert_ne!(
+        active_after_first, active_after_second,
+        "expected blue/green to switch active container"
+    );
+    let jq_installs_after_second =
+        apt_install_count(&active_after_second, "jq").expect("failed to read apt install count");
+    assert_eq!(
+        jq_installs_after_second,
+        1,
+        "expected jq apt install to be reused from cache (no second install), got {jq_installs_after_second}\ninstances: {:?}\n{}",
+        app_family_instances(&app).unwrap_or_default(),
+        apt_history_tail(&active_after_second, 80)
     );
 }
 
