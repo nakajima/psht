@@ -560,6 +560,28 @@ fn parse_tailscale_dns_name(json: &str) -> Option<String> {
     Some(name.trim_end_matches('.').to_string())
 }
 
+fn tailscale_dns_label(dns_name: &str) -> Option<&str> {
+    let label = dns_name.split('.').next()?;
+    if label.is_empty() { None } else { Some(label) }
+}
+
+fn tailscale_hostname_has_collision_suffix(dns_name: &str, app: &str) -> bool {
+    let Some(label) = tailscale_dns_label(dns_name) else {
+        return false;
+    };
+
+    let label = label.to_ascii_lowercase();
+    let app = app.to_ascii_lowercase();
+    let Some(suffix) = label
+        .strip_prefix(&app)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+
+    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+}
+
 fn tailscale_self_health_from_json(json: &str) -> Result<(String, bool, Vec<String>), String> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
@@ -2754,6 +2776,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     let mut old_storage_detached = false;
     let mut candidate_storage_attached = false;
     let mut candidate_proxy_attached = false;
+    let mut old_tailnet_disconnected = false;
 
     let cutover_result = (|| -> Result<Option<String>, String> {
         eprintln!("       Stopping current app process");
@@ -2791,8 +2814,26 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         let tailnet_hostname = if skip_tailscale {
             None
         } else {
+            eprintln!("       Disconnecting previous active container from tailnet");
+            if let Err(e) =
+                container::exec_cmd(&old_active_app, "tailscale down >/dev/null 2>&1 || true")
+            {
+                eprintln!(
+                    "       Warning: failed to bring tailscale down on previous container: {e}"
+                );
+            } else {
+                old_tailnet_disconnected = true;
+            }
+
             eprintln!("       Connecting new active container to tailnet");
-            let name = tailscale::join_in_container(&candidate_app)?;
+            let name = tailscale::join_in_container(&candidate_app, app)?;
+            if let Some(ref dns_name) = name {
+                if tailscale_hostname_has_collision_suffix(dns_name, app) {
+                    return Err(format!(
+                        "tailscale assigned hostname '{dns_name}' with collision suffix during cutover"
+                    ));
+                }
+            }
             if let Err(e) = tailscale::expose_http_in_container(&candidate_app, port) {
                 eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
             }
@@ -2832,8 +2873,25 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                 let _ =
                     launch_app_process(&old_active_app, port, &restored_start_command, &app_env);
             }
-            if !skip_tailscale && tailscale::dns_name_in_container(&old_active_app).is_some() {
-                let _ = tailscale::expose_http_in_container(&old_active_app, port);
+            if !skip_tailscale {
+                let old_tailnet_hostname = if old_tailnet_disconnected {
+                    eprintln!("       Reconnecting previous active container to tailnet");
+                    match tailscale::join_in_container(&old_active_app, app) {
+                        Ok(name) => name,
+                        Err(e) => {
+                            eprintln!(
+                                "       Warning: failed to reconnect previous container to tailnet: {e}"
+                            );
+                            tailscale::dns_name_in_container(&old_active_app)
+                        }
+                    }
+                } else {
+                    tailscale::dns_name_in_container(&old_active_app)
+                };
+
+                if old_tailnet_hostname.is_some() {
+                    let _ = tailscale::expose_http_in_container(&old_active_app, port);
+                }
             }
             let _ = caddy::add(app, port);
             let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
@@ -2845,7 +2903,10 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     };
 
     eprintln!("       Cleaning up previous active container");
-    if !skip_tailscale && let Err(e) = container::exec_cmd(&old_active_app, "tailscale down") {
+    if !skip_tailscale
+        && !old_tailnet_disconnected
+        && let Err(e) = container::exec_cmd(&old_active_app, "tailscale down")
+    {
         eprintln!("       Warning: failed to bring tailscale down on previous container: {e}");
     }
     if let Err(e) = cleanup_container_for_rebuild(&old_active_app, &current_project) {
@@ -2978,7 +3039,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
             eprintln!("-----> Skipping tailnet connection");
         } else {
             eprintln!("-----> Connecting to tailnet");
-            tailnet_hostname = tailscale::join_in_container(app)?;
+            tailnet_hostname = tailscale::join_in_container(app, app)?;
         }
 
         let port = allocate_port(app);
@@ -3834,7 +3895,7 @@ pub fn bootstrap() -> Result<(), String> {
 
     println!();
     println!("=====> psht is ready!");
-    println!("       Containers will join your tailnet as psht-<app>");
+    println!("       Containers will join your tailnet as <app>");
     println!();
     println!("Usage:");
     println!();
@@ -4175,7 +4236,7 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
     eprintln!("-----> Repairing tailscale in container");
     tailscale::install_in_container(&active_app)?;
     let _ = container::exec_cmd(&active_app, "tailscale down >/dev/null 2>&1 || true");
-    let tailnet_hostname = tailscale::join_in_container(&active_app)?;
+    let tailnet_hostname = tailscale::join_in_container(&active_app, app)?;
     let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
     let port = allocate_port(app);
     if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
@@ -5042,6 +5103,26 @@ devices:
             parse_tailscale_dns_name(json),
             Some("psht.tailnet.ts.net".to_string())
         );
+    }
+
+    #[test]
+    fn tailscale_hostname_collision_suffix_detected() {
+        assert!(tailscale_hostname_has_collision_suffix(
+            "hyperlinked-1.tailnet.ts.net",
+            "hyperlinked"
+        ));
+        assert!(tailscale_hostname_has_collision_suffix(
+            "Hyperlinked-22.tailnet.ts.net",
+            "hyperlinked"
+        ));
+        assert!(!tailscale_hostname_has_collision_suffix(
+            "hyperlinked.tailnet.ts.net",
+            "hyperlinked"
+        ));
+        assert!(!tailscale_hostname_has_collision_suffix(
+            "hyperlinked-build-1772439520.tailnet.ts.net",
+            "hyperlinked"
+        ));
     }
 
     #[test]

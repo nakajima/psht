@@ -158,7 +158,7 @@ TS_HOSTNAME=$(tailscale status --json | grep -o '"DNSName":"[^"]*"' | head -1 | 
 
 echo ""
 echo "=====> psht is ready!"
-echo "       Containers will join your tailnet as psht-<app>"
+echo "       Containers will join your tailnet as <app>"
 echo ""
 echo "Usage:"
 echo ""

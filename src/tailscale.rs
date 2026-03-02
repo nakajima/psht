@@ -152,15 +152,19 @@ pub fn dns_name_in_container(app: &str) -> Option<String> {
         .and_then(|json| parse_self_dns_name(&json))
 }
 
-pub fn join_in_container(app: &str) -> Result<Option<String>, String> {
-    let key = auth_key()?;
-    container::exec_cmd(app, "systemctl start tailscaled")?;
-    container::exec_cmd(
-        app,
-        &format!("tailscale up --auth-key {key} --hostname {app} --ssh"),
-    )?;
+fn tailscale_up_command(auth_key: &str, machine_name: &str) -> String {
+    format!("tailscale up --auth-key {auth_key} --hostname {machine_name} --ssh")
+}
 
-    let ts_hostname = dns_name_in_container(app);
+pub fn join_in_container(
+    container_app: &str,
+    machine_name: &str,
+) -> Result<Option<String>, String> {
+    let key = auth_key()?;
+    container::exec_cmd(container_app, "systemctl start tailscaled")?;
+    container::exec_cmd(container_app, &tailscale_up_command(&key, machine_name))?;
+
+    let ts_hostname = dns_name_in_container(container_app);
     match ts_hostname {
         Some(ref name) => eprintln!("       Joined tailnet as {name}"),
         None => eprintln!("       Joined tailnet"),
@@ -341,5 +345,14 @@ mod tests {
             "should map to localhost app port"
         );
         assert!(cmd.contains("tailscale serve --bg 3233"), "should fallback");
+    }
+
+    #[test]
+    fn tailscale_up_command_uses_requested_machine_name() {
+        let cmd = tailscale_up_command("tskey-auth-abc", "hyperlinked");
+        assert_eq!(
+            cmd,
+            "tailscale up --auth-key tskey-auth-abc --hostname hyperlinked --ssh"
+        );
     }
 }
