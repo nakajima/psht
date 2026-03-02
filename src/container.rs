@@ -306,20 +306,19 @@ pub fn remove_storage_mount(app: &str) -> Result<(), String> {
     ))
 }
 
-fn create_with_project(app: &str, project: Option<&str>) -> Result<(), String> {
-    let name = container_name(app);
+fn launch_with_project(name: &str, image: &str, project: Option<&str>) -> Result<(), String> {
     let mut command = Command::new("incus");
     if let Some(project) = project {
         command.arg("--project").arg(project);
     }
     let mut child = command
-        .args(["launch", "images:ubuntu/24.04"])
-        .arg(&name)
+        .args(["launch", image])
+        .arg(name)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("failed to run incus launch images:ubuntu/24.04 {name}: {e}"))?;
+        .map_err(|e| format!("failed to run incus launch {image} {name}: {e}"))?;
 
     let started_at = Instant::now();
     let mut next_progress = CONTAINER_CREATE_PROGRESS_SECS;
@@ -327,12 +326,12 @@ fn create_with_project(app: &str, project: Option<&str>) -> Result<(), String> {
     loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|e| format!("failed to wait for incus launch {name}: {e}"))?
+            .map_err(|e| format!("failed to wait for incus launch {image} {name}: {e}"))?
         {
             if status.success() {
                 return Ok(());
             }
-            return Err(format!("incus launch images:ubuntu/24.04 {name} failed"));
+            return Err(format!("incus launch {image} {name} failed"));
         }
 
         let elapsed = started_at.elapsed().as_secs();
@@ -343,8 +342,8 @@ fn create_with_project(app: &str, project: Option<&str>) -> Result<(), String> {
                 .map(|p| format!("--project {p} "))
                 .unwrap_or_default();
             return Err(format!(
-                "incus launch timed out after {}s while creating '{name}'. Repro: sudo -u psht incus {}launch images:ubuntu/24.04 {}",
-                CONTAINER_CREATE_TIMEOUT_SECS, project_hint, name
+                "incus launch timed out after {}s while creating '{name}' from '{image}'. Repro: sudo -u psht incus {}launch {} {}",
+                CONTAINER_CREATE_TIMEOUT_SECS, project_hint, image, name
             ));
         }
 
@@ -355,6 +354,11 @@ fn create_with_project(app: &str, project: Option<&str>) -> Result<(), String> {
 
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn create_with_project(app: &str, project: Option<&str>) -> Result<(), String> {
+    let name = container_name(app);
+    launch_with_project(&name, "images:ubuntu/24.04", project)
 }
 
 #[allow(dead_code)]
@@ -541,11 +545,8 @@ pub fn image_exists_in_project(stack: &str, hash: &str, project: &str) -> bool {
 #[allow(dead_code)]
 pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
-    incus()
-        .arg("launch")
-        .arg(alias)
-        .arg(container_name(app))
-        .run()
+    let name = container_name(app);
+    launch_with_project(&name, &alias, None)
 }
 
 pub fn create_from_image_in_project(
@@ -555,13 +556,8 @@ pub fn create_from_image_in_project(
     project: &str,
 ) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("launch")
-        .arg(alias)
-        .arg(container_name(app))
-        .run()
+    let name = container_name(app);
+    launch_with_project(&name, &alias, Some(project))
 }
 
 #[allow(dead_code)]
