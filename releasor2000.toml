@@ -2,6 +2,7 @@
 name = "psht"
 binaries = ["psht-server", "psht"]
 repo = "nakajima/psht"
+auto-tag = true
 # version_command = "git describe --tags --abbrev=0"
 
 [build]
