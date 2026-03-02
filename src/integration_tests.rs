@@ -1,5 +1,7 @@
+use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -632,6 +634,278 @@ impl Drop for CaddyEnvGuard {
     }
 }
 
+struct DeployEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    old_home: Option<String>,
+    old_skip_tailscale: Option<String>,
+    old_incus_project: Option<String>,
+}
+
+impl DeployEnvGuard {
+    fn set(home: &Path) -> Self {
+        let lock = match env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("warning: env lock poisoned; continuing");
+                poisoned.into_inner()
+            }
+        };
+        let old_home = std::env::var("HOME").ok();
+        let old_skip_tailscale = std::env::var("PSHT_SKIP_TAILSCALE").ok();
+        let old_incus_project = std::env::var("INCUS_PROJECT").ok();
+        let home_value = home.to_string_lossy().to_string();
+        let uid_output = Command::new("id").args(["-u"]).output().ok();
+        let user_project = uid_output.and_then(|output| {
+            if output.status.success() {
+                let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if uid.is_empty() {
+                    None
+                } else {
+                    Some(format!("user-{uid}"))
+                }
+            } else {
+                None
+            }
+        });
+        // SAFETY: environment mutation is serialized by a global mutex for these tests.
+        unsafe {
+            std::env::set_var("HOME", home_value);
+            std::env::set_var("PSHT_SKIP_TAILSCALE", "1");
+            if let Some(project) = user_project.as_deref() {
+                std::env::set_var("INCUS_PROJECT", project);
+            }
+        }
+        Self {
+            _lock: lock,
+            old_home,
+            old_skip_tailscale,
+            old_incus_project,
+        }
+    }
+}
+
+impl Drop for DeployEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: environment mutation is serialized by a global mutex for these tests.
+        unsafe {
+            match &self.old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.old_skip_tailscale {
+                Some(value) => std::env::set_var("PSHT_SKIP_TAILSCALE", value),
+                None => std::env::remove_var("PSHT_SKIP_TAILSCALE"),
+            }
+            match &self.old_incus_project {
+                Some(value) => std::env::set_var("INCUS_PROJECT", value),
+                None => std::env::remove_var("INCUS_PROJECT"),
+            }
+        }
+    }
+}
+
+struct AppFamilyGuard {
+    app: String,
+}
+
+impl AppFamilyGuard {
+    fn new(app: &str) -> Self {
+        Self {
+            app: app.to_string(),
+        }
+    }
+}
+
+impl Drop for AppFamilyGuard {
+    fn drop(&mut self) {
+        cleanup_app_family(&self.app);
+    }
+}
+
+fn run_git(args: &[&str], cwd: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!("git {} failed: {stderr}", args.join(" ")))
+}
+
+fn git_output(args: &[&str], cwd: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git {} failed: {stderr}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn ensure_user_project_exists() -> Result<String, String> {
+    let uid_output = Command::new("id")
+        .args(["-u"])
+        .output()
+        .map_err(|e| format!("failed to run id -u: {e}"))?;
+    if !uid_output.status.success() {
+        let stderr = String::from_utf8_lossy(&uid_output.stderr)
+            .trim()
+            .to_string();
+        return Err(format!("id -u failed: {stderr}"));
+    }
+    let uid = String::from_utf8_lossy(&uid_output.stdout)
+        .trim()
+        .to_string();
+    let project = format!("user-{uid}");
+    let show = Command::new("incus")
+        .args(["project", "show", &project])
+        .output()
+        .map_err(|e| format!("failed to inspect incus project {project}: {e}"))?;
+    if !show.status.success() {
+        let create = Command::new("incus")
+            .args(["project", "create", &project])
+            .output()
+            .map_err(|e| format!("failed to create incus project {project}: {e}"))?;
+        if !create.status.success() {
+            let stderr = String::from_utf8_lossy(&create.stderr).trim().to_string();
+            return Err(format!(
+                "failed to create incus project {project}: {stderr}"
+            ));
+        }
+    }
+    let set_proxy = Command::new("incus")
+        .args(["project", "set", &project, "restricted.devices.proxy=allow"])
+        .output()
+        .map_err(|e| format!("failed to update project {project} proxy policy: {e}"))?;
+    if !set_proxy.status.success() {
+        let stderr = String::from_utf8_lossy(&set_proxy.stderr)
+            .trim()
+            .to_string();
+        return Err(format!(
+            "failed to set restricted.devices.proxy=allow for project {project}: {stderr}"
+        ));
+    }
+    Ok(project)
+}
+
+fn app_family_instances(app: &str) -> Result<Vec<String>, String> {
+    let family_prefix = format!("psht-{app}");
+    Ok(container::list()?
+        .into_iter()
+        .filter_map(|container| {
+            if container.name == family_prefix
+                || container.name.starts_with(&format!("{family_prefix}-"))
+            {
+                Some(container.name)
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+fn cleanup_app_family(app: &str) {
+    let Ok(instances) = app_family_instances(app) else {
+        return;
+    };
+    for instance in instances {
+        let _ = Command::new("incus")
+            .args(["stop", "--force", &instance])
+            .status();
+        let _ = Command::new("incus")
+            .args(["delete", "--force", &instance])
+            .status();
+    }
+}
+
+fn deploy_repo_init(
+    home: &Path,
+    app: &str,
+    initial_body: &str,
+) -> Result<(PathBuf, String), String> {
+    let repos_dir = home.join("repos");
+    fs::create_dir_all(&repos_dir)
+        .map_err(|e| format!("failed to create repos dir {}: {e}", repos_dir.display()))?;
+    let work = home.join(format!("{app}-work"));
+    fs::create_dir_all(&work)
+        .map_err(|e| format!("failed to create work dir {}: {e}", work.display()))?;
+
+    run_git(&["init"], &work)?;
+    run_git(&["config", "user.name", "psht integration tests"], &work)?;
+    run_git(
+        &["config", "user.email", "psht-integration-tests@example.com"],
+        &work,
+    )?;
+    fs::write(work.join("index.html"), initial_body)
+        .map_err(|e| format!("failed to write initial index.html: {e}"))?;
+    run_git(&["add", "index.html"], &work)?;
+    run_git(&["commit", "-m", "initial"], &work)?;
+    run_git(&["branch", "-M", "main"], &work)?;
+
+    let remote = repos_dir.join(format!("{app}.git"));
+    let remote_str = remote.to_string_lossy().to_string();
+    run_git(&["init", "--bare", &remote_str], home)?;
+    run_git(&["remote", "add", "origin", &remote_str], &work)?;
+    run_git(&["push", "-u", "origin", "main"], &work)?;
+
+    let symbolic = Command::new("git")
+        .args([
+            "--git-dir",
+            &remote_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ])
+        .output()
+        .map_err(|e| format!("failed to set bare HEAD to main: {e}"))?;
+    if !symbolic.status.success() {
+        let stderr = String::from_utf8_lossy(&symbolic.stderr).trim().to_string();
+        return Err(format!("failed to set bare HEAD to main: {stderr}"));
+    }
+
+    let sha = git_output(&["rev-parse", "HEAD"], &work)?;
+    Ok((work, sha))
+}
+
+fn deploy_repo_commit(
+    work: &Path,
+    body: &str,
+    procfile: Option<&str>,
+    message: &str,
+) -> Result<String, String> {
+    fs::write(work.join("index.html"), body)
+        .map_err(|e| format!("failed to update index.html: {e}"))?;
+    let procfile_path = work.join("Procfile");
+    match procfile {
+        Some(contents) => fs::write(&procfile_path, contents)
+            .map_err(|e| format!("failed to write Procfile: {e}"))?,
+        None => {
+            if let Err(e) = fs::remove_file(&procfile_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(format!("failed to remove Procfile: {e}"));
+            }
+        }
+    }
+    run_git(&["add", "-A"], work)?;
+    run_git(&["commit", "-m", message], work)?;
+    run_git(&["push", "origin", "main"], work)?;
+    git_output(&["rev-parse", "HEAD"], work)
+}
+
+fn deploy_port(app: &str) -> u16 {
+    let hash: u32 = app
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    3001 + (hash % 1000) as u16
+}
+
 #[test]
 fn integration_caddy_end_to_end_with_real_container() {
     let _serial = integration_test_lock();
@@ -760,6 +1034,164 @@ fn integration_rust() {
     let resp = wait_for_http(&ip, APP_PORT, Duration::from_secs(120))
         .unwrap_or_else(|e| panic!("rust app not reachable: {e}\n{}", debug_info(&app)));
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
+}
+
+#[test]
+fn integration_deploy_blue_green_switches_revision_and_cleans_staging_containers() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-deploy-bluegreen");
+    let home = tempfile::tempdir().expect("failed to create temp HOME");
+    let _env = DeployEnvGuard::set(home.path());
+    let _family_guard = AppFamilyGuard::new(&app);
+
+    if let Err(e) = ensure_user_project_exists() {
+        eprintln!("skipping blue/green integration test: {e}");
+        return;
+    }
+
+    let pool = default_storage_pool_name().expect("failed to get storage pool");
+    let volume = storage_volume_name(&app);
+    delete_storage_volume_if_exists(&pool, &volume).expect("failed to clear stale storage volume");
+    let _volume_guard = StorageVolumeGuard::new(&pool, &volume);
+
+    let (work, first_sha) = deploy_repo_init(
+        home.path(),
+        &app,
+        "<html><body>ok-bluegreen-v1</body></html>\n",
+    )
+    .expect("failed to initialize deploy repository");
+
+    commands::deploy(&app, Some("refs/heads/main"), Some(&first_sha), true)
+        .expect("initial deploy failed");
+    let port = deploy_port(&app);
+    wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-bluegreen-v1",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| panic!("initial revision not reachable: {e}\n{}", debug_info(&app)));
+
+    let second_sha = deploy_repo_commit(
+        &work,
+        "<html><body>ok-bluegreen-v2</body></html>\n",
+        None,
+        "update to v2",
+    )
+    .expect("failed to commit second revision");
+
+    commands::deploy(&app, Some("refs/heads/main"), Some(&second_sha), false)
+        .expect("blue/green deploy failed");
+
+    let response = wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-bluegreen-v2",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| panic!("second revision not reachable: {e}\n{}", debug_info(&app)));
+    assert!(
+        response.contains("ok-bluegreen-v2"),
+        "expected v2 body, got response: {response}"
+    );
+
+    let instances = app_family_instances(&app).expect("failed to list app family instances");
+    assert!(
+        instances.iter().any(|name| name == &format!("psht-{app}")),
+        "expected active instance psht-{app}, got: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|name| {
+            name.contains("-build-") || name.contains("-prev-") || name.contains("-failed-")
+        }),
+        "staging instances should be cleaned after successful cutover: {instances:?}"
+    );
+}
+
+#[test]
+fn integration_deploy_blue_green_rolls_back_when_new_revision_fails_to_start() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-deploy-rollback");
+    let home = tempfile::tempdir().expect("failed to create temp HOME");
+    let _env = DeployEnvGuard::set(home.path());
+    let _family_guard = AppFamilyGuard::new(&app);
+
+    if let Err(e) = ensure_user_project_exists() {
+        eprintln!("skipping blue/green rollback integration test: {e}");
+        return;
+    }
+
+    let pool = default_storage_pool_name().expect("failed to get storage pool");
+    let volume = storage_volume_name(&app);
+    delete_storage_volume_if_exists(&pool, &volume).expect("failed to clear stale storage volume");
+    let _volume_guard = StorageVolumeGuard::new(&pool, &volume);
+
+    let (work, first_sha) = deploy_repo_init(
+        home.path(),
+        &app,
+        "<html><body>ok-rollback-v1</body></html>\n",
+    )
+    .expect("failed to initialize deploy repository");
+
+    commands::deploy(&app, Some("refs/heads/main"), Some(&first_sha), true)
+        .expect("initial deploy failed");
+    let port = deploy_port(&app);
+    wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-rollback-v1",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| panic!("initial revision not reachable: {e}\n{}", debug_info(&app)));
+
+    let bad_sha = deploy_repo_commit(
+        &work,
+        "<html><body>ok-rollback-v2</body></html>\n",
+        Some("web: sh -c 'echo broken >&2; exit 1'"),
+        "introduce broken startup",
+    )
+    .expect("failed to commit broken revision");
+
+    let err = commands::deploy(&app, Some("refs/heads/main"), Some(&bad_sha), false)
+        .expect_err("broken revision should fail and rollback");
+    assert!(
+        err.contains("rollback was applied"),
+        "expected rollback error marker, got: {err}"
+    );
+
+    let response = wait_for_http_with_host(
+        "127.0.0.1",
+        port,
+        "localhost",
+        "/",
+        "ok-rollback-v1",
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| panic!("rollback did not restore v1: {e}\n{}", debug_info(&app)));
+    assert!(
+        response.contains("ok-rollback-v1"),
+        "expected rollback to previous body, got response: {response}"
+    );
+
+    let instances = app_family_instances(&app).expect("failed to list app family instances");
+    assert!(
+        instances.iter().any(|name| name == &format!("psht-{app}")),
+        "expected active instance psht-{app}, got: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|name| name.contains("-prev-")),
+        "previous instance should be cleaned after rollback: {instances:?}"
+    );
+    assert!(
+        !instances.iter().any(|name| name.contains("-build-")),
+        "candidate instance should be cleaned after rollback: {instances:?}"
+    );
 }
 
 // RAII guard: launches an Incus VM; force-stops + deletes on drop.

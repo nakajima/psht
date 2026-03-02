@@ -437,6 +437,33 @@ pub fn add_proxy(app: &str, host_port: u16, container_port: u16) -> Result<(), S
         .run()
 }
 
+pub fn remove_proxy(app: &str) -> Result<(), String> {
+    let name = container_name(app);
+    let output = incus()
+        .args(&["config", "device", "remove"])
+        .arg(&name)
+        .arg("port")
+        .build()
+        .output()
+        .map_err(|e| format!("failed to run incus config device remove {name} port: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if is_missing_device_error(&stderr) {
+        return Ok(());
+    }
+    Err(format!(
+        "incus config device remove {name} port failed: {stderr}"
+    ))
+}
+
+pub fn rename_app(old_app: &str, new_app: &str) -> Result<(), String> {
+    let old_name = container_name(old_app);
+    let new_name = container_name(new_app);
+    incus().arg("rename").arg(old_name).arg(new_name).run()
+}
+
 pub fn stop(app: &str) -> Result<(), String> {
     incus().arg("stop").arg(container_name(app)).run()
 }
@@ -741,6 +768,30 @@ mod tests {
                 "connect=tcp:127.0.0.1:3001"
             ]
         );
+    }
+
+    #[test]
+    fn incus_proxy_remove_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "remove"])
+            .arg(&name)
+            .arg("port")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["config", "device", "remove", "psht-myapp", "port"]
+        );
+    }
+
+    #[test]
+    fn incus_rename_command_builds_correctly() {
+        let old_name = container_name("myapp");
+        let new_name = container_name("myapp-next");
+        let cmd = incus().arg("rename").arg(&old_name).arg(&new_name).build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec!["rename", "psht-myapp", "psht-myapp-next"]);
     }
 
     #[test]

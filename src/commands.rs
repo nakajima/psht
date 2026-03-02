@@ -42,6 +42,8 @@ const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
+const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
+const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -1889,6 +1891,54 @@ fn allocate_port(app: &str) -> u16 {
     3001 + (hash % 1000) as u16
 }
 
+fn deploy_instance_id() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs();
+    format!("{ts}")
+}
+
+fn candidate_app_name(app: &str, deploy_id: &str) -> String {
+    format!("{app}-build-{deploy_id}")
+}
+
+fn previous_app_name(app: &str, deploy_id: &str) -> String {
+    format!("{app}-prev-{deploy_id}")
+}
+
+fn wait_for_tcp_listener(
+    app: &str,
+    port: u16,
+    timeout_secs: u64,
+    label: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut next_heartbeat = DEPLOY_PROGRESS_HEARTBEAT_SECS;
+    loop {
+        let output = container::exec_output(
+            app,
+            &format!(
+                "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
+            ),
+        )?;
+        if output.trim() == "ready" {
+            return Ok(());
+        }
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= timeout_secs {
+            return Err(format!(
+                "{label} timed out after {timeout_secs}s waiting for TCP :{port}"
+            ));
+        }
+        if elapsed >= next_heartbeat {
+            eprintln!("       Still waiting for TCP :{port} ({elapsed}s elapsed)");
+            next_heartbeat += DEPLOY_PROGRESS_HEARTBEAT_SECS;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 fn start_exports(port: u16, vars: &BTreeMap<String, String>) -> Result<String, String> {
     let mut parts = vec![format!("export PORT={port}")];
     for (name, value) in vars {
@@ -2335,6 +2385,15 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
 }
 
 fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
+    if container::exists(app) {
+        deploy_from_blue_green(app, code_dir)
+    } else {
+        deploy_from_in_place(app, code_dir)
+    }
+}
+
+fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
+    let deploy_started = Instant::now();
     let current_uid = run_cmd_capture("id", &["-u"])?;
     let current_project = format!("user-{}", current_uid.trim());
     if command_succeeds("incus", &["project", "show", &current_project]) {
@@ -2359,8 +2418,271 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
     let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
     let hash = stack_hash(&script_path)?;
+    let port = allocate_port(app);
+    let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
+    let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
 
-    let mut tailnet_hostname = tailscale::dns_name_in_container(app);
+    let deploy_id = deploy_instance_id();
+    let candidate_app = candidate_app_name(app, &deploy_id);
+    let previous_app = previous_app_name(app, &deploy_id);
+
+    if container::exists(&candidate_app) {
+        let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+    }
+    if container::exists(&previous_app) {
+        let _ = cleanup_container_for_rebuild(&previous_app, &current_project);
+    }
+
+    eprintln!("-----> Preparing candidate container");
+    eprintln!("       Candidate: {candidate_app}");
+    eprintln!("       Traffic remains on current container");
+    wait_for_container_operation_quiet(app, &current_project)?;
+
+    let build_candidate_result = (|| -> Result<(), String> {
+        if container::image_exists_in_project(&stack, &hash, &current_project) {
+            eprintln!("-----> Creating candidate from cached image");
+            container::create_from_image_in_project(
+                &candidate_app,
+                &stack,
+                &hash,
+                &current_project,
+            )?;
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup in candidate");
+            } else {
+                eprintln!("-----> Installing tailscale in candidate");
+                tailscale::install_in_container(&candidate_app)?;
+            }
+        } else {
+            eprintln!("-----> Creating candidate container");
+            eprintln!("       First run may take a while while Ubuntu image downloads");
+            ensure_create_prereqs(&current_project)?;
+            container::create_in_project(&candidate_app, &current_project)?;
+
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup in candidate");
+            } else {
+                eprintln!("-----> Installing tailscale in candidate");
+                tailscale::install_in_container(&candidate_app)?;
+            }
+
+            eprintln!("-----> Setting up candidate runtime");
+            container::push_file(
+                &candidate_app,
+                &script_path.to_string_lossy(),
+                "/tmp/setup.sh",
+            )?;
+            container::exec_cmd_rolling(
+                &candidate_app,
+                "chmod +x /tmp/setup.sh && /tmp/setup.sh",
+                5,
+            )?;
+
+            eprintln!("-----> Caching stack image");
+            if let Err(e) =
+                container::publish_image_in_project(&candidate_app, &stack, &hash, &current_project)
+            {
+                eprintln!("       Warning: failed to cache stack image: {e}");
+            }
+        }
+
+        container::exec_cmd(
+            &candidate_app,
+            &format!("echo -n '{hash}' > /etc/psht-setup-hash"),
+        )?;
+
+        eprintln!("-----> Building candidate");
+        container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
+        install_apt_packages(&candidate_app, &config.apt_packages)?;
+        persist_start_command(&candidate_app, &config.start_command)?;
+        persist_required_env(&candidate_app, &config.required_env)?;
+        run_hook(
+            &candidate_app,
+            "preinstall",
+            config.preinstall_command.as_deref(),
+        )?;
+
+        if let Some(command) = app_workdir_command(&config.install_command) {
+            eprintln!("-----> Installing candidate dependencies");
+            container::exec_cmd_rolling(&candidate_app, &command, 5)?;
+        }
+        run_hook(
+            &candidate_app,
+            "postinstall",
+            config.postinstall_command.as_deref(),
+        )?;
+        Ok(())
+    })();
+
+    if let Err(err) = build_candidate_result {
+        let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+        return Err(err);
+    }
+
+    eprintln!("-----> Switching traffic");
+    eprintln!("       Traffic remains on current container until cutover is complete");
+    let mut active_renamed = false;
+    let mut candidate_promoted = false;
+    let mut failed_candidate_name: Option<String> = None;
+
+    let cutover_result = (|| -> Result<Option<String>, String> {
+        eprintln!("       Stopping current app process");
+        stop_app_process(app)?;
+
+        eprintln!("       Removing old proxy device");
+        container::remove_proxy(app)?;
+
+        eprintln!("       Detaching storage from current container");
+        if let Err(e) = container::remove_storage_mount(app) {
+            eprintln!("       Warning: failed to detach storage from current container: {e}");
+        }
+
+        eprintln!("       Renaming active container to previous");
+        container::rename_app(app, &previous_app)?;
+        active_renamed = true;
+
+        eprintln!("       Renaming candidate to active");
+        container::rename_app(&candidate_app, app)?;
+        candidate_promoted = true;
+
+        eprintln!("       Re-attaching storage to new active container");
+        container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
+
+        eprintln!("       Attaching proxy to new active container");
+        container::add_proxy(app, port, port)?;
+
+        eprintln!("       Starting app in new active container");
+        launch_app_process(app, &config.start_command, &app_env)?;
+
+        eprintln!("-----> Waiting for candidate readiness");
+        wait_for_tcp_listener(
+            app,
+            port,
+            DEPLOY_TCP_READY_TIMEOUT_SECS,
+            "candidate readiness",
+        )?;
+
+        let tailnet_hostname = if skip_tailscale {
+            None
+        } else {
+            eprintln!("       Connecting new active container to tailnet");
+            let name = tailscale::join_in_container(app)?;
+            if let Err(e) = tailscale::expose_http_in_container(app, port) {
+                eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+            }
+            name
+        };
+
+        caddy::add(app, port)?;
+
+        eprintln!("       Cleaning up previous container");
+        if !skip_tailscale && let Err(e) = tailscale_down(&previous_app) {
+            eprintln!("       Warning: failed to bring tailscale down on previous container: {e}");
+        }
+        cleanup_container_for_rebuild(&previous_app, &current_project)?;
+        Ok(tailnet_hostname)
+    })();
+
+    let tailnet_hostname = match cutover_result {
+        Ok(name) => name,
+        Err(err) => {
+            eprintln!("-----> Cutover failed; rolling back traffic");
+
+            if candidate_promoted {
+                let failed = format!("{app}-failed-{deploy_id}");
+                let _ = container::remove_proxy(app);
+                let _ = container::remove_storage_mount(app);
+                if container::rename_app(app, &failed).is_ok() {
+                    failed_candidate_name = Some(failed);
+                }
+            }
+            if active_renamed {
+                let _ = container::rename_app(&previous_app, app);
+            }
+
+            let _ = container::ensure_storage_mount(app, &storage_pool, &storage_volume);
+            let _ = container::add_proxy(app, port, port);
+            if let Ok(restored_start_command) = read_start_command(app) {
+                let _ = launch_app_process(app, &restored_start_command, &app_env);
+            }
+            if !skip_tailscale && tailscale::dns_name_in_container(app).is_some() {
+                let _ = tailscale::expose_http_in_container(app, port);
+            }
+            let _ = caddy::add(app, port);
+
+            if let Some(failed) = failed_candidate_name.as_deref() {
+                let _ = cleanup_container_for_rebuild(failed, &current_project);
+            } else {
+                let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+            }
+
+            return Err(format!(
+                "deploy cutover failed and rollback was applied: {err}"
+            ));
+        }
+    };
+
+    let build_number = increment_build_number(app)?;
+
+    if let Some(name) = tailnet_hostname {
+        eprintln!("       Tailnet: http://{name} (also http://{name}:{port})");
+    }
+
+    if let Some(hash) = binary_hash {
+        if let Err(e) = write_binary_hash(app, &hash) {
+            eprintln!("       Warning: failed to persist binary hash: {e}");
+        }
+    } else if let Err(e) = clear_binary_hash(app) {
+        eprintln!("       Warning: failed to clear binary hash: {e}");
+    }
+
+    eprintln!("-----> Verifying live endpoint");
+    wait_for_tcp_listener(
+        app,
+        port,
+        DEPLOY_TCP_READY_TIMEOUT_SECS,
+        "post-cutover verification",
+    )?;
+
+    eprintln!(
+        "=====> App {app} deployed on port {port} (build {build_number}, {}s)",
+        deploy_started.elapsed().as_secs()
+    );
+    Ok(())
+}
+
+fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
+    let current_uid = run_cmd_capture("id", &["-u"])?;
+    let current_project = format!("user-{}", current_uid.trim());
+    if command_succeeds("incus", &["project", "show", &current_project]) {
+        ensure_project_default_profile(&current_project)?;
+    }
+    init_stacks_in(&stacks_dir())?;
+
+    eprintln!("-----> Detecting app type");
+    let config = detect::detect(code_dir)?;
+    eprintln!("       Detected: {:?}", config.app_type);
+    let app_env = read_env_vars(app)?;
+    ensure_required_env_present(&config.required_env, &app_env)?;
+    let binary_hash = if matches!(config.app_type, detect::AppType::Binary) {
+        binary_payload_hash(code_dir)?
+    } else {
+        None
+    };
+
+    if code_dir.join("psht-stack.sh").exists() {
+        eprintln!("       Using custom stack");
+    }
+
+    let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
+    let hash = stack_hash(&script_path)?;
+    let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
+
+    let mut tailnet_hostname = if skip_tailscale {
+        None
+    } else {
+        tailscale::dns_name_in_container(app)
+    };
     let needs_setup = if container::exists(app) {
         let remote_hash = container::exec_output(app, "cat /etc/psht-setup-hash 2>/dev/null")
             .unwrap_or_default()
@@ -2386,16 +2708,24 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
             eprintln!("-----> Creating container from cached image");
             container::create_from_image_in_project(app, &stack, &hash, &current_project)?;
 
-            eprintln!("-----> Installing tailscale");
-            tailscale::install_in_container(app)?;
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup");
+            } else {
+                eprintln!("-----> Installing tailscale");
+                tailscale::install_in_container(app)?;
+            }
         } else {
             eprintln!("-----> Creating container");
             eprintln!("       First run may take a while while Ubuntu image downloads");
             ensure_create_prereqs(&current_project)?;
             container::create_in_project(app, &current_project)?;
 
-            eprintln!("-----> Installing tailscale");
-            tailscale::install_in_container(app)?;
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup");
+            } else {
+                eprintln!("-----> Installing tailscale");
+                tailscale::install_in_container(app)?;
+            }
 
             eprintln!("-----> Setting up runtime");
             container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
@@ -2411,8 +2741,12 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
 
         container::exec_cmd(app, &format!("echo -n '{hash}' > /etc/psht-setup-hash"))?;
 
-        eprintln!("-----> Connecting to tailnet");
-        tailnet_hostname = tailscale::join_in_container(app)?;
+        if skip_tailscale {
+            eprintln!("-----> Skipping tailnet connection");
+        } else {
+            eprintln!("-----> Connecting to tailnet");
+            tailnet_hostname = tailscale::join_in_container(app)?;
+        }
 
         let port = allocate_port(app);
         eprintln!("-----> Setting up port forwarding on :{port}");
@@ -2440,8 +2774,10 @@ fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Starting app");
     launch_app_process(app, &config.start_command, &app_env)?;
 
-    tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
-    if tailnet_hostname.is_some() {
+    if !skip_tailscale {
+        tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
+    }
+    if !skip_tailscale && tailnet_hostname.is_some() {
         if let Err(e) = tailscale::expose_http_in_container(app, port) {
             eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
         }
