@@ -48,13 +48,14 @@ const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
-const TAILSCALE_HOSTNAME_RECLAIM_TIMEOUT_SECS: u64 = 20;
-const TAILSCALE_HOSTNAME_RECLAIM_POLL_MS: u64 = 1000;
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 const HEALTH_DELEGATED_ENV: &str = "PSHT_HEALTH_DELEGATED";
 const LOGS_DEPLOY_HISTORY_FILES: usize = 12;
 const LOGS_DEPLOY_HISTORY_LINES_PER_FILE: usize = 400;
+const TAILSCALE_STATE_SEED_PATH: &str = "/var/lib/psht-tailscale-state";
+const INCUS_METADATA_TIMEOUT_SECS: u64 = 20;
+const TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS: u64 = 1000;
 
 macro_rules! eprintln {
     () => {
@@ -424,6 +425,82 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+fn pretty_cmd(program: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn output_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<(std::process::Output, bool), String> {
+    let use_timeout = command_exists("timeout");
+    if use_timeout {
+        let timeout_arg = format!("{timeout_secs}s");
+        let output = Command::new("timeout")
+            .arg("--kill-after=2s")
+            .arg(&timeout_arg)
+            .arg(program)
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to run timeout-wrapped {program}: {e}"))?;
+        let code = output.status.code().unwrap_or_default();
+        let timed_out = code == 124 || code == 137;
+        return Ok((output, timed_out));
+    }
+
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    Ok((output, false))
+}
+
+fn run_cmd_capture_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let pretty = pretty_cmd(program, args);
+    let (output, timed_out) = output_with_timeout(program, args, timeout_secs)?;
+    if timed_out {
+        return Err(format!("command timed out after {timeout_secs}s: {pretty}"));
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!("command failed: {pretty}"));
+        }
+        return Err(format!("command failed: {pretty}: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn command_succeeds_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<bool, String> {
+    let pretty = pretty_cmd(program, args);
+    let (output, timed_out) = output_with_timeout(program, args, timeout_secs)?;
+    if timed_out {
+        return Err(format!("command timed out after {timeout_secs}s: {pretty}"));
+    }
+    Ok(output.status.success())
+}
+
+fn run_incus_metadata_capture(args: &[&str]) -> Result<String, String> {
+    run_cmd_capture_with_timeout("incus", args, INCUS_METADATA_TIMEOUT_SECS)
+}
+
+fn incus_metadata_command_succeeds(args: &[&str]) -> Result<bool, String> {
+    command_succeeds_with_timeout("incus", args, INCUS_METADATA_TIMEOUT_SECS)
+}
+
 fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
@@ -586,25 +663,14 @@ fn parse_tailscale_dns_name(json: &str) -> Option<String> {
 }
 
 fn tailscale_dns_label(dns_name: &str) -> Option<&str> {
-    let label = dns_name.split('.').next()?;
+    let label = dns_name.trim_end_matches('.').split('.').next()?;
     if label.is_empty() { None } else { Some(label) }
 }
 
-fn tailscale_hostname_has_collision_suffix(dns_name: &str, app: &str) -> bool {
-    let Some(label) = tailscale_dns_label(dns_name) else {
-        return false;
-    };
-
-    let label = label.to_ascii_lowercase();
-    let app = app.to_ascii_lowercase();
-    let Some(suffix) = label
-        .strip_prefix(&app)
-        .and_then(|rest| rest.strip_prefix('-'))
-    else {
-        return false;
-    };
-
-    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+fn tailscale_hostname_is_exact(dns_name: &str, app: &str) -> bool {
+    tailscale_dns_label(dns_name)
+        .map(|label| label.eq_ignore_ascii_case(app))
+        .unwrap_or(false)
 }
 
 fn tailscale_self_health_from_json(json: &str) -> Result<(String, bool, Vec<String>), String> {
@@ -676,61 +742,154 @@ fn wait_for_tailscale_online(
     }
 }
 
-fn join_tailnet_for_cutover_with_reclaim<FJoin, FDown, FSleep>(
+fn reset_tailscale_for_retry(container_app: &str) -> Result<(), String> {
+    container::exec_cmd(container_app, "tailscale down >/dev/null 2>&1 || true")?;
+    container::exec_cmd(
+        container_app,
+        "systemctl stop tailscaled >/dev/null 2>&1 || true",
+    )
+}
+
+fn acquire_exact_tailscale_hostname_with_retry<
+    FStateJoin,
+    FAuthJoin,
+    FWaitHealthy,
+    FReset,
+    FSleep,
+>(
     container_app: &str,
     app: &str,
-    timeout: Duration,
-    poll_interval: Duration,
-    mut join: FJoin,
-    mut down: FDown,
+    mut join_with_state: FStateJoin,
+    mut join_with_auth_key: FAuthJoin,
+    mut wait_healthy: FWaitHealthy,
+    mut reset_for_retry: FReset,
     mut sleep: FSleep,
 ) -> Result<Option<String>, String>
 where
-    FJoin: FnMut(&str, &str) -> Result<Option<String>, String>,
-    FDown: FnMut(&str) -> Result<(), String>,
+    FStateJoin: FnMut(&str, &str) -> Result<Option<String>, String>,
+    FAuthJoin: FnMut(&str, &str) -> Result<Option<String>, String>,
+    FWaitHealthy: FnMut(&str) -> Result<(), String>,
+    FReset: FnMut(&str) -> Result<(), String>,
     FSleep: FnMut(Duration),
 {
-    let start = Instant::now();
+    let started = Instant::now();
+    let mut attempt: u64 = 0;
+    let retry_sleep = Duration::from_millis(TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS);
 
     loop {
-        let name = join(container_app, app)?;
-        let Some(dns_name) = name.as_deref() else {
-            return Ok(name);
+        attempt = attempt.saturating_add(1);
+        eprintln!(
+            "       Acquiring exact tailscale hostname (attempt {attempt}, {}s elapsed)",
+            started.elapsed().as_secs()
+        );
+
+        let name = match join_with_state(container_app, app) {
+            Ok(name) => name,
+            Err(state_err) => {
+                eprintln!("       State-based tailscale join failed: {state_err}");
+                eprintln!("       Falling back to auth-key tailscale join");
+                match join_with_auth_key(container_app, app) {
+                    Ok(name) => name,
+                    Err(auth_err) => {
+                        eprintln!("       Auth-key tailscale join failed: {auth_err}");
+                        if let Err(reset_err) = reset_for_retry(container_app) {
+                            eprintln!(
+                                "       Warning: failed to reset tailscale before retry: {reset_err}"
+                            );
+                        }
+                        sleep(retry_sleep);
+                        continue;
+                    }
+                }
+            }
         };
 
-        if !tailscale_hostname_has_collision_suffix(dns_name, app) {
-            return Ok(name);
+        let Some(dns_name) = name.as_deref() else {
+            eprintln!("       Tailscale DNS name unavailable yet; retrying");
+            if let Err(reset_err) = reset_for_retry(container_app) {
+                eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
+            }
+            sleep(retry_sleep);
+            continue;
+        };
+
+        if !tailscale_hostname_is_exact(dns_name, app) {
+            eprintln!(
+                "       Hostname mismatch: got '{dns_name}', expected label '{app}'. Retrying..."
+            );
+            if let Err(reset_err) = reset_for_retry(container_app) {
+                eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
+            }
+            sleep(retry_sleep);
+            continue;
         }
 
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "tailscale assigned hostname '{dns_name}' with collision suffix during cutover"
-            ));
+        match wait_healthy(container_app) {
+            Ok(()) => {
+                eprintln!("       Exact tailscale hostname acquired: {dns_name}");
+                return Ok(name);
+            }
+            Err(health_err) => {
+                eprintln!("       Tailscale not healthy yet: {health_err}");
+                if let Err(reset_err) = reset_for_retry(container_app) {
+                    eprintln!(
+                        "       Warning: failed to reset tailscale before retry: {reset_err}"
+                    );
+                }
+                sleep(retry_sleep);
+            }
         }
-
-        eprintln!(
-            "       Tailscale hostname collision detected ({dns_name}); retrying to reclaim '{app}'"
-        );
-        if let Err(e) = down(container_app) {
-            eprintln!("       Warning: failed to reset tailscale before retry: {e}");
-        }
-        sleep(poll_interval);
     }
 }
 
-fn join_tailnet_for_cutover_with_retry(
+fn acquire_exact_tailscale_hostname_for_deploy(
     container_app: &str,
     app: &str,
 ) -> Result<Option<String>, String> {
-    join_tailnet_for_cutover_with_reclaim(
+    acquire_exact_tailscale_hostname_with_retry(
         container_app,
         app,
-        Duration::from_secs(TAILSCALE_HOSTNAME_RECLAIM_TIMEOUT_SECS),
-        Duration::from_millis(TAILSCALE_HOSTNAME_RECLAIM_POLL_MS),
-        tailscale::join_in_container,
-        |container| container::exec_cmd(container, "tailscale down >/dev/null 2>&1 || true"),
+        tailscale::join_with_state_in_container,
+        tailscale::join_with_auth_key_in_container,
+        |container| {
+            wait_for_tailscale_online(container, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))
+                .map(|_| ())
+        },
+        reset_tailscale_for_retry,
         thread::sleep,
     )
+}
+
+fn seed_tailscale_state_volume_from_container(
+    app: &str,
+    pool: &str,
+    volume: &str,
+) -> Result<(), String> {
+    if container::has_tailscale_state_mount(app, pool, volume)? {
+        return Ok(());
+    }
+
+    eprintln!("       Seeding tailscale state volume from current container");
+    container::ensure_tailscale_state_seed_mount(app, pool, volume)?;
+    let seed_cmd = format!(
+        "mkdir -p {0} && if [ -z \"$(ls -A {0} 2>/dev/null)\" ]; then if [ -f /var/lib/tailscale/tailscaled.state ]; then cp /var/lib/tailscale/tailscaled.state {0}/tailscaled.state; fi; fi",
+        TAILSCALE_STATE_SEED_PATH
+    );
+    let seed_result = container::exec_cmd(app, &seed_cmd);
+    let unmount_result = container::remove_tailscale_state_seed_mount(app);
+
+    if let Err(err) = seed_result {
+        let _ = unmount_result;
+        return Err(format!(
+            "failed to seed tailscale state volume from container '{app}': {err}"
+        ));
+    }
+    if let Err(err) = unmount_result {
+        return Err(format!(
+            "failed to detach staged tailscale state volume from container '{app}': {err}"
+        ));
+    }
+    Ok(())
 }
 
 fn tailscale_self_status_summary_from_json(app: &str, json: &str) -> Result<String, String> {
@@ -1014,7 +1173,7 @@ fn detect_release_target() -> Result<&'static str, String> {
 }
 
 fn first_storage_pool_name() -> Result<Option<String>, String> {
-    let json = run_cmd_capture("incus", &["storage", "list", "--format=json"])?;
+    let json = run_incus_metadata_capture(&["storage", "list", "--format=json"])?;
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| format!("failed to parse incus storage list: {e}"))?;
     let pools = value
@@ -1031,10 +1190,9 @@ fn first_storage_pool_name() -> Result<Option<String>, String> {
 }
 
 fn default_storage_pool() -> Result<String, String> {
-    if let Ok(pool) = run_cmd_capture(
-        "incus",
-        &["profile", "device", "get", "default", "root", "pool"],
-    ) {
+    if let Ok(pool) =
+        run_incus_metadata_capture(&["profile", "device", "get", "default", "root", "pool"])
+    {
         let pool = pool.trim();
         if !pool.is_empty() {
             return Ok(pool.to_string());
@@ -1054,11 +1212,15 @@ fn app_storage_volume_name(app: &str) -> String {
     format!("psht-storage-{app}")
 }
 
+fn app_tailscale_volume_name(app: &str) -> String {
+    format!("psht-tailscale-{app}")
+}
+
 fn ensure_app_storage_volume(app: &str) -> Result<(String, String), String> {
     let pool = default_storage_pool()?;
     let volume = app_storage_volume_name(app);
     let show_args = vec!["storage", "volume", "show", pool.as_str(), volume.as_str()];
-    if !command_succeeds("incus", &show_args) {
+    if !incus_metadata_command_succeeds(&show_args)? {
         let create_args = vec![
             "storage",
             "volume",
@@ -1075,7 +1237,41 @@ fn delete_app_storage_volume(app: &str) -> Result<(), String> {
     let pool = default_storage_pool()?;
     let volume = app_storage_volume_name(app);
     let show_args = vec!["storage", "volume", "show", pool.as_str(), volume.as_str()];
-    if !command_succeeds("incus", &show_args) {
+    if !incus_metadata_command_succeeds(&show_args)? {
+        return Ok(());
+    }
+    let delete_args = vec![
+        "storage",
+        "volume",
+        "delete",
+        pool.as_str(),
+        volume.as_str(),
+    ];
+    run_cmd("incus", &delete_args)
+}
+
+fn ensure_app_tailscale_volume(app: &str) -> Result<(String, String), String> {
+    let pool = default_storage_pool()?;
+    let volume = app_tailscale_volume_name(app);
+    let show_args = vec!["storage", "volume", "show", pool.as_str(), volume.as_str()];
+    if !incus_metadata_command_succeeds(&show_args)? {
+        let create_args = vec![
+            "storage",
+            "volume",
+            "create",
+            pool.as_str(),
+            volume.as_str(),
+        ];
+        run_cmd("incus", &create_args)?;
+    }
+    Ok((pool, volume))
+}
+
+fn delete_app_tailscale_volume(app: &str) -> Result<(), String> {
+    let pool = default_storage_pool()?;
+    let volume = app_tailscale_volume_name(app);
+    let show_args = vec!["storage", "volume", "show", pool.as_str(), volume.as_str()];
+    if !incus_metadata_command_succeeds(&show_args)? {
         return Ok(());
     }
     let delete_args = vec![
@@ -3085,6 +3281,10 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     init_stacks_in(&stacks_dir())?;
     let old_active_app = resolve_active_app_ref(app)?
         .ok_or_else(|| format!("app '{app}' not found for blue/green deploy"))?;
+    let old_previous_app = read_app_runtime_state(app)?
+        .and_then(|state| state.previous_instance)
+        .and_then(|instance| app_ref_from_instance_name(&instance))
+        .filter(|previous_app| previous_app != &old_active_app && container::exists(previous_app));
 
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
@@ -3107,12 +3307,41 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
     let port = allocate_port(app);
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
+    eprintln!("-----> Ensuring app storage volume");
     let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
+    let tailscale_volume = if skip_tailscale {
+        None
+    } else {
+        eprintln!("-----> Ensuring tailscale state volume");
+        Some(ensure_app_tailscale_volume(app)?)
+    };
 
     let deploy_id = deploy_instance_id();
-    let candidate_app = candidate_app_name(app, &deploy_id);
+    let mut candidate_app = candidate_app_name(app, &deploy_id);
+    let mut reused_inactive_candidate = false;
+    let pending_cleanup_exists = read_cleanup_job(app)?.is_some();
 
-    if container::exists(&candidate_app) {
+    if pending_cleanup_exists {
+        eprintln!("       Pending cleanup detected; using fresh candidate container");
+    } else if let Some(previous_app) = old_previous_app.as_ref() {
+        eprintln!("-----> Evaluating reusable inactive container");
+        eprintln!("       Inactive: {previous_app}");
+        wait_for_container_operation_quiet(previous_app, &current_project)?;
+        let previous_setup_hash =
+            container::exec_output(previous_app, "cat /etc/psht-setup-hash 2>/dev/null")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+        if previous_setup_hash == setup_hash {
+            candidate_app = previous_app.clone();
+            reused_inactive_candidate = true;
+            eprintln!("       Reusing inactive container: {candidate_app}");
+        } else {
+            eprintln!("       Inactive setup hash mismatch; using fresh candidate");
+        }
+    }
+
+    if !reused_inactive_candidate && container::exists(&candidate_app) {
         let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
     }
 
@@ -3122,78 +3351,107 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     wait_for_container_operation_quiet(&old_active_app, &current_project)?;
 
     let build_candidate_result = (|| -> Result<(), String> {
-        let setup_image_cached = container::setup_image_exists_in_project(
-            &stack,
-            &hash,
-            apt_fingerprint.as_deref(),
-            &current_project,
-        );
-        if setup_image_cached {
-            eprintln!("-----> Creating candidate from cached setup image");
-            container::create_from_setup_image_in_project(
-                &candidate_app,
+        let setup_image_cached = if reused_inactive_candidate {
+            eprintln!("-----> Reusing inactive container as candidate");
+            if !container::is_running(&candidate_app)? {
+                container::start(&candidate_app)?;
+            }
+            let _ = stop_app_process_on_port(&candidate_app, port);
+            let _ = container::remove_proxy(&candidate_app);
+            let _ = container::remove_storage_mount(&candidate_app);
+            let _ = container::remove_tailscale_state_mount(&candidate_app);
+
+            if skip_tailscale {
+                eprintln!("-----> Skipping tailscale setup in candidate");
+            } else {
+                eprintln!("-----> Ensuring tailscale setup in reused candidate");
+                tailscale::install_in_container(&candidate_app)?;
+                let _ =
+                    container::exec_cmd(&candidate_app, "tailscale down >/dev/null 2>&1 || true");
+                let _ = container::exec_cmd(
+                    &candidate_app,
+                    "systemctl stop tailscaled >/dev/null 2>&1 || true",
+                );
+            }
+            true
+        } else {
+            let setup_image_cached = container::setup_image_exists_in_project(
                 &stack,
                 &hash,
                 apt_fingerprint.as_deref(),
                 &current_project,
-            )?;
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup in candidate");
+            );
+            if setup_image_cached {
+                eprintln!("-----> Creating candidate from cached setup image");
+                container::create_from_setup_image_in_project(
+                    &candidate_app,
+                    &stack,
+                    &hash,
+                    apt_fingerprint.as_deref(),
+                    &current_project,
+                )?;
+                if skip_tailscale {
+                    eprintln!("-----> Skipping tailscale setup in candidate");
+                } else {
+                    eprintln!("-----> Installing tailscale in candidate");
+                    tailscale::install_in_container(&candidate_app)?;
+                }
+            } else if container::image_exists_in_project(&stack, &hash, &current_project) {
+                eprintln!("-----> Creating candidate from cached stack image");
+                container::create_from_image_in_project(
+                    &candidate_app,
+                    &stack,
+                    &hash,
+                    &current_project,
+                )?;
+                if skip_tailscale {
+                    eprintln!("-----> Skipping tailscale setup in candidate");
+                } else {
+                    eprintln!("-----> Installing tailscale in candidate");
+                    tailscale::install_in_container(&candidate_app)?;
+                }
             } else {
-                eprintln!("-----> Installing tailscale in candidate");
-                tailscale::install_in_container(&candidate_app)?;
+                eprintln!("-----> Creating candidate container");
+                eprintln!("       First run may take a while while Ubuntu image downloads");
+                ensure_create_prereqs(&current_project)?;
+                container::create_in_project(&candidate_app, &current_project)?;
+
+                if skip_tailscale {
+                    eprintln!("-----> Skipping tailscale setup in candidate");
+                } else {
+                    eprintln!("-----> Installing tailscale in candidate");
+                    tailscale::install_in_container(&candidate_app)?;
+                }
+
+                eprintln!("-----> Setting up candidate runtime");
+                container::push_file(
+                    &candidate_app,
+                    &script_path.to_string_lossy(),
+                    "/tmp/setup.sh",
+                )?;
+                container::exec_cmd_rolling(
+                    &candidate_app,
+                    "chmod +x /tmp/setup.sh && /tmp/setup.sh",
+                    5,
+                )?;
+
+                eprintln!("-----> Caching stack image");
+                if let Err(e) = container::publish_image_in_project(
+                    &candidate_app,
+                    &stack,
+                    &hash,
+                    &current_project,
+                ) {
+                    eprintln!("       Warning: failed to cache stack image: {e}");
+                }
             }
-        } else if container::image_exists_in_project(&stack, &hash, &current_project) {
-            eprintln!("-----> Creating candidate from cached stack image");
-            container::create_from_image_in_project(
+
+            container::exec_cmd(
                 &candidate_app,
-                &stack,
-                &hash,
-                &current_project,
+                &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
             )?;
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup in candidate");
-            } else {
-                eprintln!("-----> Installing tailscale in candidate");
-                tailscale::install_in_container(&candidate_app)?;
-            }
-        } else {
-            eprintln!("-----> Creating candidate container");
-            eprintln!("       First run may take a while while Ubuntu image downloads");
-            ensure_create_prereqs(&current_project)?;
-            container::create_in_project(&candidate_app, &current_project)?;
-
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup in candidate");
-            } else {
-                eprintln!("-----> Installing tailscale in candidate");
-                tailscale::install_in_container(&candidate_app)?;
-            }
-
-            eprintln!("-----> Setting up candidate runtime");
-            container::push_file(
-                &candidate_app,
-                &script_path.to_string_lossy(),
-                "/tmp/setup.sh",
-            )?;
-            container::exec_cmd_rolling(
-                &candidate_app,
-                "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-                5,
-            )?;
-
-            eprintln!("-----> Caching stack image");
-            if let Err(e) =
-                container::publish_image_in_project(&candidate_app, &stack, &hash, &current_project)
-            {
-                eprintln!("       Warning: failed to cache stack image: {e}");
-            }
-        }
-
-        container::exec_cmd(
-            &candidate_app,
-            &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
-        )?;
+            setup_image_cached
+        };
 
         eprintln!("-----> Building candidate");
         container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
@@ -3237,9 +3495,16 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     })();
 
     if let Err(err) = build_candidate_result {
-        let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+        if !reused_inactive_candidate {
+            let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+        }
         return Err(err);
     }
+
+    let stale_inactive_app_for_cleanup = old_previous_app
+        .as_ref()
+        .filter(|previous_app| *previous_app != &candidate_app && *previous_app != &old_active_app)
+        .cloned();
 
     eprintln!("-----> Switching traffic");
     eprintln!("       Traffic remains on current container until cutover is complete");
@@ -3248,6 +3513,8 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     let mut candidate_storage_attached = false;
     let mut candidate_proxy_attached = false;
     let mut old_tailnet_disconnected = false;
+    let mut old_tailscale_state_detached = false;
+    let mut candidate_tailscale_state_attached = false;
 
     let cutover_result = (|| -> Result<Option<String>, String> {
         eprintln!("       Stopping current app process");
@@ -3285,6 +3552,9 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         let tailnet_hostname = if skip_tailscale {
             None
         } else {
+            let (tailscale_pool, tailscale_state_volume) = tailscale_volume
+                .as_ref()
+                .ok_or_else(|| "tailscale state volume should be available".to_string())?;
             eprintln!("       Disconnecting previous active container from tailnet");
             if let Err(e) =
                 container::exec_cmd(&old_active_app, "tailscale down >/dev/null 2>&1 || true")
@@ -3295,9 +3565,37 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             } else {
                 old_tailnet_disconnected = true;
             }
+            let _ = container::exec_cmd(
+                &old_active_app,
+                "systemctl stop tailscaled >/dev/null 2>&1 || true",
+            );
 
-            eprintln!("       Connecting new active container to tailnet");
-            let name = join_tailnet_for_cutover_with_retry(&candidate_app, app)?;
+            seed_tailscale_state_volume_from_container(
+                &old_active_app,
+                tailscale_pool,
+                tailscale_state_volume,
+            )?;
+
+            if container::has_tailscale_state_mount(
+                &old_active_app,
+                tailscale_pool,
+                tailscale_state_volume,
+            )? {
+                eprintln!("       Detaching tailscale state from current container");
+                container::remove_tailscale_state_mount(&old_active_app)?;
+                old_tailscale_state_detached = true;
+            }
+
+            eprintln!("       Attaching tailscale state to candidate container");
+            container::ensure_tailscale_state_mount(
+                &candidate_app,
+                tailscale_pool,
+                tailscale_state_volume,
+            )?;
+            candidate_tailscale_state_attached = true;
+
+            eprintln!("       Starting tailscaled with persisted identity");
+            let name = acquire_exact_tailscale_hostname_for_deploy(&candidate_app, app)?;
             if let Err(e) = tailscale::expose_http_in_container(&candidate_app, port) {
                 eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
             }
@@ -3338,15 +3636,44 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                     launch_app_process(&old_active_app, port, &restored_start_command, &app_env);
             }
             if !skip_tailscale {
+                if candidate_tailscale_state_attached {
+                    let _ = container::exec_cmd(
+                        &candidate_app,
+                        "systemctl stop tailscaled >/dev/null 2>&1 || true",
+                    );
+                    let _ = container::remove_tailscale_state_mount(&candidate_app);
+                }
+                if (old_tailscale_state_detached || candidate_tailscale_state_attached)
+                    && let Some((tailscale_pool, tailscale_state_volume)) =
+                        tailscale_volume.as_ref()
+                    && let Err(e) = container::ensure_tailscale_state_mount(
+                        &old_active_app,
+                        tailscale_pool,
+                        tailscale_state_volume,
+                    )
+                {
+                    eprintln!(
+                        "       Warning: failed to reattach tailscale state to previous container: {e}"
+                    );
+                }
+
                 let old_tailnet_hostname = if old_tailnet_disconnected {
                     eprintln!("       Reconnecting previous active container to tailnet");
-                    match tailscale::join_in_container(&old_active_app, app) {
+                    match tailscale::join_with_state_in_container(&old_active_app, app) {
                         Ok(name) => name,
-                        Err(e) => {
+                        Err(state_err) => {
                             eprintln!(
-                                "       Warning: failed to reconnect previous container to tailnet: {e}"
+                                "       Warning: state-based reconnect failed, falling back to auth-key join: {state_err}"
                             );
-                            tailscale::dns_name_in_container(&old_active_app)
+                            match tailscale::join_with_auth_key_in_container(&old_active_app, app) {
+                                Ok(name) => name,
+                                Err(e) => {
+                                    eprintln!(
+                                        "       Warning: failed to reconnect previous container to tailnet: {e}"
+                                    );
+                                    tailscale::dns_name_in_container(&old_active_app)
+                                }
+                            }
                         }
                     }
                 } else {
@@ -3358,7 +3685,9 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                 }
             }
             let _ = caddy::add(app, port);
-            let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+            if !reused_inactive_candidate {
+                let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+            }
 
             return Err(format!(
                 "deploy cutover failed and rollback was applied: {err}"
@@ -3366,7 +3695,9 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         }
     };
 
-    queue_previous_cleanup_in_background(app, &candidate_app, &old_active_app);
+    if let Some(stale_inactive_app) = stale_inactive_app_for_cleanup.as_ref() {
+        queue_previous_cleanup_in_background(app, &candidate_app, stale_inactive_app);
+    }
 
     let build_number = increment_build_number(app)?;
 
@@ -3425,6 +3756,14 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
     let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
+    eprintln!("-----> Ensuring app storage volume");
+    let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
+    let tailscale_volume = if skip_tailscale {
+        None
+    } else {
+        eprintln!("-----> Ensuring tailscale state volume");
+        Some(ensure_app_tailscale_volume(app)?)
+    };
 
     let port = allocate_port(app);
     let mut tailnet_hostname = if skip_tailscale {
@@ -3534,8 +3873,15 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         if skip_tailscale {
             eprintln!("-----> Skipping tailnet connection");
         } else {
+            if let Some((tailscale_pool, tailscale_state_volume)) = tailscale_volume.as_ref() {
+                container::ensure_tailscale_state_mount(
+                    app,
+                    tailscale_pool,
+                    tailscale_state_volume,
+                )?;
+            }
             eprintln!("-----> Connecting to tailnet");
-            tailnet_hostname = tailscale::join_in_container(app, app)?;
+            tailnet_hostname = acquire_exact_tailscale_hostname_for_deploy(app, app)?;
         }
 
         let port = allocate_port(app);
@@ -3543,7 +3889,6 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         container::add_proxy(app, port, port)?;
     }
 
-    let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
     container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
 
     eprintln!("-----> Pushing code to container");
@@ -4801,9 +5146,27 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
     }
 
     eprintln!("-----> Repairing tailscale in container");
+    let (tailscale_pool, tailscale_state_volume) = ensure_app_tailscale_volume(app)?;
     tailscale::install_in_container(&active_app)?;
     let _ = container::exec_cmd(&active_app, "tailscale down >/dev/null 2>&1 || true");
-    let tailnet_hostname = tailscale::join_in_container(&active_app, app)?;
+    let _ = container::exec_cmd(
+        &active_app,
+        "systemctl stop tailscaled >/dev/null 2>&1 || true",
+    );
+    seed_tailscale_state_volume_from_container(
+        &active_app,
+        &tailscale_pool,
+        &tailscale_state_volume,
+    )?;
+    container::ensure_tailscale_state_mount(&active_app, &tailscale_pool, &tailscale_state_volume)?;
+    let tailnet_hostname = match tailscale::join_with_state_in_container(&active_app, app) {
+        Ok(name) => name,
+        Err(state_err) => {
+            eprintln!("       State-based tailscale join failed: {state_err}");
+            eprintln!("       Falling back to auth-key tailscale join");
+            tailscale::join_with_auth_key_in_container(&active_app, app)?
+        }
+    };
     let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
     let port = allocate_port(app);
     if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
@@ -4813,6 +5176,13 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
         wait_for_tailscale_online(&active_app, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))?;
     if !health.is_empty() {
         eprintln!("       Warning: {}", health.join(" | "));
+    }
+    if let Some(ref name) = tailnet_hostname
+        && !tailscale_hostname_is_exact(name, app)
+    {
+        eprintln!(
+            "       Warning: tailscale hostname '{name}' does not match requested app label '{app}'"
+        );
     }
     if let Some(name) = tailnet_hostname {
         eprintln!("=====> Tailscale ready: http://{name} (also http://{name}:{port})");
@@ -4880,6 +5250,9 @@ pub fn destroy(app: &str) -> Result<(), String> {
     if let Err(e) = container::remove_storage_mount(&active_app) {
         eprintln!("       Warning: failed to remove /storage mount before destroy: {e}");
     }
+    if let Err(e) = container::remove_tailscale_state_mount(&active_app) {
+        eprintln!("       Warning: failed to remove tailscale state mount before destroy: {e}");
+    }
     container::stop(&active_app)?;
     container::delete(&active_app)?;
 
@@ -4894,6 +5267,9 @@ pub fn destroy(app: &str) -> Result<(), String> {
     }
 
     delete_app_storage_volume(app)?;
+    if let Err(e) = delete_app_tailscale_volume(app) {
+        eprintln!("       Warning: failed to remove tailscale state volume: {e}");
+    }
     if let Err(e) = remove_env_vars(app) {
         eprintln!("       Warning: failed to remove env vars: {e}");
     }
@@ -5734,6 +6110,12 @@ devices:
     }
 
     #[test]
+    fn app_tailscale_volume_name_formats_correctly() {
+        assert_eq!(app_tailscale_volume_name("myapp"), "psht-tailscale-myapp");
+        assert_eq!(app_tailscale_volume_name("my-app"), "psht-tailscale-my-app");
+    }
+
+    #[test]
     fn ensure_line_in_file_appends_once() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("shells");
@@ -5786,70 +6168,54 @@ devices:
     }
 
     #[test]
-    fn tailscale_hostname_collision_suffix_detected() {
-        assert!(tailscale_hostname_has_collision_suffix(
-            "hyperlinked-1.tailnet.ts.net",
+    fn tailscale_hostname_is_exact_matches_label_only() {
+        assert!(tailscale_hostname_is_exact(
+            "hyperlinked.tail.ts.net",
             "hyperlinked"
         ));
-        assert!(tailscale_hostname_has_collision_suffix(
-            "Hyperlinked-22.tailnet.ts.net",
+        assert!(tailscale_hostname_is_exact(
+            "Hyperlinked.tail.ts.net.",
             "hyperlinked"
         ));
-        assert!(!tailscale_hostname_has_collision_suffix(
-            "hyperlinked.tailnet.ts.net",
+        assert!(!tailscale_hostname_is_exact(
+            "hyperlinked-1.tail.ts.net",
             "hyperlinked"
         ));
-        assert!(!tailscale_hostname_has_collision_suffix(
-            "hyperlinked-build-1772439520.tailnet.ts.net",
+        assert!(!tailscale_hostname_is_exact(
+            "other.tail.ts.net",
             "hyperlinked"
         ));
     }
 
     #[test]
-    fn join_tailnet_for_cutover_reclaim_accepts_exact_hostname() {
-        let mut down_calls = 0usize;
-        let mut sleep_calls = 0usize;
-        let mut attempts =
-            std::collections::VecDeque::from([Some("hyperlinked.tailnet.ts.net".to_string())]);
-
-        let name = join_tailnet_for_cutover_with_reclaim(
-            "hyperlinked-build-1",
-            "hyperlinked",
-            Duration::from_millis(10),
-            Duration::from_millis(1),
-            |_container, _app| Ok(attempts.pop_front().expect("join attempt should exist")),
-            |_container| {
-                down_calls += 1;
-                Ok(())
-            },
-            |_duration| {
-                sleep_calls += 1;
-            },
-        )
-        .unwrap();
-
-        assert_eq!(name.as_deref(), Some("hyperlinked.tailnet.ts.net"));
-        assert_eq!(down_calls, 0);
-        assert_eq!(sleep_calls, 0);
-    }
-
-    #[test]
-    fn join_tailnet_for_cutover_reclaim_retries_collision_then_succeeds() {
-        let mut down_calls = 0usize;
-        let mut sleep_calls = 0usize;
-        let mut attempts = std::collections::VecDeque::from([
-            Some("hyperlinked-1.tailnet.ts.net".to_string()),
-            Some("hyperlinked.tailnet.ts.net".to_string()),
+    fn acquire_exact_tailscale_hostname_retries_until_exact() {
+        let mut state_results = std::collections::VecDeque::from([
+            Ok(Some("hyperlinked-1.tail.ts.net".to_string())),
+            Ok(Some("hyperlinked.tail.ts.net".to_string())),
         ]);
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
+        let mut health_calls = 0usize;
 
-        let name = join_tailnet_for_cutover_with_reclaim(
-            "hyperlinked-build-1",
+        let name = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
             "hyperlinked",
-            Duration::from_millis(10),
-            Duration::from_millis(1),
-            |_container, _app| Ok(attempts.pop_front().expect("join attempt should exist")),
+            |_container, _app| {
+                state_results
+                    .pop_front()
+                    .expect("state result should exist for each attempt")
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(Some("unexpected.tail.ts.net".to_string()))
+            },
             |_container| {
-                down_calls += 1;
+                health_calls += 1;
+                Ok(())
+            },
+            |_container| {
+                reset_calls += 1;
                 Ok(())
             },
             |_duration| {
@@ -5858,24 +6224,34 @@ devices:
         )
         .unwrap();
 
-        assert_eq!(name.as_deref(), Some("hyperlinked.tailnet.ts.net"));
-        assert_eq!(down_calls, 1);
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(auth_calls, 0);
+        assert_eq!(health_calls, 1);
+        assert_eq!(reset_calls, 1);
         assert_eq!(sleep_calls, 1);
     }
 
     #[test]
-    fn join_tailnet_for_cutover_reclaim_allows_missing_dns_name() {
-        let mut down_calls = 0usize;
+    fn acquire_exact_tailscale_hostname_falls_back_to_auth_key_when_state_fails() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
         let mut sleep_calls = 0usize;
 
-        let name = join_tailnet_for_cutover_with_reclaim(
-            "hyperlinked-build-1",
+        let name = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
             "hyperlinked",
-            Duration::from_millis(10),
-            Duration::from_millis(1),
-            |_container, _app| Ok(None),
+            |_container, _app| {
+                state_calls += 1;
+                Err("state unavailable".to_string())
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(Some("hyperlinked.tail.ts.net".to_string()))
+            },
+            |_container| Ok(()),
             |_container| {
-                down_calls += 1;
+                reset_calls += 1;
                 Ok(())
             },
             |_duration| {
@@ -5884,37 +6260,11 @@ devices:
         )
         .unwrap();
 
-        assert_eq!(name, None);
-        assert_eq!(down_calls, 0);
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 1);
+        assert_eq!(reset_calls, 0);
         assert_eq!(sleep_calls, 0);
-    }
-
-    #[test]
-    fn join_tailnet_for_cutover_reclaim_fails_after_timeout_when_collision_persists() {
-        let mut down_calls = 0usize;
-
-        let err = join_tailnet_for_cutover_with_reclaim(
-            "hyperlinked-build-1",
-            "hyperlinked",
-            Duration::from_millis(2),
-            Duration::from_millis(1),
-            |_container, _app| Ok(Some("hyperlinked-1.tailnet.ts.net".to_string())),
-            |_container| {
-                down_calls += 1;
-                Ok(())
-            },
-            |duration| {
-                std::thread::sleep(duration);
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("hyperlinked-1.tailnet.ts.net"));
-        assert!(err.contains("collision suffix"));
-        assert!(
-            down_calls >= 1,
-            "expected at least one reset attempt before timeout"
-        );
     }
 
     #[test]

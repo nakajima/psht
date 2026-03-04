@@ -8,6 +8,12 @@ use crate::deploy_log;
 
 const CONTAINER_CREATE_TIMEOUT_SECS: u64 = 300;
 const CONTAINER_CREATE_PROGRESS_SECS: u64 = 30;
+const STORAGE_DEVICE_NAME: &str = "storage";
+const STORAGE_MOUNT_PATH: &str = "/storage";
+const TAILSCALE_STATE_DEVICE_NAME: &str = "tailscale-state";
+const TAILSCALE_STATE_MOUNT_PATH: &str = "/var/lib/tailscale";
+const TAILSCALE_STATE_SEED_DEVICE_NAME: &str = "tailscale-state-seed";
+const TAILSCALE_STATE_SEED_MOUNT_PATH: &str = "/var/lib/psht-tailscale-state";
 
 macro_rules! eprintln {
     () => {
@@ -253,13 +259,13 @@ fn device_value(app: &str, device: &str, key: &str) -> Result<Option<String>, St
     ))
 }
 
-fn storage_device(app: &str) -> Result<Option<StorageDevice>, String> {
-    let Some(path) = device_value(app, "storage", "path")? else {
+fn disk_device(app: &str, device: &str) -> Result<Option<StorageDevice>, String> {
+    let Some(path) = device_value(app, device, "path")? else {
         return Ok(None);
     };
-    let dev_type = device_value(app, "storage", "type")?.unwrap_or_default();
-    let pool = device_value(app, "storage", "pool")?.unwrap_or_default();
-    let source = device_value(app, "storage", "source")?.unwrap_or_default();
+    let dev_type = device_value(app, device, "type")?.unwrap_or_default();
+    let pool = device_value(app, device, "pool")?.unwrap_or_default();
+    let source = device_value(app, device, "source")?.unwrap_or_default();
     Ok(Some(StorageDevice {
         dev_type,
         path,
@@ -268,20 +274,27 @@ fn storage_device(app: &str) -> Result<Option<StorageDevice>, String> {
     }))
 }
 
-pub fn ensure_storage_mount(app: &str, pool: &str, volume: &str) -> Result<(), String> {
+fn ensure_disk_mount(
+    app: &str,
+    device_name: &str,
+    mount_path: &str,
+    pool: &str,
+    volume: &str,
+    label: &str,
+) -> Result<(), String> {
     let expected = StorageDevice {
         dev_type: "disk".to_string(),
-        path: "/storage".to_string(),
+        path: mount_path.to_string(),
         pool: pool.to_string(),
         source: volume.to_string(),
     };
 
-    if let Some(current) = storage_device(app)? {
+    if let Some(current) = disk_device(app, device_name)? {
         if current == expected {
             return Ok(());
         }
         return Err(format!(
-            "container '{app}' has conflicting storage device config: expected type=disk path=/storage pool={pool} source={volume}, got type={} path={} pool={} source={}",
+            "container '{app}' has conflicting {label} device config: expected type=disk path={mount_path} pool={pool} source={volume}, got type={} path={} pool={} source={}",
             current.dev_type, current.path, current.pool, current.source
         ));
     }
@@ -290,32 +303,34 @@ pub fn ensure_storage_mount(app: &str, pool: &str, volume: &str) -> Result<(), S
     incus()
         .args(&["config", "device", "add"])
         .arg(&name)
-        .arg("storage")
+        .arg(device_name)
         .arg("disk")
-        .arg("path=/storage")
+        .arg(format!("path={mount_path}"))
         .arg(format!("pool={pool}"))
         .arg(format!("source={volume}"))
         .run()?;
 
-    if let Some(current) = storage_device(app)? {
+    if let Some(current) = disk_device(app, device_name)? {
         if current == expected {
             return Ok(());
         }
     }
     Err(format!(
-        "failed to verify storage device for container '{app}' after attaching volume '{volume}'"
+        "failed to verify {label} device for container '{app}' after attaching volume '{volume}'"
     ))
 }
 
-pub fn remove_storage_mount(app: &str) -> Result<(), String> {
+fn remove_disk_mount(app: &str, device_name: &str, label: &str) -> Result<(), String> {
     let name = container_name(app);
     let output = incus()
         .args(&["config", "device", "remove"])
         .arg(&name)
-        .arg("storage")
+        .arg(device_name)
         .build()
         .output()
-        .map_err(|e| format!("failed to run incus config device remove {name} storage: {e}"))?;
+        .map_err(|e| {
+            format!("failed to run incus config device remove {name} {device_name}: {e}")
+        })?;
     if output.status.success() {
         return Ok(());
     }
@@ -324,8 +339,72 @@ pub fn remove_storage_mount(app: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "incus config device remove {name} storage failed: {stderr}"
+        "incus config device remove {name} {device_name} ({label}) failed: {stderr}"
     ))
+}
+
+pub fn ensure_storage_mount(app: &str, pool: &str, volume: &str) -> Result<(), String> {
+    ensure_disk_mount(
+        app,
+        STORAGE_DEVICE_NAME,
+        STORAGE_MOUNT_PATH,
+        pool,
+        volume,
+        "storage",
+    )
+}
+
+pub fn remove_storage_mount(app: &str) -> Result<(), String> {
+    remove_disk_mount(app, STORAGE_DEVICE_NAME, "storage")
+}
+
+pub fn has_tailscale_state_mount(app: &str, pool: &str, volume: &str) -> Result<bool, String> {
+    let expected = StorageDevice {
+        dev_type: "disk".to_string(),
+        path: TAILSCALE_STATE_MOUNT_PATH.to_string(),
+        pool: pool.to_string(),
+        source: volume.to_string(),
+    };
+    let current = disk_device(app, TAILSCALE_STATE_DEVICE_NAME)?;
+    Ok(current.is_some_and(|value| value == expected))
+}
+
+pub fn ensure_tailscale_state_mount(app: &str, pool: &str, volume: &str) -> Result<(), String> {
+    ensure_disk_mount(
+        app,
+        TAILSCALE_STATE_DEVICE_NAME,
+        TAILSCALE_STATE_MOUNT_PATH,
+        pool,
+        volume,
+        "tailscale-state",
+    )
+}
+
+pub fn remove_tailscale_state_mount(app: &str) -> Result<(), String> {
+    remove_disk_mount(app, TAILSCALE_STATE_DEVICE_NAME, "tailscale-state")
+}
+
+pub fn ensure_tailscale_state_seed_mount(
+    app: &str,
+    pool: &str,
+    volume: &str,
+) -> Result<(), String> {
+    ensure_disk_mount(
+        app,
+        TAILSCALE_STATE_SEED_DEVICE_NAME,
+        TAILSCALE_STATE_SEED_MOUNT_PATH,
+        pool,
+        volume,
+        "tailscale-state-seed",
+    )
+}
+
+pub fn remove_tailscale_state_seed_mount(app: &str) -> Result<(), String> {
+    remove_disk_mount(
+        app,
+        TAILSCALE_STATE_SEED_DEVICE_NAME,
+        "tailscale-state-seed",
+    )
 }
 
 fn launch_with_project(name: &str, image: &str, project: Option<&str>) -> Result<(), String> {
@@ -961,6 +1040,106 @@ mod tests {
         assert_eq!(
             args,
             vec!["config", "device", "remove", "psht-myapp", "storage"]
+        );
+    }
+
+    #[test]
+    fn incus_tailscale_state_add_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "add"])
+            .arg(&name)
+            .arg(TAILSCALE_STATE_DEVICE_NAME)
+            .arg("disk")
+            .arg(format!("path={TAILSCALE_STATE_MOUNT_PATH}"))
+            .arg("pool=default")
+            .arg("source=psht-tailscale-myapp")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "config",
+                "device",
+                "add",
+                "psht-myapp",
+                "tailscale-state",
+                "disk",
+                "path=/var/lib/tailscale",
+                "pool=default",
+                "source=psht-tailscale-myapp"
+            ]
+        );
+    }
+
+    #[test]
+    fn incus_tailscale_state_remove_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "remove"])
+            .arg(&name)
+            .arg(TAILSCALE_STATE_DEVICE_NAME)
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "config",
+                "device",
+                "remove",
+                "psht-myapp",
+                "tailscale-state"
+            ]
+        );
+    }
+
+    #[test]
+    fn incus_tailscale_seed_add_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "add"])
+            .arg(&name)
+            .arg(TAILSCALE_STATE_SEED_DEVICE_NAME)
+            .arg("disk")
+            .arg(format!("path={TAILSCALE_STATE_SEED_MOUNT_PATH}"))
+            .arg("pool=default")
+            .arg("source=psht-tailscale-myapp")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "config",
+                "device",
+                "add",
+                "psht-myapp",
+                "tailscale-state-seed",
+                "disk",
+                "path=/var/lib/psht-tailscale-state",
+                "pool=default",
+                "source=psht-tailscale-myapp"
+            ]
+        );
+    }
+
+    #[test]
+    fn incus_tailscale_seed_remove_command_builds_correctly() {
+        let name = container_name("myapp");
+        let cmd = incus()
+            .args(&["config", "device", "remove"])
+            .arg(&name)
+            .arg(TAILSCALE_STATE_SEED_DEVICE_NAME)
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "config",
+                "device",
+                "remove",
+                "psht-myapp",
+                "tailscale-state-seed"
+            ]
         );
     }
 

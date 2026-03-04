@@ -152,17 +152,17 @@ pub fn dns_name_in_container(app: &str) -> Option<String> {
         .and_then(|json| parse_self_dns_name(&json))
 }
 
-fn tailscale_up_command(auth_key: &str, machine_name: &str) -> String {
+fn tailscale_up_with_auth_key_command(auth_key: &str, machine_name: &str) -> String {
     format!("tailscale up --auth-key {auth_key} --hostname {machine_name} --ssh")
 }
 
-pub fn join_in_container(
-    container_app: &str,
-    machine_name: &str,
-) -> Result<Option<String>, String> {
-    let key = auth_key()?;
+fn tailscale_up_with_state_command(machine_name: &str) -> String {
+    format!("tailscale up --hostname {machine_name} --ssh")
+}
+
+fn join_with_up_command(container_app: &str, up_command: &str) -> Result<Option<String>, String> {
     container::exec_cmd(container_app, "systemctl start tailscaled")?;
-    container::exec_cmd(container_app, &tailscale_up_command(&key, machine_name))?;
+    container::exec_cmd(container_app, up_command)?;
 
     let ts_hostname = dns_name_in_container(container_app);
     match ts_hostname {
@@ -171,6 +171,23 @@ pub fn join_in_container(
     }
 
     Ok(ts_hostname)
+}
+
+pub fn join_with_auth_key_in_container(
+    container_app: &str,
+    machine_name: &str,
+) -> Result<Option<String>, String> {
+    let key = auth_key()?;
+    let up_command = tailscale_up_with_auth_key_command(&key, machine_name);
+    join_with_up_command(container_app, &up_command)
+}
+
+pub fn join_with_state_in_container(
+    container_app: &str,
+    machine_name: &str,
+) -> Result<Option<String>, String> {
+    let up_command = tailscale_up_with_state_command(machine_name);
+    join_with_up_command(container_app, &up_command)
 }
 
 fn serve_http_command(port: u16) -> String {
@@ -349,10 +366,16 @@ mod tests {
 
     #[test]
     fn tailscale_up_command_uses_requested_machine_name() {
-        let cmd = tailscale_up_command("tskey-auth-abc", "hyperlinked");
+        let cmd = tailscale_up_with_auth_key_command("tskey-auth-abc", "hyperlinked");
         assert_eq!(
             cmd,
             "tailscale up --auth-key tskey-auth-abc --hostname hyperlinked --ssh"
         );
+    }
+
+    #[test]
+    fn tailscale_up_state_command_uses_requested_machine_name() {
+        let cmd = tailscale_up_with_state_command("hyperlinked");
+        assert_eq!(cmd, "tailscale up --hostname hyperlinked --ssh");
     }
 }
