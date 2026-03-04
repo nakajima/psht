@@ -5563,6 +5563,70 @@ fn ensure_binary_version(path: &Path, expected: &str, label: &str) -> Result<(),
     ))
 }
 
+fn install_binary_atomically(
+    source: &Path,
+    destination: &Path,
+    mode: u32,
+    label: &str,
+) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!(
+            "failed to install {label}: source {} does not exist",
+            source.display()
+        ));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "failed to install {label}: destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "failed to install {label}: invalid destination file name: {}",
+                destination.display()
+            )
+        })?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staged = parent.join(format!(
+        ".{file_name}.psht-staged-{}-{unique}",
+        std::process::id()
+    ));
+
+    let result = (|| -> Result<(), String> {
+        fs::copy(source, &staged).map_err(|e| {
+            format!(
+                "failed to stage {label} binary {} -> {}: {e}",
+                source.display(),
+                staged.display()
+            )
+        })?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("failed to chmod staged {}: {e}", staged.display()))?;
+        fs::rename(&staged, destination).map_err(|e| {
+            format!(
+                "failed to install {label} binary to {}: {e}",
+                destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
 pub fn upgrade_server() -> Result<(), String> {
     if run_cmd_capture("id", &["-u"])? != "0" {
         return Err("Run this command as root: sudo psht-server upgrade".to_string());
@@ -5625,35 +5689,13 @@ pub fn upgrade_server() -> Result<(), String> {
 
         eprintln!("-----> Installing server binary");
         for target_path in &install_targets {
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-            }
-            fs::copy(&server_candidate, target_path).map_err(|e| {
-                format!(
-                    "failed to install server binary to {}: {e}",
-                    target_path.display()
-                )
-            })?;
-            fs::set_permissions(target_path, fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("failed to chmod {}: {e}", target_path.display()))?;
+            install_binary_atomically(&server_candidate, target_path, 0o755, "psht-server")?;
             ensure_binary_version(target_path, &latest, "installed psht-server")?;
         }
 
         eprintln!("-----> Installing CLI binary");
         let psht_cli_dst = home_dir().join("bin/psht");
-        if let Some(parent) = psht_cli_dst.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-        }
-        fs::copy(&cli_candidate, &psht_cli_dst).map_err(|e| {
-            format!(
-                "failed to install cli binary to {}: {e}",
-                psht_cli_dst.display()
-            )
-        })?;
-        fs::set_permissions(&psht_cli_dst, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("failed to chmod {}: {e}", psht_cli_dst.display()))?;
+        install_binary_atomically(&cli_candidate, &psht_cli_dst, 0o755, "psht")?;
         let _ = run_cmd("chown", &["psht:psht", &psht_cli_dst.to_string_lossy()]);
         ensure_binary_version(&psht_cli_dst, &latest, "installed psht")?;
 
@@ -6701,6 +6743,34 @@ devices:
 
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(!path_is_world_executable(&file).unwrap());
+    }
+
+    #[test]
+    fn install_binary_atomically_creates_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("psht-server.src");
+        let dst = tmp.path().join("bin").join("psht-server");
+        fs::write(&src, "new-binary").unwrap();
+
+        install_binary_atomically(&src, &dst, 0o755, "psht-server").unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "new-binary");
+        let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn install_binary_atomically_overwrites_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("psht-server.src");
+        let dst = tmp.path().join("bin").join("psht-server");
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&src, "new-binary").unwrap();
+        fs::write(&dst, "old-binary").unwrap();
+
+        install_binary_atomically(&src, &dst, 0o755, "psht-server").unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "new-binary");
     }
 
     #[test]
