@@ -52,6 +52,9 @@ const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 const DEPLOY_INTERRUPT_WAIT_POLL_MS: u64 = 1000;
 const DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS: u64 = 5;
+const DEPLOY_FORCE_TAKEOVER_TIMEOUT_SECS: u64 = 30;
+const DEPLOY_FORCE_KILL_WAIT_MS: u64 = 150;
+const DEPLOY_FORCE_KILL_WAIT_CHECKS: u32 = 8;
 const DEPLOY_INTERRUPT_ERR_PREFIX: &str = "deploy interrupted by --force request";
 const HEALTH_DELEGATED_ENV: &str = "PSHT_HEALTH_DELEGATED";
 const LOGS_DEPLOY_HISTORY_FILES: usize = 12;
@@ -1953,6 +1956,13 @@ struct DeployInterruptState {
     target_sha: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DeployLockMetadata {
+    pid: Option<u32>,
+    created: Option<u64>,
+    updated: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct AppRuntimeState {
     active_instance: String,
@@ -2190,9 +2200,114 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn parse_deploy_lock_metadata(content: &str) -> DeployLockMetadata {
+    let mut metadata = DeployLockMetadata::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "pid" => {
+                metadata.pid = value.trim().parse::<u32>().ok();
+            }
+            "created" => {
+                metadata.created = value.trim().parse::<u64>().ok();
+            }
+            "updated" => {
+                metadata.updated = value.trim().parse::<u64>().ok();
+            }
+            _ => {}
+        }
+    }
+    metadata
+}
+
+fn read_deploy_lock_metadata_from(path: &Path) -> Result<Option<DeployLockMetadata>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    Ok(Some(parse_deploy_lock_metadata(&content)))
+}
+
+fn read_deploy_lock_metadata(app: &str) -> Result<Option<DeployLockMetadata>, String> {
+    read_deploy_lock_metadata_from(&deploy_lock_path(app))
+}
+
+fn write_deploy_lock_metadata(path: &Path, metadata: &DeployLockMetadata) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let pid = metadata.pid.unwrap_or_else(std::process::id);
+    let created = metadata.created.unwrap_or_else(now_unix_secs);
+    let updated = metadata.updated.unwrap_or_else(now_unix_secs);
+    let body = format!("pid={pid}\ncreated={created}\nupdated={updated}\n");
+    fs::write(path, body).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn refresh_deploy_lock_heartbeat_at(path: &Path, owner_pid: u32) -> Result<(), String> {
+    let Some(mut metadata) = read_deploy_lock_metadata_from(path)? else {
+        return Ok(());
+    };
+    if let Some(holder_pid) = metadata.pid
+        && holder_pid != owner_pid
+    {
+        return Ok(());
+    }
+    metadata.pid = Some(owner_pid);
+    metadata.created = Some(metadata.created.unwrap_or_else(now_unix_secs));
+    metadata.updated = Some(now_unix_secs());
+    write_deploy_lock_metadata(path, &metadata)
+}
+
+fn refresh_deploy_lock_heartbeat(app: &str) -> Result<(), String> {
+    refresh_deploy_lock_heartbeat_at(&deploy_lock_path(app), std::process::id())
+}
+
+fn clear_deploy_lock_path(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn clear_deploy_lock(app: &str) -> Result<(), String> {
+    clear_deploy_lock_path(&deploy_lock_path(app))
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn send_kill_signal(pid: u32) -> Result<(), String> {
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("failed to execute kill -KILL {pid}: {e}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    if !pid_is_alive(pid) {
+        return Ok(());
+    }
+    Err(format!("failed to send SIGKILL to lock holder pid {pid}"))
+}
+
 fn write_new_lock_file(path: &Path) -> Result<(), std::io::Error> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let body = format!("pid={}\ncreated={}\n", std::process::id(), now_unix_secs());
+    let now = now_unix_secs();
+    let body = format!("pid={}\ncreated={now}\nupdated={now}\n", std::process::id());
     file.write_all(body.as_bytes())?;
     Ok(())
 }
@@ -3252,6 +3367,9 @@ fn deploy_result_was_interrupted(result: &Result<(), String>) -> bool {
 }
 
 fn check_deploy_interrupt(app: &str, phase: &str) -> Result<(), String> {
+    if let Err(err) = refresh_deploy_lock_heartbeat(app) {
+        eprintln!("       Warning: failed to refresh deploy lock heartbeat: {err}");
+    }
     if let Some(state) = read_deploy_interrupt(app)? {
         return Err(deploy_interrupted_error(phase, &state));
     }
@@ -3266,6 +3384,19 @@ fn should_process_pending_request(
         return true;
     }
     active_target.map(|target| target.sha.as_str()) != Some(pending.sha.as_str())
+}
+
+fn pending_force_request_is_ours(
+    pending_request: Option<&PendingGitDeployRequest>,
+    request_id: &str,
+    target_sha: &str,
+) -> bool {
+    matches!(
+        pending_request,
+        Some(request)
+            if request.request_id.as_deref() == Some(request_id)
+                || (request.request_id.is_none() && request.force && request.sha == target_sha)
+    )
 }
 
 fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Result<(), String> {
@@ -3357,10 +3488,13 @@ fn wait_for_forced_pending_deploy_completion(
         let pending_request = read_pending_git_request(app)?;
         let state = read_git_deploy_state(app)?;
         let interrupt_state = read_deploy_interrupt(app)?;
+        let elapsed = started.elapsed().as_secs();
         let interrupt_is_ours = matches!(
             interrupt_state.as_ref(),
             Some(DeployInterruptState { request_id: id, .. }) if id == request_id
         );
+        let pending_is_ours =
+            pending_force_request_is_ours(pending_request.as_ref(), request_id, &target.sha);
 
         if matches!(
             state.as_ref(),
@@ -3369,7 +3503,7 @@ fn wait_for_forced_pending_deploy_completion(
                 status: GitDeployStatus::Success,
                 ..
             }) if sha == &target.sha
-        ) && !interrupt_is_ours
+        ) && !pending_is_ours
         {
             eprintln!(
                 "=====> Forced deploy complete for {} ({})",
@@ -3379,6 +3513,60 @@ fn wait_for_forced_pending_deploy_completion(
             return Ok(());
         }
 
+        if lock_active
+            && interrupt_is_ours
+            && pending_is_ours
+            && elapsed >= DEPLOY_FORCE_TAKEOVER_TIMEOUT_SECS
+        {
+            eprintln!("-----> Force timeout reached ({elapsed}s); escalating to lock takeover");
+            let lock_path = deploy_lock_path(app);
+            match read_deploy_lock_metadata(app)? {
+                Some(metadata) => {
+                    if let Some(pid) = metadata.pid {
+                        let alive = pid_is_alive(pid);
+                        eprintln!("       Lock holder pid {pid} (alive: {alive})");
+                        if alive {
+                            eprintln!("       Sending SIGKILL to lock holder pid {pid}");
+                            send_kill_signal(pid)?;
+                            let mut exited = false;
+                            for _ in 0..DEPLOY_FORCE_KILL_WAIT_CHECKS {
+                                if !pid_is_alive(pid) {
+                                    exited = true;
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(DEPLOY_FORCE_KILL_WAIT_MS));
+                            }
+                            if !exited {
+                                return Err(format!(
+                                    "lock holder pid {pid} did not exit after SIGKILL"
+                                ));
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "       Warning: deploy lock metadata missing pid; forcing lock takeover"
+                        );
+                    }
+                }
+                None => {
+                    eprintln!("       Deploy lock disappeared during takeover escalation");
+                }
+            }
+            clear_deploy_lock(app)?;
+            let Some(_lock) = try_acquire_deploy_lock(app)? else {
+                return Err(format!(
+                    "failed to acquire deploy lock after forced takeover at {}; a concurrent deploy may still be running",
+                    lock_path.display()
+                ));
+            };
+            eprintln!("-----> Starting forced deploy takeover");
+            let _ = take_pending_git_request(app)?;
+            kick_pending_cleanup_worker(app);
+            let result = deploy_once(app, Some(target), true);
+            let _ = clear_deploy_interrupt(app);
+            return result;
+        }
+
         if !lock_active
             && interrupt_is_ours
             && let Some(_lock) = try_acquire_deploy_lock(app)?
@@ -3386,11 +3574,7 @@ fn wait_for_forced_pending_deploy_completion(
             eprintln!(
                 "-----> Active deploy did not acknowledge interrupt; taking over forced deploy"
             );
-            let should_take_own_pending = matches!(
-                pending_request.as_ref(),
-                Some(request) if request.request_id.as_deref() == Some(request_id)
-            );
-            if should_take_own_pending {
+            if pending_is_ours {
                 let _ = take_pending_git_request(app)?;
             }
             kick_pending_cleanup_worker(app);
@@ -3438,7 +3622,6 @@ fn wait_for_forced_pending_deploy_completion(
             }
         };
 
-        let elapsed = started.elapsed().as_secs();
         let status_line = if lock_active
             && elapsed >= DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS.saturating_mul(3)
             && status_line == "interrupt requested; waiting for active deploy to stop"
@@ -6261,6 +6444,41 @@ sha = "deadbeef"
     }
 
     #[test]
+    fn parse_deploy_lock_metadata_parses_fields() {
+        let parsed = parse_deploy_lock_metadata("pid=123\ncreated=10\nupdated=12\n");
+        assert_eq!(parsed.pid, Some(123));
+        assert_eq!(parsed.created, Some(10));
+        assert_eq!(parsed.updated, Some(12));
+    }
+
+    #[test]
+    fn parse_deploy_lock_metadata_ignores_invalid_values() {
+        let parsed = parse_deploy_lock_metadata("pid=nope\ncreated=\nupdated=abc\n");
+        assert_eq!(parsed.pid, None);
+        assert_eq!(parsed.created, None);
+        assert_eq!(parsed.updated, None);
+    }
+
+    #[test]
+    fn refresh_deploy_lock_heartbeat_updates_updated_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deploy_lock_path_in(tmp.path(), "myapp");
+        let metadata = DeployLockMetadata {
+            pid: Some(std::process::id()),
+            created: Some(100),
+            updated: Some(100),
+        };
+        write_deploy_lock_metadata(&path, &metadata).unwrap();
+
+        refresh_deploy_lock_heartbeat_at(&path, std::process::id()).unwrap();
+        let loaded = read_deploy_lock_metadata_from(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.pid, Some(std::process::id()));
+        assert_eq!(loaded.created, Some(100));
+        assert!(loaded.updated.unwrap_or(0) >= 100);
+    }
+
+    #[test]
     fn deploy_lock_is_exclusive_until_guard_drops() {
         let tmp = tempfile::tempdir().unwrap();
         let path = deploy_lock_path_in(tmp.path(), "myapp");
@@ -6369,6 +6587,27 @@ sha = "deadbeef"
         };
         assert!(!should_process_pending_request(Some(&active), &non_forced));
         assert!(should_process_pending_request(Some(&active), &forced));
+    }
+
+    #[test]
+    fn pending_force_request_is_ours_supports_legacy_force_without_request_id() {
+        let pending = PendingGitDeployRequest {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            force: true,
+            request_id: None,
+            interrupt_requested_at: None,
+        };
+        assert!(pending_force_request_is_ours(
+            Some(&pending),
+            "req-123",
+            "deadbeef"
+        ));
+        assert!(!pending_force_request_is_ours(
+            Some(&pending),
+            "req-123",
+            "cafebabe"
+        ));
     }
 
     #[test]
