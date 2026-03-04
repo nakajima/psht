@@ -3020,9 +3020,16 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
         .map_err(|e| format!("apt package install failed: {e}"))
 }
 
-fn wait_for_container_operation_quiet(app: &str, project: &str) -> Result<(), String> {
+fn wait_for_container_operation_quiet(
+    app: &str,
+    project: &str,
+    deploy_app: Option<&str>,
+) -> Result<(), String> {
     let mut announced_wait = false;
     for _ in 0..CONTAINER_OP_WAIT_CHECKS {
+        if let Some(deploy_app) = deploy_app {
+            check_deploy_interrupt(deploy_app, "waiting for active container operation")?;
+        }
         if !container::has_running_operation_in_project(app, project)? {
             if announced_wait {
                 eprintln!("       Active operation finished");
@@ -3053,7 +3060,7 @@ fn ensure_create_prereqs(project: &str) -> Result<(), String> {
 }
 
 fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String> {
-    wait_for_container_operation_quiet(app, project)?;
+    wait_for_container_operation_quiet(app, project, None)?;
 
     if !container::exists(app) {
         return Ok(());
@@ -3349,6 +3356,11 @@ fn wait_for_forced_pending_deploy_completion(
         let lock_active = deploy_lock_path(app).exists();
         let pending_request = read_pending_git_request(app)?;
         let state = read_git_deploy_state(app)?;
+        let interrupt_state = read_deploy_interrupt(app)?;
+        let interrupt_is_ours = matches!(
+            interrupt_state.as_ref(),
+            Some(DeployInterruptState { request_id: id, .. }) if id == request_id
+        );
 
         if matches!(
             state.as_ref(),
@@ -3357,13 +3369,34 @@ fn wait_for_forced_pending_deploy_completion(
                 status: GitDeployStatus::Success,
                 ..
             }) if sha == &target.sha
-        ) {
+        ) && !interrupt_is_ours
+        {
             eprintln!(
                 "=====> Forced deploy complete for {} ({})",
                 target.ref_name, target.sha
             );
             let _ = clear_deploy_interrupt(app);
             return Ok(());
+        }
+
+        if !lock_active
+            && interrupt_is_ours
+            && let Some(_lock) = try_acquire_deploy_lock(app)?
+        {
+            eprintln!(
+                "-----> Active deploy did not acknowledge interrupt; taking over forced deploy"
+            );
+            let should_take_own_pending = matches!(
+                pending_request.as_ref(),
+                Some(request) if request.request_id.as_deref() == Some(request_id)
+            );
+            if should_take_own_pending {
+                let _ = take_pending_git_request(app)?;
+            }
+            kick_pending_cleanup_worker(app);
+            let result = deploy_once(app, Some(target), true);
+            let _ = clear_deploy_interrupt(app);
+            return result;
         }
 
         if !lock_active
@@ -3406,6 +3439,14 @@ fn wait_for_forced_pending_deploy_completion(
         };
 
         let elapsed = started.elapsed().as_secs();
+        let status_line = if lock_active
+            && elapsed >= DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS.saturating_mul(3)
+            && status_line == "interrupt requested; waiting for active deploy to stop"
+        {
+            "interrupt requested; waiting for active deploy to stop (it may be in a long-running command)".to_string()
+        } else {
+            status_line
+        };
         if status_line != last_status_line || elapsed >= next_heartbeat {
             eprintln!("       {status_line} ({elapsed}s elapsed)");
             last_status_line = status_line;
@@ -3612,7 +3653,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     } else if let Some(previous_app) = old_previous_app.as_ref() {
         eprintln!("-----> Evaluating reusable inactive container");
         eprintln!("       Inactive: {previous_app}");
-        wait_for_container_operation_quiet(previous_app, &current_project)?;
+        wait_for_container_operation_quiet(previous_app, &current_project, Some(app))?;
         let previous_setup_hash =
             container::exec_output(previous_app, "cat /etc/psht-setup-hash 2>/dev/null")
                 .unwrap_or_default()
@@ -3634,7 +3675,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Preparing candidate container");
     eprintln!("       Candidate: {candidate_app}");
     eprintln!("       Traffic remains on current container");
-    wait_for_container_operation_quiet(&old_active_app, &current_project)?;
+    wait_for_container_operation_quiet(&old_active_app, &current_project, Some(app))?;
     check_deploy_interrupt(app, "candidate preparation")?;
 
     let build_candidate_result = (|| -> Result<(), String> {
@@ -4090,7 +4131,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     check_deploy_interrupt(app, "in-place setup evaluation")?;
     if needs_setup {
         check_deploy_interrupt(app, "in-place setup start")?;
-        wait_for_container_operation_quiet(app, &current_project)?;
+        wait_for_container_operation_quiet(app, &current_project, Some(app))?;
 
         let setup_image_cached = container::setup_image_exists_in_project(
             &stack,
