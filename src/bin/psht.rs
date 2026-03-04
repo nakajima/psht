@@ -169,7 +169,7 @@ fn resolve_host_from(config: &Config, cwd: &str) -> Result<String, String> {
     config
         .host
         .clone()
-        .ok_or_else(|| "no host configured. Run: ssh psht@<host> setup | sh".to_string())
+        .ok_or_else(|| "no host configured. Set `host` in ~/.psht/config.toml".to_string())
 }
 
 fn app_name(explicit: Option<&str>, cwd: &Path) -> String {
@@ -1420,37 +1420,190 @@ fn setup_project_in(host: &str, cwd: &Path, config_path: &Path, app: &str) -> Re
     Ok(())
 }
 
-fn update(host: &str) -> Result<(), String> {
-    let mut ssh = Command::new("ssh")
-        .arg(format!("psht@{host}"))
-        .arg("update-cli")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to run ssh: {e}"))?;
-    let stdin = ssh
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture ssh stdout".to_string())?;
-    let script_status = Command::new("sh")
-        .stdin(stdin)
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to run update script: {e}"))?;
-    let ssh_status = ssh
-        .wait()
-        .map_err(|e| format!("failed to wait for ssh: {e}"))?;
-
-    check_update_pipeline_status(script_status.success(), ssh_status.success())
+#[derive(Debug, Deserialize)]
+struct ServerUpdateManifest {
+    version: String,
+    #[serde(default)]
+    forge_url: String,
 }
 
-fn check_update_pipeline_status(script_success: bool, ssh_success: bool) -> Result<(), String> {
-    if !script_success {
-        return Err("update failed while running installer script".to_string());
+fn configured_forge_url() -> String {
+    env::var("PSHT_FORGE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://github.com/nakajima/psht".to_string())
+}
+
+fn detect_release_target() -> Result<&'static str, String> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        (os, arch) => Err(format!("unsupported platform: {os}/{arch}")),
     }
-    if !ssh_success {
-        return Err("update failed while fetching installer script over ssh".to_string());
+}
+
+fn binary_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace().nth(1).map(|v| v.to_string())
+}
+
+fn fetch_update_manifest(host: &str) -> Result<ServerUpdateManifest, String> {
+    let output = Command::new("ssh")
+        .arg(format!("psht@{host}"))
+        .arg("update-cli")
+        .output()
+        .map_err(|e| format!("failed to run ssh: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to fetch update manifest over ssh: {stderr}"
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(manifest) = serde_json::from_str::<ServerUpdateManifest>(trimmed) {
+            return Ok(manifest);
+        }
+    }
+    Err("server update manifest was not valid JSON".to_string())
+}
+
+fn install_local_update(manifest: &ServerUpdateManifest) -> Result<(), String> {
+    let version = manifest.version.trim();
+    if version.is_empty() {
+        return Err("update manifest missing version".to_string());
+    }
+    let forge_url = if manifest.forge_url.trim().is_empty() {
+        configured_forge_url()
+    } else {
+        manifest.forge_url.trim().trim_end_matches('/').to_string()
+    };
+    let target = detect_release_target()?;
+    let install_path =
+        env::current_exe().map_err(|e| format!("failed to resolve current executable: {e}"))?;
+
+    if binary_version(&install_path).as_deref() == Some(version) {
+        eprintln!("psht {version} (up to date)");
+        return Ok(());
+    }
+
+    let tmpdir = mktemp_dir("psht-update-")?;
+    let tarball = tmpdir.join("psht.tar.gz");
+    let tarball_s = tarball.to_string_lossy().to_string();
+    let tmpdir_s = tmpdir.to_string_lossy().to_string();
+    let asset_url =
+        format!("{forge_url}/releases/download/v{version}/psht-{version}-{target}.tar.gz");
+    let source_url = env::var("PSHT_SOURCE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| forge_url.clone());
+
+    let result = (|| -> Result<(), String> {
+        let mut candidate = tmpdir.join("psht");
+        let release_downloaded = Command::new("curl")
+            .args(["-fsSL", &asset_url, "-o", &tarball_s])
+            .status()
+            .map_err(|e| format!("failed to run curl: {e}"))?
+            .success();
+
+        if release_downloaded {
+            let status = Command::new("tar")
+                .args(["xzf", &tarball_s, "-C", &tmpdir_s])
+                .status()
+                .map_err(|e| format!("failed to run tar: {e}"))?;
+            if !status.success() || !candidate.is_file() {
+                return Err(format!(
+                    "downloaded archive missing executable psht binary: {asset_url}"
+                ));
+            }
+        } else {
+            eprintln!("warning: no prebuilt psht release at {asset_url}; building from source");
+            let source_root = tmpdir.join("source-root");
+            let source_root_s = source_root.to_string_lossy().to_string();
+            let tag = format!("v{version}");
+            let status = Command::new("cargo")
+                .args([
+                    "install",
+                    "--git",
+                    &source_url,
+                    "--tag",
+                    &tag,
+                    "--root",
+                    &source_root_s,
+                    "--bin",
+                    "psht",
+                ])
+                .status()
+                .map_err(|e| format!("failed to run cargo install: {e}"))?;
+            if !status.success() {
+                return Err("cargo install failed while building psht from source".to_string());
+            }
+            candidate = source_root.join("bin/psht");
+            if !candidate.is_file() {
+                return Err("cargo install completed but psht binary was not found".to_string());
+            }
+        }
+
+        let candidate_version = binary_version(&candidate).unwrap_or_else(|| "unknown".to_string());
+        if candidate_version != version {
+            return Err(format!(
+                "downloaded psht {candidate_version}, expected {version}"
+            ));
+        }
+
+        let file_name = install_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| format!("invalid install path: {}", install_path.display()))?;
+        let staged = install_path.with_file_name(format!("{file_name}.new"));
+        fs::copy(&candidate, &staged).map_err(|e| {
+            format!(
+                "failed to stage update {} -> {}: {e}",
+                candidate.display(),
+                staged.display()
+            )
+        })?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("failed to chmod {}: {e}", staged.display()))?;
+        fs::rename(&staged, &install_path).map_err(|e| {
+            format!(
+                "failed to install update {} -> {}: {e}",
+                staged.display(),
+                install_path.display()
+            )
+        })?;
+
+        let installed = binary_version(&install_path).unwrap_or_else(|| "unknown".to_string());
+        if installed != version {
+            return Err(format!(
+                "installed psht {installed}, expected {version} at {}",
+                install_path.display()
+            ));
+        }
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&tmpdir);
+    result?;
+    eprintln!("psht {version} (updated)");
     Ok(())
+}
+
+fn update(host: &str) -> Result<(), String> {
+    let manifest = fetch_update_manifest(host)?;
+    install_local_update(&manifest)
 }
 
 fn run() -> Result<(), String> {
@@ -1665,20 +1818,9 @@ mod tests {
     }
 
     #[test]
-    fn update_pipeline_status_ok_when_both_succeed() {
-        assert!(check_update_pipeline_status(true, true).is_ok());
-    }
-
-    #[test]
-    fn update_pipeline_status_fails_when_script_fails() {
-        let err = check_update_pipeline_status(false, true).unwrap_err();
-        assert!(err.contains("installer script"));
-    }
-
-    #[test]
-    fn update_pipeline_status_fails_when_ssh_fails() {
-        let err = check_update_pipeline_status(true, false).unwrap_err();
-        assert!(err.contains("over ssh"));
+    fn detect_release_target_supported_in_tests() {
+        // CI/dev environments for this repo are Linux/macOS amd64/arm64.
+        assert!(detect_release_target().is_ok());
     }
 
     #[test]

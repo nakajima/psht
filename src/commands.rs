@@ -16,6 +16,7 @@ use crate::caddy;
 use crate::container;
 use crate::deploy_log;
 use crate::detect;
+use crate::sqlite_store;
 use crate::tailscale;
 
 const STACKS: &[(&str, &str)] = &[
@@ -102,10 +103,6 @@ fn stacks_dir() -> PathBuf {
     home_dir().join("stacks")
 }
 
-fn git_deploy_state_dir() -> PathBuf {
-    home_dir().join("deploy-state")
-}
-
 fn upgrade_check_state_path() -> PathBuf {
     home_dir().join(".psht").join("upgrade-check.toml")
 }
@@ -114,24 +111,8 @@ fn deploy_lock_dir() -> PathBuf {
     home_dir().join("deploy-locks")
 }
 
-fn deploy_pending_dir() -> PathBuf {
-    home_dir().join("deploy-pending")
-}
-
-fn deploy_interrupt_dir() -> PathBuf {
-    home_dir().join(".psht").join("deploy-interrupts")
-}
-
-fn cleanup_job_dir() -> PathBuf {
-    home_dir().join(".psht").join("cleanup-jobs")
-}
-
 fn cleanup_lock_dir() -> PathBuf {
     home_dir().join(".psht").join("cleanup-locks")
-}
-
-fn app_runtime_state_dir() -> PathBuf {
-    home_dir().join(".psht").join("apps")
 }
 
 fn build_numbers_dir() -> PathBuf {
@@ -1983,12 +1964,12 @@ struct CleanupJobState {
     updated_at: u64,
 }
 
-fn app_runtime_state_path_in(dir: &Path, app: &str) -> PathBuf {
-    dir.join(format!("{app}.toml"))
-}
-
-fn app_runtime_state_path(app: &str) -> PathBuf {
-    app_runtime_state_path_in(&app_runtime_state_dir(), app)
+#[derive(Debug, Clone)]
+struct ReconcileIntentContext {
+    intent_id: String,
+    generation: i64,
+    plan_hash: String,
+    source_summary: String,
 }
 
 fn app_ref_from_instance_name(instance: &str) -> Option<String> {
@@ -2012,29 +1993,37 @@ fn instance_name_from_app_ref(app_ref: &str) -> String {
     }
 }
 
-fn read_app_runtime_state_from(path: &Path) -> Result<Option<AppRuntimeState>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    let state: AppRuntimeState =
-        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(state))
+fn sqlite_i64_to_u64(value: i64, app: &str, field: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| {
+        format!("invalid sqlite value for {field} in app '{app}': expected non-negative integer")
+    })
+}
+
+fn sqlite_i64_to_u32(value: i64, app: &str, field: &str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| {
+        format!("invalid sqlite value for {field} in app '{app}': expected u32-compatible integer")
+    })
+}
+
+fn sqlite_u64_to_i64(value: u64, app: &str, field: &str) -> Result<i64, String> {
+    i64::try_from(value)
+        .map_err(|_| format!("value for {field} in app '{app}' exceeds sqlite integer range"))
+}
+
+fn app_runtime_state_from_row(
+    row: sqlite_store::AppRuntimeStateRow,
+) -> Result<AppRuntimeState, String> {
+    Ok(AppRuntimeState {
+        active_instance: row.active_instance,
+        previous_instance: row.previous_instance,
+        updated_at: sqlite_i64_to_u64(row.updated_at, &row.app_id, "updated_at")?,
+    })
 }
 
 fn read_app_runtime_state(app: &str) -> Result<Option<AppRuntimeState>, String> {
-    read_app_runtime_state_from(&app_runtime_state_path(app))
-}
-
-fn write_app_runtime_state_to(path: &Path, state: &AppRuntimeState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let content = toml::to_string_pretty(state)
-        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
-    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    sqlite_store::get_app_runtime_state(app)?
+        .map(app_runtime_state_from_row)
+        .transpose()
 }
 
 fn write_app_runtime_state(
@@ -2042,51 +2031,26 @@ fn write_app_runtime_state(
     active_app_ref: &str,
     previous_app_ref: Option<&str>,
 ) -> Result<(), String> {
-    let state = AppRuntimeState {
+    sqlite_store::upsert_app_runtime_state(&sqlite_store::AppRuntimeStateRow {
+        app_id: app.to_string(),
         active_instance: instance_name_from_app_ref(active_app_ref),
         previous_instance: previous_app_ref.map(instance_name_from_app_ref),
-        updated_at: now_unix_secs(),
-    };
-    write_app_runtime_state_to(&app_runtime_state_path(app), &state)
+        updated_at: now_unix_secs() as i64,
+    })
 }
 
 fn clear_app_runtime_state(app: &str) -> Result<(), String> {
-    let path = app_runtime_state_path(app);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
-    }
+    sqlite_store::delete_app_runtime_state(app)
 }
 
 fn read_all_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
-    let dir = app_runtime_state_dir();
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("failed to read {}: {e}", dir.display())),
-    };
-
-    let mut states = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("failed to read entry in {}: {e}", dir.display()))?;
-        let path = entry.path();
-        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if ext != "toml" {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some(state) = read_app_runtime_state_from(&path)? else {
-            continue;
-        };
-        states.push((stem.to_string(), state));
+    let rows = sqlite_store::list_app_runtime_states()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let app = row.app_id.clone();
+        out.push((app, app_runtime_state_from_row(row)?));
     }
-    states.sort_by(|(left, _), (right, _)| left.cmp(right));
-    Ok(states)
+    Ok(out)
 }
 
 fn resolve_active_app_ref(app: &str) -> Result<Option<String>, String> {
@@ -2125,44 +2089,12 @@ fn resolve_existing_active_app_ref(app: &str) -> Result<String, String> {
     Ok(active_app_ref)
 }
 
-fn git_deploy_state_path_in(dir: &Path, app: &str) -> PathBuf {
-    dir.join(format!("{app}.toml"))
-}
-
-fn git_deploy_state_path(app: &str) -> PathBuf {
-    git_deploy_state_path_in(&git_deploy_state_dir(), app)
-}
-
 fn deploy_lock_path_in(dir: &Path, app: &str) -> PathBuf {
     dir.join(format!("{app}.lock"))
 }
 
 fn deploy_lock_path(app: &str) -> PathBuf {
     deploy_lock_path_in(&deploy_lock_dir(), app)
-}
-
-fn pending_git_target_path_in(dir: &Path, app: &str) -> PathBuf {
-    dir.join(format!("{app}.toml"))
-}
-
-fn pending_git_target_path(app: &str) -> PathBuf {
-    pending_git_target_path_in(&deploy_pending_dir(), app)
-}
-
-fn deploy_interrupt_path_in(dir: &Path, app: &str) -> PathBuf {
-    dir.join(format!("{app}.toml"))
-}
-
-fn deploy_interrupt_path(app: &str) -> PathBuf {
-    deploy_interrupt_path_in(&deploy_interrupt_dir(), app)
-}
-
-fn cleanup_job_path_in(dir: &Path, app: &str) -> PathBuf {
-    dir.join(format!("{app}.toml"))
-}
-
-fn cleanup_job_path(app: &str) -> PathBuf {
-    cleanup_job_path_in(&cleanup_job_dir(), app)
 }
 
 fn cleanup_lock_path_in(dir: &Path, app: &str) -> PathBuf {
@@ -2407,29 +2339,41 @@ fn try_acquire_cleanup_lock(app: &str) -> Result<Option<CleanupLockGuard>, Strin
     try_acquire_cleanup_lock_at(&cleanup_lock_path(app))
 }
 
-fn read_git_deploy_state_from(path: &Path) -> Result<Option<GitDeployState>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    let state: GitDeployState =
-        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(state))
+fn git_deploy_status_from_str(status: &str) -> Result<GitDeployStatus, String> {
+    match status {
+        "pending" => Ok(GitDeployStatus::Pending),
+        "success" => Ok(GitDeployStatus::Success),
+        "failed" => Ok(GitDeployStatus::Failed),
+        "interrupted" => Ok(GitDeployStatus::Interrupted),
+        _ => Err(format!(
+            "invalid git deploy status '{status}' in sqlite state"
+        )),
+    }
+}
+
+fn git_deploy_status_as_str(status: GitDeployStatus) -> &'static str {
+    match status {
+        GitDeployStatus::Pending => "pending",
+        GitDeployStatus::Success => "success",
+        GitDeployStatus::Failed => "failed",
+        GitDeployStatus::Interrupted => "interrupted",
+    }
+}
+
+fn git_deploy_state_from_row(
+    row: sqlite_store::GitDeployStateRow,
+) -> Result<GitDeployState, String> {
+    Ok(GitDeployState {
+        ref_name: row.ref_name,
+        sha: row.sha,
+        status: git_deploy_status_from_str(&row.status)?,
+    })
 }
 
 fn read_git_deploy_state(app: &str) -> Result<Option<GitDeployState>, String> {
-    read_git_deploy_state_from(&git_deploy_state_path(app))
-}
-
-fn write_git_deploy_state_to(path: &Path, state: &GitDeployState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let content = toml::to_string_pretty(state)
-        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
-    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    sqlite_store::get_git_deploy_state(app)?
+        .map(git_deploy_state_from_row)
+        .transpose()
 }
 
 fn write_git_deploy_state(
@@ -2437,155 +2381,121 @@ fn write_git_deploy_state(
     target: &GitCheckoutTarget,
     status: GitDeployStatus,
 ) -> Result<(), String> {
-    let state = GitDeployState {
+    sqlite_store::upsert_git_deploy_state(&sqlite_store::GitDeployStateRow {
+        app_id: app.to_string(),
         ref_name: target.ref_name.clone(),
         sha: target.sha.clone(),
-        status,
-    };
-    write_git_deploy_state_to(&git_deploy_state_path(app), &state)
-}
-
-fn clear_git_deploy_state_at(path: &Path) -> Result<(), String> {
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
-    }
+        status: git_deploy_status_as_str(status).to_string(),
+    })
 }
 
 fn clear_git_deploy_state(app: &str) -> Result<(), String> {
-    clear_git_deploy_state_at(&git_deploy_state_path(app))
+    sqlite_store::delete_git_deploy_state(app)
 }
 
-fn write_pending_git_request_to(
-    path: &Path,
-    request: &PendingGitDeployRequest,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let content = toml::to_string_pretty(request)
-        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
-    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+fn pending_git_request_from_row(
+    row: sqlite_store::PendingGitRequestRow,
+) -> Result<PendingGitDeployRequest, String> {
+    let app = row.app_id.clone();
+    Ok(PendingGitDeployRequest {
+        ref_name: row.ref_name,
+        sha: row.sha,
+        force: row.force,
+        request_id: row.request_id,
+        interrupt_requested_at: row
+            .interrupt_requested_at
+            .map(|value| sqlite_i64_to_u64(value, &app, "interrupt_requested_at"))
+            .transpose()?,
+    })
 }
 
 fn write_pending_git_request(app: &str, request: &PendingGitDeployRequest) -> Result<(), String> {
-    write_pending_git_request_to(&pending_git_target_path(app), request)
-}
-
-fn read_pending_git_request_from(path: &Path) -> Result<Option<PendingGitDeployRequest>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    let target: PendingGitDeployRequest =
-        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(target))
+    sqlite_store::upsert_pending_git_request(&sqlite_store::PendingGitRequestRow {
+        app_id: app.to_string(),
+        ref_name: request.ref_name.clone(),
+        sha: request.sha.clone(),
+        force: request.force,
+        request_id: request.request_id.clone(),
+        interrupt_requested_at: request
+            .interrupt_requested_at
+            .map(|value| sqlite_u64_to_i64(value, app, "interrupt_requested_at"))
+            .transpose()?,
+    })
 }
 
 fn read_pending_git_request(app: &str) -> Result<Option<PendingGitDeployRequest>, String> {
-    read_pending_git_request_from(&pending_git_target_path(app))
-}
-
-fn take_pending_git_request_from(path: &Path) -> Result<Option<PendingGitDeployRequest>, String> {
-    let target = read_pending_git_request_from(path)?;
-    if target.is_none() {
-        return Ok(None);
-    }
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("failed to remove {}: {e}", path.display())),
-    }
-    Ok(target)
+    sqlite_store::get_pending_git_request(app)?
+        .map(pending_git_request_from_row)
+        .transpose()
 }
 
 fn take_pending_git_request(app: &str) -> Result<Option<PendingGitDeployRequest>, String> {
-    take_pending_git_request_from(&pending_git_target_path(app))
+    sqlite_store::take_pending_git_request(app)?
+        .map(pending_git_request_from_row)
+        .transpose()
 }
 
-fn read_deploy_interrupt_from(path: &Path) -> Result<Option<DeployInterruptState>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    let state: DeployInterruptState =
-        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(state))
+fn deploy_interrupt_from_row(
+    row: sqlite_store::DeployInterruptRow,
+) -> Result<DeployInterruptState, String> {
+    Ok(DeployInterruptState {
+        request_id: row.request_id,
+        requested_at: sqlite_i64_to_u64(row.requested_at, &row.app_id, "requested_at")?,
+        target_sha: row.target_sha,
+    })
 }
 
 fn read_deploy_interrupt(app: &str) -> Result<Option<DeployInterruptState>, String> {
-    read_deploy_interrupt_from(&deploy_interrupt_path(app))
-}
-
-fn write_deploy_interrupt_to(path: &Path, state: &DeployInterruptState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let content = toml::to_string_pretty(state)
-        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
-    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    sqlite_store::get_deploy_interrupt(app)?
+        .map(deploy_interrupt_from_row)
+        .transpose()
 }
 
 fn request_deploy_interrupt(app: &str, state: &DeployInterruptState) -> Result<(), String> {
-    write_deploy_interrupt_to(&deploy_interrupt_path(app), state)
-}
-
-fn clear_deploy_interrupt_at(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
-    }
+    sqlite_store::upsert_deploy_interrupt(&sqlite_store::DeployInterruptRow {
+        app_id: app.to_string(),
+        request_id: state.request_id.clone(),
+        requested_at: sqlite_u64_to_i64(state.requested_at, app, "requested_at")?,
+        target_sha: state.target_sha.clone(),
+    })
 }
 
 fn clear_deploy_interrupt(app: &str) -> Result<(), String> {
-    clear_deploy_interrupt_at(&deploy_interrupt_path(app))
+    sqlite_store::delete_deploy_interrupt(app)
 }
 
-fn read_cleanup_job_from(path: &Path) -> Result<Option<CleanupJobState>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    let state: CleanupJobState =
-        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    Ok(Some(state))
+fn cleanup_job_from_row(row: sqlite_store::CleanupJobRow) -> Result<CleanupJobState, String> {
+    Ok(CleanupJobState {
+        app: row.app_id.clone(),
+        active_instance_at_schedule: row.active_instance_at_schedule,
+        scheduled_previous_instance: row.scheduled_previous_instance,
+        attempts: sqlite_i64_to_u32(row.attempts, &row.app_id, "attempts")?,
+        last_error: row.last_error,
+        scheduled_at: sqlite_i64_to_u64(row.scheduled_at, &row.app_id, "scheduled_at")?,
+        updated_at: sqlite_i64_to_u64(row.updated_at, &row.app_id, "updated_at")?,
+    })
 }
 
 fn read_cleanup_job(app: &str) -> Result<Option<CleanupJobState>, String> {
-    read_cleanup_job_from(&cleanup_job_path(app))
-}
-
-fn write_cleanup_job_to(path: &Path, state: &CleanupJobState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let content = toml::to_string_pretty(state)
-        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
-    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    sqlite_store::get_cleanup_job(app)?
+        .map(cleanup_job_from_row)
+        .transpose()
 }
 
 fn write_cleanup_job(app: &str, state: &CleanupJobState) -> Result<(), String> {
-    write_cleanup_job_to(&cleanup_job_path(app), state)
-}
-
-fn clear_cleanup_job_at(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
-    }
+    sqlite_store::upsert_cleanup_job(&sqlite_store::CleanupJobRow {
+        app_id: app.to_string(),
+        active_instance_at_schedule: state.active_instance_at_schedule.clone(),
+        scheduled_previous_instance: state.scheduled_previous_instance.clone(),
+        attempts: i64::from(state.attempts),
+        last_error: state.last_error.clone(),
+        scheduled_at: sqlite_u64_to_i64(state.scheduled_at, app, "scheduled_at")?,
+        updated_at: sqlite_u64_to_i64(state.updated_at, app, "updated_at")?,
+    })
 }
 
 fn clear_cleanup_job(app: &str) -> Result<(), String> {
-    clear_cleanup_job_at(&cleanup_job_path(app))
+    sqlite_store::delete_cleanup_job(app)
 }
 
 fn spawn_cleanup_previous_worker(app: &str) -> Result<(), String> {
@@ -3460,6 +3370,177 @@ fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Re
     }
 }
 
+fn runtime_state_snapshot(app: &str) -> (Option<String>, Option<String>) {
+    if let Ok(Some(state)) = read_app_runtime_state(app) {
+        return (Some(state.active_instance), state.previous_instance);
+    }
+    let active = resolve_active_app_ref(app)
+        .ok()
+        .flatten()
+        .map(|app_ref| instance_name_from_app_ref(&app_ref));
+    (active, None)
+}
+
+fn begin_reconcile_intent(
+    app: &str,
+    kind: &str,
+    source_kind: &str,
+    source_payload_json: &str,
+) -> Result<ReconcileIntentContext, String> {
+    let generation = sqlite_store::next_app_generation(app)?;
+    let spec = sqlite_store::AppSpecRow {
+        app_id: app.to_string(),
+        generation,
+        desired_state: "running".to_string(),
+        source_kind: source_kind.to_string(),
+        source_payload_json: source_payload_json.to_string(),
+        runtime_payload_json: "{}".to_string(),
+    };
+    sqlite_store::upsert_app_spec(&spec)?;
+
+    let intent_id = format!("{}-{}-{generation}", now_unix_secs(), std::process::id());
+    sqlite_store::insert_deploy_intent(&sqlite_store::DeployIntentRow {
+        intent_id: intent_id.clone(),
+        app_id: app.to_string(),
+        generation,
+        kind: kind.to_string(),
+        payload_json: source_payload_json.to_string(),
+    })?;
+
+    let plan_hash = format!("{app}:{kind}:{generation}");
+    sqlite_store::upsert_reconcile_checkpoint(
+        app,
+        generation,
+        &plan_hash,
+        0,
+        "intent-accepted",
+        Some("{\"ok\":true}"),
+    )?;
+
+    let (active_instance, previous_instance) = runtime_state_snapshot(app);
+    let previous_status = sqlite_store::get_app_status(app).ok().flatten();
+    let active_revision = read_git_deploy_state(app)
+        .ok()
+        .flatten()
+        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
+    sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+        app_id: app.to_string(),
+        observed_generation: generation,
+        phase: "Reconciling".to_string(),
+        active_instance,
+        candidate_instance: previous_status.and_then(|status| status.candidate_instance),
+        previous_instance,
+        active_revision,
+        candidate_revision: None,
+        health_json: "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string(),
+        last_error_json: None,
+        recovery_actions_json: "[]".to_string(),
+    })?;
+
+    Ok(ReconcileIntentContext {
+        intent_id,
+        generation,
+        plan_hash,
+        source_summary: source_payload_json.to_string(),
+    })
+}
+
+fn reconcile_checkpoint(
+    app: &str,
+    ctx: &ReconcileIntentContext,
+    op_index: i64,
+    op_name: &str,
+    last_result_json: Option<&str>,
+) {
+    if let Err(err) = sqlite_store::upsert_reconcile_checkpoint(
+        app,
+        ctx.generation,
+        &ctx.plan_hash,
+        op_index,
+        op_name,
+        last_result_json,
+    ) {
+        eprintln!("       Warning: failed to persist reconcile checkpoint: {err}");
+    }
+}
+
+fn complete_reconcile_intent(
+    app: &str,
+    ctx: &ReconcileIntentContext,
+    result: &Result<(), String>,
+    revision: Option<&str>,
+) {
+    let (phase, last_error_json, health_json, recovery_actions_json, outcome, summary) =
+        match result {
+            Ok(()) => (
+                "Idle".to_string(),
+                None,
+                "{\"healthy\":true}".to_string(),
+                "[]".to_string(),
+                "success".to_string(),
+                format!("deploy succeeded ({})", ctx.source_summary),
+            ),
+            Err(err) => (
+                "Degraded".to_string(),
+                Some(
+                    serde_json::json!({
+                        "error": err,
+                        "generation": ctx.generation,
+                    })
+                    .to_string(),
+                ),
+                "{\"healthy\":false}".to_string(),
+                serde_json::json!(["inspect deploy logs", "run `psht health`", "retry deploy"])
+                    .to_string(),
+                "failed".to_string(),
+                err.to_string(),
+            ),
+        };
+
+    let (active_instance, previous_instance) = runtime_state_snapshot(app);
+    if let Err(err) = sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+        app_id: app.to_string(),
+        observed_generation: ctx.generation,
+        phase,
+        active_instance,
+        candidate_instance: None,
+        previous_instance,
+        active_revision: revision.map(|value| value.to_string()),
+        candidate_revision: None,
+        health_json,
+        last_error_json,
+        recovery_actions_json,
+    }) {
+        eprintln!("       Warning: failed to persist app status: {err}");
+    }
+
+    if result.is_ok() {
+        let _ = sqlite_store::clear_reconcile_checkpoint(app);
+    } else {
+        reconcile_checkpoint(
+            app,
+            ctx,
+            999,
+            "failed",
+            Some(
+                &serde_json::json!({
+                    "error": summary,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    if let Err(err) =
+        sqlite_store::append_deploy_history(app, ctx.generation, revision, &outcome, &summary)
+    {
+        eprintln!("       Warning: failed to append deploy history: {err}");
+    }
+    if let Err(err) = sqlite_store::mark_deploy_intent_processed(&ctx.intent_id) {
+        eprintln!("       Warning: failed to mark deploy intent processed: {err}");
+    }
+}
+
 fn queue_pending_git_deploy(
     app: &str,
     target: &GitCheckoutTarget,
@@ -3647,6 +3728,37 @@ pub fn deploy(
     force: bool,
 ) -> Result<(), String> {
     app_name::validate_app_name(app)?;
+    let source_payload = serde_json::json!({
+        "mode": "git",
+        "ref": git_ref,
+        "sha": git_sha,
+        "force": force,
+    })
+    .to_string();
+    let ctx = begin_reconcile_intent(app, "deploy", "git", &source_payload)?;
+    reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
+
+    let result = deploy_impl(app, git_ref, git_sha, force);
+    let revision = parse_git_checkout_target(git_ref, git_sha)
+        .ok()
+        .and_then(|target| target.map(|target| target.sha))
+        .or_else(|| {
+            read_git_deploy_state(app)
+                .ok()
+                .flatten()
+                .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha))
+        });
+    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
+    result
+}
+
+fn deploy_impl(
+    app: &str,
+    git_ref: Option<&str>,
+    git_sha: Option<&str>,
+    force: bool,
+) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
     let _deploy_log_session = start_deploy_log_session(app);
     eprintln!("-----> Deploying {app}");
     warn_if_upgrade_available();
@@ -3722,6 +3834,24 @@ pub fn deploy(
 }
 
 pub fn push(app: &str, force: bool) -> Result<(), String> {
+    app_name::validate_app_name(app)?;
+    let source_payload = serde_json::json!({
+        "mode": "push",
+        "force": force,
+    })
+    .to_string();
+    let ctx = begin_reconcile_intent(app, "push", "tar-stdin", &source_payload)?;
+    reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
+    let result = push_impl(app, force);
+    let revision = read_git_deploy_state(app)
+        .ok()
+        .flatten()
+        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
+    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
+    result
+}
+
+fn push_impl(app: &str, force: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let _deploy_log_session = start_deploy_log_session(app);
     eprintln!("-----> Deploying {app}");
@@ -4899,164 +5029,39 @@ pub fn logs(app: &str, follow: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn setup_script(hostname: &str) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let forge_url = configured_forge_url();
-    format!(
-        r#"#!/bin/sh
-set -e
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CliUpdateManifest {
+    version: String,
+    forge_url: String,
+}
 
-VERSION="{version}"
-FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
-FORGE_URL="${{FORGE_URL%/}}"
-SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
-SOURCE_URL="${{SOURCE_URL%/}}"
-
-detect_target() {{
-  os=$(uname -s)
-  arch=$(uname -m)
-  case "$os/$arch" in
-    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
-    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
-    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
-    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
-    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
-  esac
-}}
-
-install_cli() {{
-  install_dir="$1"
-  target=$(detect_target)
-  asset_url="$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz"
-  tmpdir=$(mktemp -d)
-  if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
-    tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
-    install -m 755 "$tmpdir/psht" "$install_dir/psht"
-    rm -rf "$tmpdir"
-    return 0
-  fi
-
-  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
-    rm -rf "$tmpdir"
-    exit 1
-  fi
-
-  source_root="$tmpdir/source-root"
-  echo "-----> building psht from source (this can take a few minutes)" >&2
-  cargo install --git "$SOURCE_URL" --tag "v$VERSION" --root "$source_root" --bin psht
-  install -m 755 "$source_root/bin/psht" "$install_dir/psht"
-  rm -rf "$tmpdir"
-}}
-
-# Find or install psht CLI
-# The server binary also has a `setup` command that prints this script.
-# Reusing it here would recurse and only print the script again.
-if command -v psht >/dev/null 2>&1 && psht __is-cli >/dev/null 2>&1; then
-  PSHT_BIN=$(command -v psht)
-else
-  printf "Install psht CLI to (default: ~/.local/bin): " >&2
-  read -r install_dir < /dev/tty
-  install_dir="${{install_dir:-$HOME/.local/bin}}"
-  mkdir -p "$install_dir"
-  install_cli "$install_dir"
-  PSHT_BIN="$install_dir/psht"
-  case ":$PATH:" in
-    *":$install_dir:"*) ;;
-    *) echo "NOTE: Add $install_dir to your PATH: export PATH=\"$install_dir:\$PATH\"" >&2 ;;
-  esac
-  echo "Installed psht CLI to $PSHT_BIN" >&2
-fi
-
-# Write default host
-mkdir -p "$HOME/.psht"
-config="$HOME/.psht/config.toml"
-if [ ! -f "$config" ]; then
-  echo 'host = "{hostname}"' > "$config"
-fi
-
-# Set up project
-"$PSHT_BIN" setup"#
-    )
+fn cli_update_manifest() -> CliUpdateManifest {
+    CliUpdateManifest {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        forge_url: configured_forge_url(),
+    }
 }
 
 pub fn setup() -> Result<(), String> {
-    println!("{}", setup_script(&hostname()));
+    let host = hostname();
+    let manifest = cli_update_manifest();
+    println!("psht setup is now Rust-native.");
+    println!("Install or update your local CLI to continue:");
+    println!(
+        "  version: {}\n  forge: {}\n  server: {}",
+        manifest.version, manifest.forge_url, host
+    );
+    println!("Then run: psht setup");
     Ok(())
 }
 
-fn update_script(hostname: &str) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let forge_url = configured_forge_url();
-    format!(
-        r#"#!/bin/sh
-set -e
-PSHT_BIN=$(command -v psht) || {{ echo "psht not found. Run: ssh psht@{hostname} setup | sh" >&2; exit 1; }}
-FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
-FORGE_URL="${{FORGE_URL%/}}"
-SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
-SOURCE_URL="${{SOURCE_URL%/}}"
-
-detect_target() {{
-  os=$(uname -s)
-  arch=$(uname -m)
-  case "$os/$arch" in
-    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
-    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
-    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
-    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
-    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
-  esac
-}}
-
-current=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || current=""
-if [ "$current" = "{version}" ]; then
-  echo "psht {version} (up to date)" >&2
-  exit 0
-fi
-
-target=$(detect_target)
-asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz"
-tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
-candidate="$tmpdir/psht"
-if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
-  tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
-else
-  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
-    exit 1
-  fi
-  source_root="$tmpdir/source-root"
-  echo "-----> building psht from source (this can take a few minutes)" >&2
-  cargo install --git "$SOURCE_URL" --tag "v{version}" --root "$source_root" --bin psht
-  candidate="$source_root/bin/psht"
-fi
-if [ ! -x "$candidate" ]; then
-  echo "error: downloaded archive missing executable psht binary" >&2
-  exit 1
-fi
-candidate_version=$("$candidate" --version 2>/dev/null | awk '{{print $2}}') || candidate_version=""
-if [ "$candidate_version" != "{version}" ]; then
-  echo "error: downloaded psht ${{candidate_version:-unknown}}, expected {version}" >&2
-  exit 1
-fi
-staged="$tmpdir/psht.new"
-install -m 755 "$candidate" "$staged"
-mv "$staged" "$PSHT_BIN"
-installed=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || installed=""
-if [ "$installed" != "{version}" ]; then
-  echo "error: installed psht ${{installed:-unknown}}, expected {version}" >&2
-  exit 1
-fi
-echo "psht $installed (updated)" >&2"#
-    )
-}
-
 pub fn update() -> Result<(), String> {
-    println!("{}", update_script(&hostname()));
+    let manifest = cli_update_manifest();
+    println!(
+        "{}",
+        serde_json::to_string(&manifest)
+            .map_err(|e| format!("failed to serialize update manifest: {e}"))?
+    );
     Ok(())
 }
 
@@ -5351,298 +5356,316 @@ pub fn bootstrap() -> Result<(), String> {
     Ok(())
 }
 
-fn upgrade_script() -> String {
-    let forge_url = configured_forge_url();
-    let invoked_bin = env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let invoked_bin_quoted = shell_quote(&invoked_bin);
-    format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
+fn server_release_url(forge_url: &str, version: &str, target: &str) -> String {
+    format!("{forge_url}/releases/download/v{version}/psht-server-{version}-{target}.tar.gz")
+}
 
-PSHT_USER="psht"
-PSHT_HOME="/home/$PSHT_USER"
-FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
-FORGE_URL="${{FORGE_URL%/}}"
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
+        if deduped.iter().any(|existing: &PathBuf| {
+            fs::canonicalize(existing).unwrap_or(existing.clone()) == canonical
+        }) {
+            continue;
+        }
+        deduped.push(path);
+    }
+    deduped
+}
 
-log() {{ echo "-----> $*"; }}
-err() {{ echo "ERROR: $*" >&2; exit 1; }}
-detect_version() {{
-    local bin="$1"
-    "$bin" --version 2>/dev/null | awk '{{print $2}}' | head -n1
-}}
+fn psht_user_shell_path() -> Option<PathBuf> {
+    let passwd = run_cmd_capture("getent", &["passwd", "psht"]).ok()?;
+    let shell = passwd.split(':').nth(6)?.trim();
+    if shell.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(shell))
+}
 
-PSHT_BIN=$(getent passwd "$PSHT_USER" | cut -d: -f7 || true)
-if [[ -z "$PSHT_BIN" ]]; then
-    PSHT_BIN=$(command -v psht-server) || err "psht-server not found in PATH"
-fi
-PSHT_BIN=$(realpath "$PSHT_BIN")
-[[ -x "$PSHT_BIN" ]] || err "psht-server binary is not executable: $PSHT_BIN"
+fn collect_server_install_targets(current_bin: &Path) -> Vec<PathBuf> {
+    let mut targets = vec![current_bin.to_path_buf()];
+    if let Ok(which_bin) = run_cmd_capture("which", &["psht-server"]) {
+        let path = PathBuf::from(which_bin.trim());
+        if path.exists() {
+            targets.push(path);
+        }
+    }
+    if let Some(shell_path) = psht_user_shell_path()
+        && shell_path.exists()
+    {
+        targets.push(shell_path);
+    }
+    dedupe_paths(targets)
+}
 
-PATH_BIN=$(command -v psht-server || true)
-if [[ -n "$PATH_BIN" ]]; then
-    PATH_BIN=$(realpath "$PATH_BIN")
-fi
-INVOKED_BIN={invoked_bin_quoted}
-if [[ -n "$INVOKED_BIN" ]]; then
-    INVOKED_BIN=$(realpath "$INVOKED_BIN" 2>/dev/null || true)
-fi
-
-install_targets=("$PSHT_BIN")
-if [[ -n "$PATH_BIN" && "$PATH_BIN" != "$PSHT_BIN" ]]; then
-    install_targets+=("$PATH_BIN")
-fi
-if [[ -n "$INVOKED_BIN" && "$INVOKED_BIN" != "$PSHT_BIN" && "$INVOKED_BIN" != "${{PATH_BIN:-}}" ]]; then
-    install_targets+=("$INVOKED_BIN")
-fi
-
-[[ $EUID -eq 0 ]] || err "Run this script as root: sudo psht-server upgrade"
-
-CURRENT_VERSION=$(detect_version "$PSHT_BIN")
-[[ -n "$CURRENT_VERSION" ]] || err "failed to detect installed psht-server version from $PSHT_BIN"
-
-# Detect architecture
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
-    aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-    *)       err "Unsupported architecture: $ARCH" ;;
-esac
-
-# Resolve latest version from forge.
-log "Checking for updates"
-LATEST=""
-LATEST_URL=$(curl -fsSL -o /dev/null -w '%{{url_effective}}' "$FORGE_URL/releases/latest" 2>/dev/null || true)
-if [[ -n "$LATEST_URL" ]]; then
-    LATEST_TAG="${{LATEST_URL##*/}}"
-    LATEST_TAG="${{LATEST_TAG%%\?*}}"
-    if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "latest" ]]; then
-        LATEST="${{LATEST_TAG#v}}"
-    fi
-fi
-
-if [[ -z "$LATEST" ]]; then
-    REPO_PATH=$(echo "$FORGE_URL" | sed -E 's#https?://[^/]+/##')
-    if [[ -n "$REPO_PATH" && "$REPO_PATH" != "$FORGE_URL" ]]; then
-        LATEST_API=$(curl -fsSL "$FORGE_URL/api/v1/repos/$REPO_PATH/releases/latest" 2>/dev/null || true)
-        if [[ -n "$LATEST_API" ]]; then
-            LATEST=$(echo "$LATEST_API" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | cut -d'"' -f4 | sed 's/^v//')
-        fi
-    fi
-fi
-
-[[ -n "$LATEST" ]] || err "Failed to resolve latest release from $FORGE_URL (tried /releases/latest and /api/v1/repos/.../releases/latest)"
-
-needs_upgrade=0
-for target in "${{install_targets[@]}}"; do
-    target_version=$(detect_version "$target" || true)
-    if [[ -z "$target_version" || "$target_version" != "$LATEST" ]]; then
-        needs_upgrade=1
-        break
-    fi
-done
-if [[ "$needs_upgrade" -eq 0 ]]; then
-    echo "psht $LATEST (up to date)"
-    exit 0
-fi
-if [[ "$CURRENT_VERSION" == "$LATEST" ]]; then
-    log "Upgrading psht binaries to $LATEST"
-else
-    log "Upgrading psht $CURRENT_VERSION -> $LATEST"
-fi
-
-# Set up temp directory with cleanup
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
-
-# Download both tarballs
-BASE_URL="$FORGE_URL/releases/download/v$LATEST"
-download_or_err() {{
-    local url="$1"
-    local out="$2"
-    if ! curl -fsSL "$url" -o "$out"; then
-        err "download failed: $url"
-    fi
-}}
-
-log "Downloading psht $LATEST"
-download_or_err "$BASE_URL/psht-server-${{LATEST}}-${{TARGET}}.tar.gz" "$TMPDIR/psht-server.tar.gz"
-download_or_err "$BASE_URL/psht-${{LATEST}}-${{TARGET}}.tar.gz" "$TMPDIR/psht.tar.gz"
-
-# Extract and install
-tar xzf "$TMPDIR/psht-server.tar.gz" -C "$TMPDIR"
-tar xzf "$TMPDIR/psht.tar.gz" -C "$TMPDIR"
-
-candidate_version=$(detect_version "$TMPDIR/psht-server" || true)
-[[ -n "$candidate_version" ]] || err "failed to detect downloaded psht-server version"
-if [[ "$candidate_version" != "$LATEST" ]]; then
-    err "downloaded psht-server ${{candidate_version:-unknown}}, expected $LATEST"
-fi
-
-log "Installing binaries"
-for target in "${{install_targets[@]}}"; do
-    install -m 755 "$TMPDIR/psht-server" "$target"
-done
-mkdir -p "$PSHT_HOME/bin"
-install -m 755 "$TMPDIR/psht" "$PSHT_HOME/bin/psht"
-chown "$PSHT_USER:$PSHT_USER" "$PSHT_HOME/bin/psht"
-
-for target in "${{install_targets[@]}}"; do
-    installed_version=$(detect_version "$target" || true)
-    if [[ -z "$installed_version" || "$installed_version" != "$LATEST" ]]; then
-        err "installed $target reports ${{installed_version:-unknown}}, expected $LATEST"
-    fi
-done
-
-# Update incus
-log "Updating incus"
-apt-get update -qq && apt-get install -y -qq incus
-
-# Refresh stacks
-log "Refreshing stacks"
-sudo -u "$PSHT_USER" "$PSHT_BIN" init-stacks
-
-echo "=====> psht upgraded to $LATEST"
-"#
-    )
+fn ensure_binary_version(path: &Path, expected: &str, label: &str) -> Result<(), String> {
+    let installed = binary_version(path).unwrap_or_else(|| "unknown".to_string());
+    if installed == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} version mismatch at {}: expected {expected}, got {installed}",
+        path.display()
+    ))
 }
 
 pub fn upgrade_server() -> Result<(), String> {
-    let script = upgrade_script();
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to run upgrade: {e}"))?;
-    if !status.success() {
-        return Err("upgrade failed".to_string());
+    if run_cmd_capture("id", &["-u"])? != "0" {
+        return Err("Run this command as root: sudo psht-server upgrade".to_string());
     }
+
+    let current_bin = current_psht_binary()?;
+    let current_version = binary_version(&current_bin).ok_or_else(|| {
+        format!(
+            "failed to detect current version from {}",
+            current_bin.display()
+        )
+    })?;
+    let latest = latest_release_version()?;
+    let target = detect_release_target()?;
+    let forge_url = configured_forge_url();
+    let install_targets = collect_server_install_targets(&current_bin);
+
+    if !version_is_newer(&latest, &current_version) {
+        let all_targets_match = install_targets
+            .iter()
+            .all(|path| binary_matches_version(path, &latest));
+        if all_targets_match {
+            println!("psht {latest} (up to date)");
+            return Ok(());
+        }
+    }
+
+    eprintln!("-----> Upgrading psht {current_version} -> {latest}");
+    let tmpdir = run_cmd_capture("mktemp", &["-d"])?;
+    let tmpdir_path = PathBuf::from(tmpdir);
+    let tmpdir_s = tmpdir_path.to_string_lossy().to_string();
+    let server_tar = tmpdir_path.join("psht-server.tar.gz");
+    let cli_tar = tmpdir_path.join("psht.tar.gz");
+    let server_tar_s = server_tar.to_string_lossy().to_string();
+    let cli_tar_s = cli_tar.to_string_lossy().to_string();
+
+    let result = (|| {
+        let server_url = server_release_url(&forge_url, &latest, target);
+        let cli_url = cli_release_url(&forge_url, &latest, target);
+
+        eprintln!("-----> Downloading release artifacts");
+        run_cmd_quiet("curl", &["-fsSL", &server_url, "-o", &server_tar_s])
+            .map_err(|e| format!("download failed: {server_url}: {e}"))?;
+        run_cmd_quiet("curl", &["-fsSL", &cli_url, "-o", &cli_tar_s])
+            .map_err(|e| format!("download failed: {cli_url}: {e}"))?;
+
+        run_cmd_quiet("tar", &["xzf", &server_tar_s, "-C", &tmpdir_s])?;
+        run_cmd_quiet("tar", &["xzf", &cli_tar_s, "-C", &tmpdir_s])?;
+
+        let server_candidate = tmpdir_path.join("psht-server");
+        let cli_candidate = tmpdir_path.join("psht");
+        if !server_candidate.is_file() {
+            return Err("release tarball missing psht-server binary".to_string());
+        }
+        if !cli_candidate.is_file() {
+            return Err("release tarball missing psht binary".to_string());
+        }
+        ensure_binary_version(&server_candidate, &latest, "downloaded psht-server")?;
+        ensure_binary_version(&cli_candidate, &latest, "downloaded psht")?;
+
+        eprintln!("-----> Installing server binary");
+        for target_path in &install_targets {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            }
+            fs::copy(&server_candidate, target_path).map_err(|e| {
+                format!(
+                    "failed to install server binary to {}: {e}",
+                    target_path.display()
+                )
+            })?;
+            fs::set_permissions(target_path, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("failed to chmod {}: {e}", target_path.display()))?;
+            ensure_binary_version(target_path, &latest, "installed psht-server")?;
+        }
+
+        eprintln!("-----> Installing CLI binary");
+        let psht_cli_dst = home_dir().join("bin/psht");
+        if let Some(parent) = psht_cli_dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        fs::copy(&cli_candidate, &psht_cli_dst).map_err(|e| {
+            format!(
+                "failed to install cli binary to {}: {e}",
+                psht_cli_dst.display()
+            )
+        })?;
+        fs::set_permissions(&psht_cli_dst, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("failed to chmod {}: {e}", psht_cli_dst.display()))?;
+        let _ = run_cmd("chown", &["psht:psht", &psht_cli_dst.to_string_lossy()]);
+        ensure_binary_version(&psht_cli_dst, &latest, "installed psht")?;
+
+        eprintln!("-----> Updating incus");
+        run_cmd("apt-get", &["update", "-qq"])?;
+        run_cmd("apt-get", &["install", "-y", "-qq", "incus"])?;
+
+        eprintln!("-----> Refreshing stacks");
+        init_stacks_in(&stacks_dir())?;
+        let _ = run_cmd(
+            "chown",
+            &["-R", "psht:psht", &stacks_dir().to_string_lossy()],
+        );
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&tmpdir_path);
+    result?;
+    println!("=====> psht upgraded to {latest}");
     Ok(())
 }
 
-fn doctor_script() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    format!(
-        r#"#!/usr/bin/env bash
-set -uo pipefail
-
-PSHT_USER="psht"
-PSHT_HOME="/home/$PSHT_USER"
-PSHT_USER_SHELL=$(getent passwd "$PSHT_USER" 2>/dev/null | cut -d: -f7 || true)
-FAILED=0
-
-pass() {{ echo "  [ok] $*"; }}
-fail() {{ echo "  [FAIL] $*"; FAILED=1; }}
-
-check() {{
-    local desc="$1"; shift
-    if "$@" &>/dev/null; then
-        pass "$desc"
-    else
-        fail "$desc"
-    fi
-}}
-
-echo "Installation:"
-if [[ -n "$PSHT_USER_SHELL" ]]; then
-    check "psht-server binary at $PSHT_USER_SHELL" test -x "$PSHT_USER_SHELL"
-else
-    fail "psht user shell path missing"
-fi
-check "psht CLI binary at \$PSHT_HOME/bin/psht" test -x "$PSHT_HOME/bin/psht"
-if [[ -n "$PSHT_USER_SHELL" ]]; then
-    INSTALLED_VERSION=$("$PSHT_USER_SHELL" --version 2>/dev/null | awk '{{print $2}}') || INSTALLED_VERSION=""
-else
-    INSTALLED_VERSION=""
-fi
-if [[ "$INSTALLED_VERSION" == "{version}" ]]; then
-    pass "psht version {version}"
-else
-    fail "psht version: expected {version}, got ${{INSTALLED_VERSION:-unknown}}"
-fi
-
-echo ""
-echo "System:"
-check "psht user exists" id psht
-if [[ -n "$PSHT_USER_SHELL" ]] && getent passwd psht | grep -q ":$PSHT_USER_SHELL$"; then
-    pass "psht user shell is $PSHT_USER_SHELL"
-else
-    fail "psht user shell is not $PSHT_USER_SHELL"
-fi
-if [[ -n "$PSHT_USER_SHELL" ]] && grep -qx "$PSHT_USER_SHELL" /etc/shells 2>/dev/null; then
-    pass "$PSHT_USER_SHELL listed in /etc/shells"
-else
-    fail "$PSHT_USER_SHELL not listed in /etc/shells"
-fi
-if id -nG psht 2>/dev/null | grep -qw incus; then
-    pass "psht user in incus group"
-else
-    fail "psht user not in incus group"
-fi
-
-echo ""
-echo "Incus:"
-check "incus installed" command -v incus
-check "incus responsive" incus info
-
-if [[ -z "${{PSHT_SKIP_TAILSCALE:-}}" ]]; then
-echo ""
-echo "Tailscale:"
-check "tailscale installed" command -v tailscale
-check "tailscale connected" tailscale status
-if tailscale status --json 2>/dev/null | grep -q '"SSH":true'; then
-    pass "tailscale SSH enabled"
-else
-    fail "tailscale SSH not enabled"
-fi
-if [[ -f "$PSHT_HOME/.config/tailscale-oauth" ]]; then
-    pass "OAuth config exists"
-else
-    fail "OAuth config missing at \$PSHT_HOME/.config/tailscale-oauth"
-fi
-fi
-
-echo ""
-echo "Directories & stacks:"
-check "\$PSHT_HOME/repos exists" test -d "$PSHT_HOME/repos"
-check "\$PSHT_HOME/builds exists" test -d "$PSHT_HOME/builds"
-check "\$PSHT_HOME/stacks exists" test -d "$PSHT_HOME/stacks"
-if ls "$PSHT_HOME/stacks"/*.sh &>/dev/null; then
-    pass "stacks populated"
-else
-    fail "no .sh files in \$PSHT_HOME/stacks"
-fi
-
-echo ""
-if [[ $FAILED -eq 0 ]]; then
-    echo "All checks passed."
-else
-    echo "Some checks failed."
-    exit 1
-fi
-"#
-    )
+fn doctor_check(label: &str, ok: bool, failed: &mut bool) {
+    if ok {
+        println!("  [ok] {label}");
+    } else {
+        println!("  [FAIL] {label}");
+        *failed = true;
+    }
 }
 
 pub fn doctor() -> Result<(), String> {
-    let script = doctor_script();
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to run doctor: {e}"))?;
-    if !status.success() {
-        return Err("doctor checks failed".to_string());
+    let expected_version = env!("CARGO_PKG_VERSION");
+    let mut failed = false;
+
+    println!("Installation:");
+    let psht_user_shell = psht_user_shell_path();
+    doctor_check(
+        "psht user shell path exists",
+        psht_user_shell
+            .as_ref()
+            .map(|path| path.is_file())
+            .unwrap_or(false),
+        &mut failed,
+    );
+    let psht_cli_path = home_dir().join("bin/psht");
+    doctor_check(
+        "$PSHT_HOME/bin/psht executable",
+        psht_cli_path.is_file() && path_is_world_executable(&psht_cli_path).unwrap_or(false),
+        &mut failed,
+    );
+    if let Some(shell) = psht_user_shell.as_ref() {
+        doctor_check(
+            &format!("psht version {expected_version}"),
+            binary_matches_version(shell, expected_version),
+            &mut failed,
+        );
+    } else {
+        doctor_check(
+            &format!("psht version {expected_version}"),
+            false,
+            &mut failed,
+        );
     }
-    Ok(())
+
+    println!();
+    println!("System:");
+    doctor_check(
+        "psht user exists",
+        command_succeeds("id", &["psht"]),
+        &mut failed,
+    );
+    if let Some(shell) = psht_user_shell.as_ref() {
+        let shell_s = shell.to_string_lossy().to_string();
+        let shell_ok = run_cmd_capture("getent", &["passwd", "psht"])
+            .ok()
+            .map(|line| line.trim_end().ends_with(&format!(":{shell_s}")))
+            .unwrap_or(false);
+        doctor_check(
+            &format!("psht user shell is {shell_s}"),
+            shell_ok,
+            &mut failed,
+        );
+        let in_etc_shells = fs::read_to_string("/etc/shells")
+            .ok()
+            .map(|contents| contents.lines().any(|line| line.trim() == shell_s))
+            .unwrap_or(false);
+        doctor_check(
+            &format!("{shell_s} listed in /etc/shells"),
+            in_etc_shells,
+            &mut failed,
+        );
+    } else {
+        doctor_check("psht user shell configured", false, &mut failed);
+        doctor_check("psht user shell listed in /etc/shells", false, &mut failed);
+    }
+    let in_incus_group = run_cmd_capture("id", &["-nG", "psht"])
+        .ok()
+        .map(|groups| groups.split_whitespace().any(|group| group == "incus"))
+        .unwrap_or(false);
+    doctor_check("psht user in incus group", in_incus_group, &mut failed);
+
+    println!();
+    println!("Incus:");
+    doctor_check("incus installed", command_exists("incus"), &mut failed);
+    doctor_check(
+        "incus responsive",
+        command_succeeds("incus", &["info"]),
+        &mut failed,
+    );
+
+    if env::var_os("PSHT_SKIP_TAILSCALE").is_none() {
+        println!();
+        println!("Tailscale:");
+        doctor_check(
+            "tailscale installed",
+            command_exists("tailscale"),
+            &mut failed,
+        );
+        doctor_check(
+            "tailscale connected",
+            command_succeeds("tailscale", &["status"]),
+            &mut failed,
+        );
+        doctor_check(
+            "tailscale SSH enabled",
+            tailscale_ssh_enabled().unwrap_or(false),
+            &mut failed,
+        );
+        let oauth_config = home_dir().join(".config/tailscale-oauth");
+        doctor_check(
+            "$PSHT_HOME/.config/tailscale-oauth exists",
+            oauth_config.is_file(),
+            &mut failed,
+        );
+    }
+
+    println!();
+    println!("Directories & stacks:");
+    let repos = home_dir().join("repos");
+    let builds = home_dir().join("builds");
+    let stacks = home_dir().join("stacks");
+    doctor_check("$PSHT_HOME/repos exists", repos.is_dir(), &mut failed);
+    doctor_check("$PSHT_HOME/builds exists", builds.is_dir(), &mut failed);
+    doctor_check("$PSHT_HOME/stacks exists", stacks.is_dir(), &mut failed);
+    let stacks_populated = stacks
+        .read_dir()
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sh"))
+        })
+        .unwrap_or(false);
+    doctor_check("stacks populated", stacks_populated, &mut failed);
+
+    println!();
+    if failed {
+        println!("Some checks failed.");
+        Err("doctor checks failed".to_string())
+    } else {
+        println!("All checks passed.");
+        Ok(())
+    }
 }
 
 fn resolve_active_app_for_tailscale(app: &str) -> Result<String, String> {
@@ -5842,223 +5865,8 @@ mod tests {
     }
 
     #[test]
-    fn setup_script_calls_psht_setup() {
-        let script = setup_script("example.com");
-        assert!(
-            script.contains("\"$PSHT_BIN\" setup"),
-            "script should delegate project setup to CLI via full path"
-        );
-    }
-
-    #[test]
-    fn setup_script_reads_from_tty() {
-        let script = setup_script("example.com");
-        assert!(
-            script.contains("< /dev/tty"),
-            "read should use /dev/tty so prompts work when piped"
-        );
-    }
-
-    #[test]
-    fn setup_script_tracks_binary_path() {
-        let script = setup_script("example.com");
-        assert!(
-            script.contains("PSHT_BIN=$(command -v psht)"),
-            "should capture existing binary path"
-        );
-        assert!(
-            script.contains("psht __is-cli >/dev/null 2>&1"),
-            "should verify existing binary is the local CLI"
-        );
-        assert!(
-            script.contains("PSHT_BIN=\"$install_dir/psht\""),
-            "should capture newly installed binary path"
-        );
-    }
-
-    #[test]
-    fn setup_script_has_no_help_text() {
-        let script = setup_script("example.com");
-        assert!(
-            !script.contains("Commands:"),
-            "script should not contain help text"
-        );
-    }
-
-    #[test]
-    fn setup_script_installs_cli() {
-        let script = setup_script("example.com");
-        let expected_forge = format!("FORGE_URL=\"${{PSHT_FORGE_URL:-{}}}\"", DEFAULT_FORGE_URL);
-        assert!(
-            script.contains("Install psht CLI"),
-            "script should install the CLI"
-        );
-        assert!(
-            script.contains("PSHT_FORGE_URL"),
-            "script should support overriding forge URL via PSHT_FORGE_URL"
-        );
-        assert!(
-            script.contains("PSHT_SOURCE_URL"),
-            "script should support overriding source URL via PSHT_SOURCE_URL"
-        );
-        assert!(
-            script.contains(&expected_forge),
-            "script should default forge URL to the configured default"
-        );
-        assert!(
-            script.contains(
-                "asset_url=\"$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz\""
-            ),
-            "script should download CLI tarball from forge releases"
-        );
-        assert!(
-            script.contains("curl -fsSL \"$asset_url\" -o \"$tmpdir/psht.tar.gz\" 2>/dev/null"),
-            "script should fetch CLI with curl"
-        );
-        assert!(
-            script.contains("cargo install --git \"$SOURCE_URL\" --tag \"v$VERSION\" --root \"$source_root\" --bin psht"),
-            "script should fall back to building from source when prebuilt CLI is missing"
-        );
-        assert!(
-            script.contains("building psht from source (this can take a few minutes)"),
-            "script should explain source fallback duration"
-        );
-        assert!(
-            script.contains("tar xzf \"$tmpdir/psht.tar.gz\""),
-            "script should extract downloaded CLI tarball"
-        );
-        assert!(
-            script.contains("install -m 755 \"$tmpdir/psht\" \"$install_dir/psht\""),
-            "script should install CLI binary"
-        );
-        assert!(
-            script.contains("Darwin/aarch64|Darwin/arm64"),
-            "script should support macOS arm64 target detection"
-        );
-        assert!(
-            script.contains("Darwin/x86_64|Darwin/amd64"),
-            "script should support macOS x86_64 target detection"
-        );
-    }
-
-    #[test]
-    fn setup_script_writes_default_host() {
-        let script = setup_script("example.com");
-        assert!(
-            script.contains("host = \"example.com\""),
-            "script should write default host to config"
-        );
-    }
-
-    #[test]
-    fn update_script_downloads_binary_from_forge() {
-        let script = update_script("example.com");
-        let expected_forge = format!("FORGE_URL=\"${{PSHT_FORGE_URL:-{}}}\"", DEFAULT_FORGE_URL);
-        assert!(
-            script.contains("PSHT_FORGE_URL"),
-            "should support overriding forge URL via PSHT_FORGE_URL"
-        );
-        assert!(
-            script.contains("PSHT_SOURCE_URL"),
-            "should support overriding source URL via PSHT_SOURCE_URL"
-        );
-        assert!(
-            script.contains(&expected_forge),
-            "should default forge URL to the configured default"
-        );
-        assert!(
-            script.contains("asset_url=\"$FORGE_URL/releases/download/v"),
-            "should build release asset URL from forge"
-        );
-        assert!(
-            script.contains("curl -fsSL \"$asset_url\" -o \"$tmpdir/psht.tar.gz\" 2>/dev/null"),
-            "should download CLI tarball from forge"
-        );
-        assert!(
-            script.contains("cargo install --git \"$SOURCE_URL\" --tag \"v"),
-            "should fall back to source build when prebuilt CLI asset is missing"
-        );
-        assert!(
-            script.contains("building psht from source (this can take a few minutes)"),
-            "should explain source fallback duration"
-        );
-        assert!(
-            script.contains("Darwin/aarch64|Darwin/arm64"),
-            "update script should support macOS arm64 target detection"
-        );
-        assert!(
-            script.contains("Darwin/x86_64|Darwin/amd64"),
-            "update script should support macOS x86_64 target detection"
-        );
-    }
-
-    #[test]
     fn default_forge_url_points_to_github() {
         assert_eq!(DEFAULT_FORGE_URL, "https://github.com/nakajima/psht");
-    }
-
-    #[test]
-    fn update_script_replaces_atomically() {
-        let script = update_script("example.com");
-        assert!(
-            !script.contains("rm -f \"$PSHT_BIN\""),
-            "should not remove current binary before replacement is staged"
-        );
-        assert!(
-            script.contains("install -m 755 \"$candidate\" \"$staged\""),
-            "should install candidate to staged path first"
-        );
-        assert!(
-            script.contains("mv \"$staged\" \"$PSHT_BIN\""),
-            "should atomically swap staged binary into place"
-        );
-    }
-
-    #[test]
-    fn update_script_errors_if_not_installed() {
-        let script = update_script("example.com");
-        assert!(
-            script.contains("psht not found"),
-            "should error if psht is not installed"
-        );
-    }
-
-    #[test]
-    fn update_script_skips_if_up_to_date() {
-        let script = update_script("example.com");
-        assert!(
-            script.contains("up to date"),
-            "should say up to date when versions match"
-        );
-        assert!(
-            script.contains(env!("CARGO_PKG_VERSION")),
-            "should embed the current version"
-        );
-    }
-
-    #[test]
-    fn update_script_verifies_installed_version() {
-        let script = update_script("example.com");
-        assert!(
-            script.contains("candidate_version=$(\"$candidate\" --version"),
-            "should verify downloaded candidate version before replacement"
-        );
-        assert!(
-            script.contains("downloaded psht ${candidate_version:-unknown}, expected"),
-            "should fail when downloaded candidate version mismatches"
-        );
-        assert!(
-            script.contains("installed=$(\"$PSHT_BIN\" --version"),
-            "should read installed version after downloading"
-        );
-        assert!(
-            script.contains("installed psht ${installed:-unknown}, expected"),
-            "should fail when installed version does not match server version"
-        );
-        assert!(
-            script.contains("psht $installed (updated)"),
-            "should report the installed version on success"
-        );
     }
 
     #[test]
@@ -6234,87 +6042,52 @@ mod tests {
         assert_eq!((n1, n2, n3), (1, 2, 3));
     }
 
+    fn unique_test_app(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{}-{now}", std::process::id())
+    }
+
     #[test]
     fn git_deploy_state_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = git_deploy_state_path_in(tmp.path(), "myapp");
+        let app = unique_test_app("deploy-state");
+        let target = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+        };
+        write_git_deploy_state(&app, &target, GitDeployStatus::Success).unwrap();
         let state = GitDeployState {
             ref_name: "refs/heads/main".to_string(),
             sha: "deadbeef".to_string(),
             status: GitDeployStatus::Success,
         };
-        write_git_deploy_state_to(&path, &state).unwrap();
-        let loaded = read_git_deploy_state_from(&path).unwrap().unwrap();
+        let loaded = read_git_deploy_state(&app).unwrap().unwrap();
         assert_eq!(loaded, state);
-    }
-
-    #[test]
-    fn clear_git_deploy_state_removes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = git_deploy_state_path_in(tmp.path(), "myapp");
-        let state = GitDeployState {
-            ref_name: "refs/heads/main".to_string(),
-            sha: "deadbeef".to_string(),
-            status: GitDeployStatus::Failed,
-        };
-        write_git_deploy_state_to(&path, &state).unwrap();
-        assert!(path.exists());
-
-        clear_git_deploy_state_at(&path).unwrap();
-        assert!(!path.exists());
-        assert!(read_git_deploy_state_from(&path).unwrap().is_none());
+        clear_git_deploy_state(&app).unwrap();
+        assert!(read_git_deploy_state(&app).unwrap().is_none());
     }
 
     #[test]
     fn pending_git_target_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        let app = unique_test_app("pending-request");
         let target = GitCheckoutTarget {
             ref_name: "refs/heads/main".to_string(),
             sha: "deadbeef".to_string(),
         };
         let request = PendingGitDeployRequest::from_target(&target, false, None);
-        write_pending_git_request_to(&path, &request).unwrap();
-        let loaded = read_pending_git_request_from(&path)
-            .unwrap()
-            .unwrap()
-            .target();
+        write_pending_git_request(&app, &request).unwrap();
+        let loaded = read_pending_git_request(&app).unwrap().unwrap().target();
         assert_eq!(loaded, target);
-    }
-
-    #[test]
-    fn pending_git_target_overwrite_keeps_latest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = pending_git_target_path_in(tmp.path(), "myapp");
-        let first = GitCheckoutTarget {
-            ref_name: "refs/heads/main".to_string(),
-            sha: "deadbeef".to_string(),
-        };
-        let second = GitCheckoutTarget {
-            ref_name: "refs/heads/main".to_string(),
-            sha: "cafebabe".to_string(),
-        };
-        write_pending_git_request_to(
-            &path,
-            &PendingGitDeployRequest::from_target(&first, false, None),
-        )
-        .unwrap();
-        write_pending_git_request_to(
-            &path,
-            &PendingGitDeployRequest::from_target(&second, false, None),
-        )
-        .unwrap();
-        let loaded = read_pending_git_request_from(&path)
-            .unwrap()
-            .unwrap()
-            .target();
-        assert_eq!(loaded, second);
+        let taken = take_pending_git_request(&app).unwrap().unwrap().target();
+        assert_eq!(taken, target);
+        assert!(take_pending_git_request(&app).unwrap().is_none());
     }
 
     #[test]
     fn pending_git_request_round_trip_preserves_force_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        let app = unique_test_app("pending-force");
         let request = PendingGitDeployRequest {
             ref_name: "refs/heads/main".to_string(),
             sha: "deadbeef".to_string(),
@@ -6323,45 +6096,25 @@ mod tests {
             interrupt_requested_at: Some(123),
         };
 
-        write_pending_git_request_to(&path, &request).unwrap();
-        let loaded = read_pending_git_request_from(&path).unwrap().unwrap();
+        write_pending_git_request(&app, &request).unwrap();
+        let loaded = read_pending_git_request(&app).unwrap().unwrap();
         assert_eq!(loaded, request);
-    }
-
-    #[test]
-    fn pending_git_request_reads_legacy_target_format() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = pending_git_target_path_in(tmp.path(), "myapp");
-        fs::write(
-            &path,
-            r#"ref = "refs/heads/main"
-sha = "deadbeef"
-"#,
-        )
-        .unwrap();
-
-        let loaded = read_pending_git_request_from(&path).unwrap().unwrap();
-        assert_eq!(loaded.ref_name, "refs/heads/main");
-        assert_eq!(loaded.sha, "deadbeef");
-        assert!(!loaded.force);
-        assert!(loaded.request_id.is_none());
-        assert!(loaded.interrupt_requested_at.is_none());
+        let _ = take_pending_git_request(&app).unwrap();
     }
 
     #[test]
     fn deploy_interrupt_state_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = deploy_interrupt_path_in(tmp.path(), "myapp");
+        let app = unique_test_app("interrupt");
         let state = DeployInterruptState {
             request_id: "req-123".to_string(),
             requested_at: 123,
             target_sha: "deadbeef".to_string(),
         };
-        write_deploy_interrupt_to(&path, &state).unwrap();
-        let loaded = read_deploy_interrupt_from(&path).unwrap().unwrap();
+        request_deploy_interrupt(&app, &state).unwrap();
+        let loaded = read_deploy_interrupt(&app).unwrap().unwrap();
         assert_eq!(loaded, state);
-        clear_deploy_interrupt_at(&path).unwrap();
-        assert!(read_deploy_interrupt_from(&path).unwrap().is_none());
+        clear_deploy_interrupt(&app).unwrap();
+        assert!(read_deploy_interrupt(&app).unwrap().is_none());
     }
 
     #[test]
@@ -6378,39 +6131,10 @@ sha = "deadbeef"
     }
 
     #[test]
-    fn take_pending_git_target_removes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = pending_git_target_path_in(tmp.path(), "myapp");
-        let target = GitCheckoutTarget {
-            ref_name: "refs/heads/main".to_string(),
-            sha: "deadbeef".to_string(),
-        };
-        write_pending_git_request_to(
-            &path,
-            &PendingGitDeployRequest::from_target(&target, false, None),
-        )
-        .unwrap();
-        let taken = take_pending_git_request_from(&path)
-            .unwrap()
-            .unwrap()
-            .target();
-        assert_eq!(taken, target);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn take_pending_git_target_missing_file_is_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = pending_git_target_path_in(tmp.path(), "myapp");
-        assert!(take_pending_git_request_from(&path).unwrap().is_none());
-    }
-
-    #[test]
     fn cleanup_job_state_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = cleanup_job_path_in(tmp.path(), "myapp");
+        let app = unique_test_app("cleanup-job");
         let state = CleanupJobState {
-            app: "myapp".to_string(),
+            app: app.clone(),
             active_instance_at_schedule: "psht-myapp-build-100".to_string(),
             scheduled_previous_instance: "psht-myapp-build-99".to_string(),
             attempts: 2,
@@ -6418,29 +6142,11 @@ sha = "deadbeef"
             scheduled_at: 100,
             updated_at: 101,
         };
-        write_cleanup_job_to(&path, &state).unwrap();
-        let loaded = read_cleanup_job_from(&path).unwrap().unwrap();
+        write_cleanup_job(&app, &state).unwrap();
+        let loaded = read_cleanup_job(&app).unwrap().unwrap();
         assert_eq!(loaded, state);
-    }
-
-    #[test]
-    fn clear_cleanup_job_removes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = cleanup_job_path_in(tmp.path(), "myapp");
-        let state = CleanupJobState {
-            app: "myapp".to_string(),
-            active_instance_at_schedule: "psht-myapp-build-100".to_string(),
-            scheduled_previous_instance: "psht-myapp-build-99".to_string(),
-            attempts: 0,
-            last_error: None,
-            scheduled_at: 100,
-            updated_at: 100,
-        };
-        write_cleanup_job_to(&path, &state).unwrap();
-        assert!(path.exists());
-        clear_cleanup_job_at(&path).unwrap();
-        assert!(!path.exists());
-        assert!(read_cleanup_job_from(&path).unwrap().is_none());
+        clear_cleanup_job(&app).unwrap();
+        assert!(read_cleanup_job(&app).unwrap().is_none());
     }
 
     #[test]
@@ -7045,572 +6751,6 @@ devices:
         assert!(!version_is_newer("0.2.27", "0.2.28"));
     }
 
-    #[test]
-    fn upgrade_script_checks_root() {
-        let script = upgrade_script();
-        assert!(script.contains("EUID -eq 0"), "should check for root");
-    }
-
-    #[test]
-    fn upgrade_script_detects_current_version_from_binary() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("detect_version \"$PSHT_BIN\""),
-            "should detect current version from installed psht-server binary"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_detects_architecture() {
-        let script = upgrade_script();
-        assert!(script.contains("uname -m"), "should detect architecture");
-        assert!(
-            script.contains("x86_64-unknown-linux-gnu"),
-            "should map x86_64"
-        );
-        assert!(
-            script.contains("aarch64-unknown-linux-gnu"),
-            "should map aarch64"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_fetches_latest_version() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("LATEST_URL=$(curl -fsSL -o /dev/null -w '%{url_effective}' \"$FORGE_URL/releases/latest\" 2>/dev/null || true)"),
-            "should try latest release redirect first"
-        );
-        assert!(
-            script.contains("$FORGE_URL/api/v1/repos/$REPO_PATH/releases/latest"),
-            "should fallback to forge API latest endpoint"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_skips_if_up_to_date() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("up to date"),
-            "should skip if already on latest version"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_downloads_both_binaries() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("psht-server-${"),
-            "should download psht-server tarball"
-        );
-        assert!(
-            script.contains("psht-${"),
-            "should download psht CLI tarball"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_reports_failed_download_url() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("download failed: $url"),
-            "should include the failed download URL in errors"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_installs_to_correct_paths() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("PSHT_BIN=$(getent passwd \"$PSHT_USER\""),
-            "should resolve psht binary path from user shell"
-        );
-        assert!(
-            script.contains("PSHT_BIN=$(command -v psht-server)"),
-            "should fall back to command -v psht-server"
-        );
-        assert!(
-            script.contains("install_targets=(\"$PSHT_BIN\")"),
-            "should include psht shell binary in install targets"
-        );
-        assert!(
-            script.contains("install -m 755 \"$TMPDIR/psht-server\" \"$target\""),
-            "should install psht-server to all target binary paths"
-        );
-        assert!(
-            script.contains("INVOKED_BIN="),
-            "should include the invoked binary path as an install target"
-        );
-        assert!(
-            script.contains("$PSHT_HOME/bin/psht"),
-            "should install psht CLI to $PSHT_HOME/bin/psht"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_updates_incus() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("apt-get install") && script.contains("incus"),
-            "should update incus via apt"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_refreshes_stacks() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("\"$PSHT_BIN\" init-stacks"),
-            "should refresh stacks with the active psht binary"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_cleans_up_tempdir() {
-        let script = upgrade_script();
-        assert!(
-            script.contains("mktemp -d"),
-            "should create a temp directory"
-        );
-        assert!(
-            script.contains("trap") && script.contains("rm -rf"),
-            "should clean up temp directory on exit"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_upgrades_when_path_binary_is_stale() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        fn write_exec(path: &Path, contents: &str) {
-            fs::write(path, contents).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        fn build_tarball(dir: &Path, tar_path: &Path, file_name: &str, contents: &str) {
-            let src = dir.join(file_name);
-            write_exec(&src, contents);
-            let status = Command::new("tar")
-                .args(["-czf"])
-                .arg(tar_path)
-                .args(["-C"])
-                .arg(dir)
-                .arg(file_name)
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "failed to build tarball {}",
-                tar_path.display()
-            );
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_bin = tmp.path().join("fake-bin");
-        let fake_home = tmp.path().join("fake-home");
-        let assets = tmp.path().join("assets");
-        fs::create_dir_all(&fake_bin).unwrap();
-        fs::create_dir_all(&fake_home).unwrap();
-        fs::create_dir_all(&assets).unwrap();
-
-        let path_bin = fake_bin.join("psht-server");
-        let shell_bin = tmp.path().join("psht-shell-server");
-        write_exec(
-            &path_bin,
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
-        );
-        write_exec(
-            &shell_bin,
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.8 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
-        );
-
-        let server_tar = assets.join("psht-server.tar.gz");
-        let cli_tar = assets.join("psht-cli.tar.gz");
-        build_tarball(
-            &assets,
-            &server_tar,
-            "psht-server",
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.8 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
-        );
-        build_tarball(
-            &assets,
-            &cli_tar,
-            "psht",
-            "#!/usr/bin/env bash\necho \"psht 0.2.8 (cli)\"\n",
-        );
-
-        write_exec(
-            &fake_bin.join("getent"),
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"passwd\" && \"${2:-}\" == \"psht\" ]]; then\n  echo \"psht:x:1000:1000::/home/psht:$PSHT_TEST_SHELL_BIN\"\n  exit 0\nfi\nexit 2\n",
-        );
-        write_exec(
-            &fake_bin.join("curl"),
-            "#!/usr/bin/env bash\nset -euo pipefail\nout=\"\"\nwrite_fmt=\"\"\nurl=\"\"\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    -w) write_fmt=\"$2\"; shift 2 ;;\n    -fsSL|-f|-s|-S|-L) shift ;;\n    *) url=\"$1\"; shift ;;\n  esac\ndone\nif [[ \"$url\" == *\"/releases/latest\" && \"$out\" == \"/dev/null\" ]]; then\n  printf \"https://example.com/org/repo/releases/tag/v0.2.8\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-server-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_SERVER_TARBALL\" \"$out\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_CLI_TARBALL\" \"$out\"\n  exit 0\nfi\necho \"unexpected curl URL: $url\" >&2\nexit 22\n",
-        );
-        write_exec(&fake_bin.join("apt-get"), "#!/usr/bin/env bash\nexit 0\n");
-        write_exec(
-            &fake_bin.join("sudo"),
-            "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"-u\" ]]; then shift 2; fi\nexec \"$@\"\n",
-        );
-        write_exec(&fake_bin.join("chown"), "#!/usr/bin/env bash\nexit 0\n");
-
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let test_path = format!("{}:{}", fake_bin.display(), original_path);
-
-        let mut script = upgrade_script();
-        script = script.replace(
-            "PSHT_HOME=\"/home/$PSHT_USER\"",
-            &format!("PSHT_HOME=\"{}\"", fake_home.display()),
-        );
-        script = script.replace(
-            "[[ $EUID -eq 0 ]] || err \"Run this script as root: sudo psht-server upgrade\"",
-            "true",
-        );
-        script = script
-            .lines()
-            .map(|line| {
-                if line.starts_with("INVOKED_BIN=") {
-                    "INVOKED_BIN=\"\"".to_string()
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let output1 = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("PATH", &test_path)
-            .env("PSHT_FORGE_URL", "https://example.com/org/repo")
-            .env(
-                "PSHT_TEST_SHELL_BIN",
-                shell_bin.to_string_lossy().to_string(),
-            )
-            .env(
-                "PSHT_TEST_SERVER_TARBALL",
-                server_tar.to_string_lossy().to_string(),
-            )
-            .env(
-                "PSHT_TEST_CLI_TARBALL",
-                cli_tar.to_string_lossy().to_string(),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output1.status.success(),
-            "first upgrade failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output1.stdout),
-            String::from_utf8_lossy(&output1.stderr)
-        );
-
-        let path_version = Command::new(&path_bin).arg("--version").output().unwrap();
-        assert!(
-            String::from_utf8_lossy(&path_version.stdout).contains("0.2.8"),
-            "PATH binary should be upgraded to 0.2.8"
-        );
-
-        let output2 = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("PATH", &test_path)
-            .env("PSHT_FORGE_URL", "https://example.com/org/repo")
-            .env(
-                "PSHT_TEST_SHELL_BIN",
-                shell_bin.to_string_lossy().to_string(),
-            )
-            .env(
-                "PSHT_TEST_SERVER_TARBALL",
-                server_tar.to_string_lossy().to_string(),
-            )
-            .env(
-                "PSHT_TEST_CLI_TARBALL",
-                cli_tar.to_string_lossy().to_string(),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output2.status.success(),
-            "second upgrade failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output2.stdout),
-            String::from_utf8_lossy(&output2.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output2.stdout).contains("up to date"),
-            "second run should report up to date"
-        );
-    }
-
-    #[test]
-    fn upgrade_script_errors_when_downloaded_server_version_mismatches_latest() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        fn write_exec(path: &Path, contents: &str) {
-            fs::write(path, contents).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        fn build_tarball(dir: &Path, tar_path: &Path, file_name: &str, contents: &str) {
-            let src = dir.join(file_name);
-            write_exec(&src, contents);
-            let status = Command::new("tar")
-                .args(["-czf"])
-                .arg(tar_path)
-                .args(["-C"])
-                .arg(dir)
-                .arg(file_name)
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "failed to build tarball {}",
-                tar_path.display()
-            );
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let fake_bin = tmp.path().join("fake-bin");
-        let fake_home = tmp.path().join("fake-home");
-        let assets = tmp.path().join("assets");
-        fs::create_dir_all(&fake_bin).unwrap();
-        fs::create_dir_all(&fake_home).unwrap();
-        fs::create_dir_all(&assets).unwrap();
-
-        let path_bin = fake_bin.join("psht-server");
-        let shell_bin = tmp.path().join("psht-shell-server");
-        write_exec(
-            &path_bin,
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
-        );
-        write_exec(
-            &shell_bin,
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
-        );
-
-        let server_tar = assets.join("psht-server.tar.gz");
-        let cli_tar = assets.join("psht-cli.tar.gz");
-        build_tarball(
-            &assets,
-            &server_tar,
-            "psht-server",
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" || \"${1:-}\" == \"-V\" ]]; then echo \"psht-server 0.2.7 (server)\"; exit 0; fi\nif [[ \"${1:-}\" == \"init-stacks\" ]]; then exit 0; fi\nexit 0\n",
-        );
-        build_tarball(
-            &assets,
-            &cli_tar,
-            "psht",
-            "#!/usr/bin/env bash\necho \"psht 0.2.8 (cli)\"\n",
-        );
-
-        write_exec(
-            &fake_bin.join("getent"),
-            "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"passwd\" && \"${2:-}\" == \"psht\" ]]; then\n  echo \"psht:x:1000:1000::/home/psht:$PSHT_TEST_SHELL_BIN\"\n  exit 0\nfi\nexit 2\n",
-        );
-        write_exec(
-            &fake_bin.join("curl"),
-            "#!/usr/bin/env bash\nset -euo pipefail\nout=\"\"\nurl=\"\"\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    -w) shift 2 ;;\n    -fsSL|-f|-s|-S|-L) shift ;;\n    *) url=\"$1\"; shift ;;\n  esac\ndone\nif [[ \"$url\" == *\"/releases/latest\" && \"$out\" == \"/dev/null\" ]]; then\n  printf \"https://example.com/org/repo/releases/tag/v0.2.8\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-server-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_SERVER_TARBALL\" \"$out\"\n  exit 0\nfi\nif [[ \"$url\" == *\"psht-0.2.8-x86_64-unknown-linux-gnu.tar.gz\" ]]; then\n  cp \"$PSHT_TEST_CLI_TARBALL\" \"$out\"\n  exit 0\nfi\nexit 22\n",
-        );
-        write_exec(&fake_bin.join("apt-get"), "#!/usr/bin/env bash\nexit 0\n");
-        write_exec(
-            &fake_bin.join("sudo"),
-            "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"-u\" ]]; then shift 2; fi\nexec \"$@\"\n",
-        );
-        write_exec(&fake_bin.join("chown"), "#!/usr/bin/env bash\nexit 0\n");
-
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let test_path = format!("{}:{}", fake_bin.display(), original_path);
-
-        let mut script = upgrade_script();
-        script = script.replace(
-            "PSHT_HOME=\"/home/$PSHT_USER\"",
-            &format!("PSHT_HOME=\"{}\"", fake_home.display()),
-        );
-        script = script.replace(
-            "[[ $EUID -eq 0 ]] || err \"Run this script as root: sudo psht-server upgrade\"",
-            "true",
-        );
-        script = script
-            .lines()
-            .map(|line| {
-                if line.starts_with("INVOKED_BIN=") {
-                    "INVOKED_BIN=\"\"".to_string()
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("PATH", &test_path)
-            .env("PSHT_FORGE_URL", "https://example.com/org/repo")
-            .env(
-                "PSHT_TEST_SHELL_BIN",
-                shell_bin.to_string_lossy().to_string(),
-            )
-            .env(
-                "PSHT_TEST_SERVER_TARBALL",
-                server_tar.to_string_lossy().to_string(),
-            )
-            .env(
-                "PSHT_TEST_CLI_TARBALL",
-                cli_tar.to_string_lossy().to_string(),
-            )
-            .output()
-            .unwrap();
-
-        assert!(
-            !output.status.success(),
-            "upgrade should fail when downloaded server version mismatches latest"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("downloaded psht-server 0.2.7, expected 0.2.8"),
-            "unexpected stderr:\n{stderr}"
-        );
-    }
-
-    #[test]
-    fn doctor_script_does_not_require_root() {
-        let script = doctor_script();
-        assert!(
-            !script.contains("EUID -eq 0"),
-            "doctor should not require root"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_psht_binary() {
-        let script = doctor_script();
-        assert!(
-            script.contains("PSHT_USER_SHELL=$(getent passwd \"$PSHT_USER\""),
-            "should resolve psht binary from psht user's shell"
-        );
-        assert!(
-            script.contains("test -x \"$PSHT_USER_SHELL\""),
-            "should check psht binary executable path"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_psht_cli_binary() {
-        let script = doctor_script();
-        assert!(
-            script.contains("$PSHT_HOME/bin/psht"),
-            "should check psht CLI binary"
-        );
-    }
-
-    #[test]
-    fn doctor_script_embeds_current_version() {
-        let script = doctor_script();
-        assert!(
-            script.contains(env!("CARGO_PKG_VERSION")),
-            "should embed the current version"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_psht_user() {
-        let script = doctor_script();
-        assert!(script.contains("id psht"), "should check psht user exists");
-    }
-
-    #[test]
-    fn doctor_script_checks_user_shell() {
-        let script = doctor_script();
-        assert!(
-            script.contains("getent passwd psht | grep -q \":$PSHT_USER_SHELL$\""),
-            "should check psht user shell"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_etc_shells() {
-        let script = doctor_script();
-        assert!(script.contains("/etc/shells"), "should check /etc/shells");
-    }
-
-    #[test]
-    fn doctor_script_checks_incus_group() {
-        let script = doctor_script();
-        assert!(
-            script.contains("id -nG psht"),
-            "should check incus group membership"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_incus_installed() {
-        let script = doctor_script();
-        assert!(
-            script.contains("command -v incus"),
-            "should check incus is installed"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_incus_responsive() {
-        let script = doctor_script();
-        assert!(
-            script.contains("incus info"),
-            "should check incus is responsive"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_tailscale() {
-        let script = doctor_script();
-        assert!(
-            script.contains("PSHT_SKIP_TAILSCALE"),
-            "tailscale checks should be guarded by PSHT_SKIP_TAILSCALE"
-        );
-        assert!(
-            script.contains("command -v tailscale"),
-            "should check tailscale is installed"
-        );
-        assert!(
-            script.contains("tailscale status"),
-            "should check tailscale is connected"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_directories() {
-        let script = doctor_script();
-        assert!(
-            script.contains("$PSHT_HOME/repos"),
-            "should check repos dir"
-        );
-        assert!(
-            script.contains("$PSHT_HOME/builds"),
-            "should check builds dir"
-        );
-        assert!(
-            script.contains("$PSHT_HOME/stacks"),
-            "should check stacks dir"
-        );
-    }
-
-    #[test]
-    fn doctor_script_checks_stacks() {
-        let script = doctor_script();
-        assert!(script.contains(".sh"), "should check for stack scripts");
-    }
-
-    #[test]
-    fn doctor_script_exits_nonzero_on_failure() {
-        let script = doctor_script();
-        assert!(
-            script.contains("exit 1"),
-            "should exit non-zero when checks fail"
-        );
-    }
-
     fn run_git(args: &[&str], cwd: &Path) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -7784,16 +6924,13 @@ devices:
 
     #[test]
     fn app_runtime_state_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = app_runtime_state_path_in(tmp.path(), "myapp");
-        let state = AppRuntimeState {
-            active_instance: "psht-myapp-build-123".to_string(),
-            previous_instance: Some("psht-myapp".to_string()),
-            updated_at: 1234,
-        };
-        write_app_runtime_state_to(&path, &state).unwrap();
-        let loaded = read_app_runtime_state_from(&path).unwrap().unwrap();
-        assert_eq!(loaded, state);
+        let app = unique_test_app("runtime-state");
+        write_app_runtime_state(&app, "myapp-build-123", Some("myapp")).unwrap();
+        let loaded = read_app_runtime_state(&app).unwrap().unwrap();
+        assert_eq!(loaded.active_instance, "psht-myapp-build-123");
+        assert_eq!(loaded.previous_instance.as_deref(), Some("psht-myapp"));
+        assert!(loaded.updated_at > 0);
+        clear_app_runtime_state(&app).unwrap();
     }
 
     #[test]

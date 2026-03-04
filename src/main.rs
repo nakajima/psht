@@ -5,6 +5,7 @@ mod container;
 mod deploy_log;
 mod detect;
 mod git;
+mod sqlite_store;
 mod tailscale;
 
 #[cfg(all(test, feature = "integration"))]
