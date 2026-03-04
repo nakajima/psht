@@ -60,6 +60,11 @@ fn parse_self_dns_name(json: &str) -> Option<String> {
     Some(name.trim_end_matches('.').to_string())
 }
 
+fn parse_backend_state(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value["BackendState"].as_str().map(|s| s.to_string())
+}
+
 fn parse_auth_key(json: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("failed to parse auth key response: {e}"))?;
@@ -156,10 +161,6 @@ fn tailscale_up_with_auth_key_command(auth_key: &str, machine_name: &str) -> Str
     format!("tailscale up --auth-key {auth_key} --hostname {machine_name} --ssh")
 }
 
-fn tailscale_up_with_state_command(machine_name: &str) -> String {
-    format!("tailscale up --hostname {machine_name} --ssh")
-}
-
 fn join_with_up_command(container_app: &str, up_command: &str) -> Result<Option<String>, String> {
     container::exec_cmd(container_app, "systemctl start tailscaled")?;
     container::exec_cmd(container_app, up_command)?;
@@ -186,8 +187,31 @@ pub fn join_with_state_in_container(
     container_app: &str,
     machine_name: &str,
 ) -> Result<Option<String>, String> {
-    let up_command = tailscale_up_with_state_command(machine_name);
-    join_with_up_command(container_app, &up_command)
+    container::exec_cmd(container_app, "systemctl start tailscaled")?;
+
+    let status_json =
+        container::exec_output(container_app, "tailscale status --json").map_err(|e| {
+            format!("failed to read tailscale state from container '{container_app}': {e}")
+        })?;
+    if let Some(state) = parse_backend_state(&status_json)
+        && (state == "NeedsLogin" || state == "NoState")
+    {
+        return Err(format!("tailscale state requires login (state: {state})"));
+    }
+
+    // Prefer non-interactive settings update to avoid blocking on login prompts.
+    container::exec_cmd(
+        container_app,
+        &format!("tailscale set --hostname {machine_name} --ssh >/dev/null 2>&1 || true"),
+    )?;
+
+    let ts_hostname = dns_name_in_container(container_app);
+    match ts_hostname {
+        Some(ref name) => eprintln!("       Joined tailnet as {name}"),
+        None => eprintln!("       Joined tailnet"),
+    }
+
+    Ok(ts_hostname)
 }
 
 fn serve_http_command(port: u16) -> String {
@@ -351,6 +375,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_backend_state_from_status() {
+        let json = r#"{"BackendState":"Running","Self":{"DNSName":"psht-test.tail1234.ts.net."}}"#;
+        assert_eq!(parse_backend_state(json).as_deref(), Some("Running"));
+    }
+
+    #[test]
     fn serve_http_command_includes_expected_port_and_fallbacks() {
         let cmd = serve_http_command(3233);
         assert!(
@@ -374,8 +404,8 @@ mod tests {
     }
 
     #[test]
-    fn tailscale_up_state_command_uses_requested_machine_name() {
-        let cmd = tailscale_up_with_state_command("hyperlinked");
-        assert_eq!(cmd, "tailscale up --hostname hyperlinked --ssh");
+    fn parse_backend_state_missing_returns_none() {
+        let json = r#"{"Self":{"DNSName":"psht-test.tail1234.ts.net."}}"#;
+        assert!(parse_backend_state(json).is_none());
     }
 }
