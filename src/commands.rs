@@ -5042,26 +5042,179 @@ fn cli_update_manifest() -> CliUpdateManifest {
     }
 }
 
+fn cli_update_manifest_json(manifest: &CliUpdateManifest) -> Result<String, String> {
+    serde_json::to_string(manifest).map_err(|e| format!("failed to serialize update manifest: {e}"))
+}
+
+fn setup_script(hostname: &str, manifest: &CliUpdateManifest) -> Result<String, String> {
+    let manifest_json = cli_update_manifest_json(manifest)?;
+    Ok(format!(
+        r#"#!/bin/sh
+set -e
+
+cat >/dev/null <<'__PSHT_UPDATE_MANIFEST__'
+{manifest_json}
+__PSHT_UPDATE_MANIFEST__
+
+VERSION="{version}"
+FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
+FORGE_URL="${{FORGE_URL%/}}"
+SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
+SOURCE_URL="${{SOURCE_URL%/}}"
+
+detect_target() {{
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "$os/$arch" in
+    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
+    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
+    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
+  esac
+}}
+
+install_cli() {{
+  install_dir="$1"
+  target=$(detect_target)
+  asset_url="$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz"
+  tmpdir=$(mktemp -d)
+  if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
+    tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
+    install -m 755 "$tmpdir/psht" "$install_dir/psht"
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+
+  source_root="$tmpdir/source-root"
+  echo "-----> building psht from source (this can take a few minutes)" >&2
+  cargo install --git "$SOURCE_URL" --tag "v$VERSION" --root "$source_root" --bin psht
+  install -m 755 "$source_root/bin/psht" "$install_dir/psht"
+  rm -rf "$tmpdir"
+}}
+
+# Find or install psht CLI
+if command -v psht >/dev/null 2>&1 && psht __is-cli >/dev/null 2>&1; then
+  PSHT_BIN=$(command -v psht)
+else
+  printf "Install psht CLI to (default: ~/.local/bin): " >&2
+  read -r install_dir < /dev/tty
+  install_dir="${{install_dir:-$HOME/.local/bin}}"
+  mkdir -p "$install_dir"
+  install_cli "$install_dir"
+  PSHT_BIN="$install_dir/psht"
+  case ":$PATH:" in
+    *":$install_dir:"*) ;;
+    *) echo "NOTE: Add $install_dir to your PATH: export PATH=\"$install_dir:\$PATH\"" >&2 ;;
+  esac
+  echo "Installed psht CLI to $PSHT_BIN" >&2
+fi
+
+mkdir -p "$HOME/.psht"
+config="$HOME/.psht/config.toml"
+if [ ! -f "$config" ]; then
+  echo 'host = "{hostname}"' > "$config"
+fi
+
+"$PSHT_BIN" setup"#,
+        version = manifest.version,
+        forge_url = manifest.forge_url,
+    ))
+}
+
+fn update_script(hostname: &str, manifest: &CliUpdateManifest) -> Result<String, String> {
+    let manifest_json = cli_update_manifest_json(manifest)?;
+    Ok(format!(
+        r#"#!/bin/sh
+set -e
+
+cat >/dev/null <<'__PSHT_UPDATE_MANIFEST__'
+{manifest_json}
+__PSHT_UPDATE_MANIFEST__
+
+PSHT_BIN=$(command -v psht) || {{ echo "psht not found. Run: ssh psht@{hostname} setup | sh" >&2; exit 1; }}
+FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
+FORGE_URL="${{FORGE_URL%/}}"
+SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
+SOURCE_URL="${{SOURCE_URL%/}}"
+
+detect_target() {{
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "$os/$arch" in
+    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
+    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
+    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
+  esac
+}}
+
+current=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || current=""
+if [ "$current" = "{version}" ]; then
+  echo "psht {version} (up to date)" >&2
+  exit 0
+fi
+
+target=$(detect_target)
+asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz"
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+candidate="$tmpdir/psht"
+if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
+  tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
+else
+  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
+    exit 1
+  fi
+  source_root="$tmpdir/source-root"
+  echo "-----> building psht from source (this can take a few minutes)" >&2
+  cargo install --git "$SOURCE_URL" --tag "v{version}" --root "$source_root" --bin psht
+  candidate="$source_root/bin/psht"
+fi
+if [ ! -x "$candidate" ]; then
+  echo "error: downloaded archive missing executable psht binary" >&2
+  exit 1
+fi
+candidate_version=$("$candidate" --version 2>/dev/null | awk '{{print $2}}') || candidate_version=""
+if [ "$candidate_version" != "{version}" ]; then
+  echo "error: downloaded psht ${{candidate_version:-unknown}}, expected {version}" >&2
+  exit 1
+fi
+staged="$tmpdir/psht.new"
+install -m 755 "$candidate" "$staged"
+mv "$staged" "$PSHT_BIN"
+installed=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || installed=""
+if [ "$installed" != "{version}" ]; then
+  echo "error: installed psht ${{installed:-unknown}}, expected {version}" >&2
+  exit 1
+fi
+echo "psht $installed (updated)" >&2"#,
+        version = manifest.version,
+        forge_url = manifest.forge_url,
+    ))
+}
+
 pub fn setup() -> Result<(), String> {
     let host = hostname();
     let manifest = cli_update_manifest();
-    println!("psht setup is now Rust-native.");
-    println!("Install or update your local CLI to continue:");
-    println!(
-        "  version: {}\n  forge: {}\n  server: {}",
-        manifest.version, manifest.forge_url, host
-    );
-    println!("Then run: psht setup");
+    println!("{}", setup_script(&host, &manifest)?);
     Ok(())
 }
 
 pub fn update() -> Result<(), String> {
+    let host = hostname();
     let manifest = cli_update_manifest();
-    println!(
-        "{}",
-        serde_json::to_string(&manifest)
-            .map_err(|e| format!("failed to serialize update manifest: {e}"))?
-    );
+    println!("{}", update_script(&host, &manifest)?);
     Ok(())
 }
 
@@ -6099,7 +6252,6 @@ mod tests {
         write_pending_git_request(&app, &request).unwrap();
         let loaded = read_pending_git_request(&app).unwrap().unwrap();
         assert_eq!(loaded, request);
-        let _ = take_pending_git_request(&app).unwrap();
     }
 
     #[test]
@@ -6749,6 +6901,25 @@ devices:
         assert!(version_is_newer("1.0.0", "0.99.99"));
         assert!(!version_is_newer("0.2.28", "0.2.28"));
         assert!(!version_is_newer("0.2.27", "0.2.28"));
+    }
+
+    #[test]
+    fn update_script_contains_json_manifest_for_rust_native_cli() {
+        let manifest = cli_update_manifest();
+        let script = update_script("psht", &manifest).unwrap();
+        let json = cli_update_manifest_json(&manifest).unwrap();
+        assert!(script.contains(&json));
+        assert!(script.contains("PSHT_BIN=$(command -v psht)"));
+    }
+
+    #[test]
+    fn setup_script_bootstraps_cli_then_runs_setup() {
+        let manifest = cli_update_manifest();
+        let script = setup_script("psht", &manifest).unwrap();
+        let json = cli_update_manifest_json(&manifest).unwrap();
+        assert!(script.contains(&json));
+        assert!(script.contains("\"$PSHT_BIN\" setup"));
+        assert!(script.contains("host = \"psht\""));
     }
 
     fn run_git(args: &[&str], cwd: &Path) {

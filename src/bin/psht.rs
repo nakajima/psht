@@ -1454,6 +1454,48 @@ fn binary_version(path: &Path) -> Option<String> {
     text.split_whitespace().nth(1).map(|v| v.to_string())
 }
 
+fn parse_update_manifest_stdout(stdout: &str) -> Result<ServerUpdateManifest, String> {
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(manifest) = serde_json::from_str::<ServerUpdateManifest>(trimmed) {
+            return Ok(manifest);
+        }
+    }
+
+    // Backward compatibility: pre-rust-native servers emit an installer script.
+    let mut version = None;
+    let mut forge_url = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if version.is_none()
+            && let Some(raw) = trimmed.strip_prefix("VERSION=\"")
+            && let Some(value) = raw.strip_suffix('"')
+            && !value.trim().is_empty()
+        {
+            version = Some(value.trim().to_string());
+            continue;
+        }
+        if forge_url.is_none()
+            && let Some(raw) = trimmed.strip_prefix("FORGE_URL=\"${PSHT_FORGE_URL:-")
+            && let Some(value) = raw.strip_suffix("}\"")
+            && !value.trim().is_empty()
+        {
+            forge_url = Some(value.trim().trim_end_matches('/').to_string());
+        }
+    }
+    if let Some(version) = version {
+        return Ok(ServerUpdateManifest {
+            version,
+            forge_url: forge_url.unwrap_or_default(),
+        });
+    }
+
+    Err("server update manifest was not valid JSON".to_string())
+}
+
 fn fetch_update_manifest(host: &str) -> Result<ServerUpdateManifest, String> {
     let output = Command::new("ssh")
         .arg(format!("psht@{host}"))
@@ -1467,16 +1509,7 @@ fn fetch_update_manifest(host: &str) -> Result<ServerUpdateManifest, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(manifest) = serde_json::from_str::<ServerUpdateManifest>(trimmed) {
-            return Ok(manifest);
-        }
-    }
-    Err("server update manifest was not valid JSON".to_string())
+    parse_update_manifest_stdout(&stdout)
 }
 
 fn install_local_update(manifest: &ServerUpdateManifest) -> Result<(), String> {
@@ -2579,5 +2612,37 @@ mod tests {
             loaded.projects.get("/some/path").map(|s| s.as_str()),
             Some("original")
         );
+    }
+
+    #[test]
+    fn parse_update_manifest_stdout_reads_embedded_json_line() {
+        let stdout = r#"#!/bin/sh
+set -e
+cat >/dev/null <<'__PSHT_UPDATE_MANIFEST__'
+{"version":"0.2.47","forge_url":"https://github.com/nakajima/psht"}
+__PSHT_UPDATE_MANIFEST__
+"#;
+
+        let manifest = parse_update_manifest_stdout(stdout).unwrap();
+        assert_eq!(manifest.version, "0.2.47");
+        assert_eq!(manifest.forge_url, "https://github.com/nakajima/psht");
+    }
+
+    #[test]
+    fn parse_update_manifest_stdout_reads_legacy_script_assignments() {
+        let stdout = r#"#!/bin/sh
+VERSION="0.2.13"
+FORGE_URL="${PSHT_FORGE_URL:-https://example.com/org/repo}"
+"#;
+
+        let manifest = parse_update_manifest_stdout(stdout).unwrap();
+        assert_eq!(manifest.version, "0.2.13");
+        assert_eq!(manifest.forge_url, "https://example.com/org/repo");
+    }
+
+    #[test]
+    fn parse_update_manifest_stdout_errors_without_manifest() {
+        let err = parse_update_manifest_stdout("#!/bin/sh\necho hi\n").unwrap_err();
+        assert!(err.contains("not valid JSON"));
     }
 }
