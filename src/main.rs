@@ -73,13 +73,13 @@ enum Command {
         ref_name: Option<String>,
         #[arg(long)]
         sha: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'f', long)]
         force: bool,
     },
     #[command(hide = true)]
     Push {
         app: String,
-        #[arg(long)]
+        #[arg(short = 'f', long)]
         force: bool,
     },
     #[command(name = "git-receive-pack", hide = true)]
@@ -347,6 +347,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_deploy_with_short_force() {
+        let cli = parse_cli(&[
+            "psht-server",
+            "deploy",
+            "myapp",
+            "--ref",
+            "refs/heads/main",
+            "--sha",
+            "deadbeef",
+            "-f",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Deploy {
+                app: "myapp".to_string(),
+                ref_name: Some("refs/heads/main".to_string()),
+                sha: Some("deadbeef".to_string()),
+                force: true,
+            }
+        );
+    }
+
+    #[test]
     fn parse_ps() {
         let cli = parse_cli(&["psht-server", "ps"]).unwrap();
         assert_eq!(cli.command, Command::Ps);
@@ -424,6 +448,18 @@ mod tests {
     #[test]
     fn parse_push_force() {
         let cli = parse_cli(&["psht-server", "push", "--force", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Push {
+                app: "myapp".to_string(),
+                force: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_push_short_force() {
+        let cli = parse_cli(&["psht-server", "push", "-f", "myapp"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Push {

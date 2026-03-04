@@ -46,7 +46,7 @@ enum CliCommand {
         #[arg(long)]
         bin: Option<String>,
         /// Force deploy even when payload hash is unchanged
-        #[arg(long)]
+        #[arg(short = 'f', long)]
         force: bool,
     },
     /// List running apps
@@ -1846,6 +1846,25 @@ mod tests {
             "psht",
             "deploy",
             "--force",
+            "--url",
+            "https://example.com/app.tar.gz",
+            "--start",
+            "./app",
+        ])
+        .expect("deploy should parse");
+
+        match cli.command {
+            CliCommand::Deploy { force, .. } => assert!(force),
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_force_short_flag_parse() {
+        let cli = Cli::try_parse_from([
+            "psht",
+            "deploy",
+            "-f",
             "--url",
             "https://example.com/app.tar.gz",
             "--start",

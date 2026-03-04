@@ -50,6 +50,9 @@ const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
+const DEPLOY_INTERRUPT_WAIT_POLL_MS: u64 = 1000;
+const DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS: u64 = 5;
+const DEPLOY_INTERRUPT_ERR_PREFIX: &str = "deploy interrupted by --force request";
 const HEALTH_DELEGATED_ENV: &str = "PSHT_HEALTH_DELEGATED";
 const LOGS_DEPLOY_HISTORY_FILES: usize = 12;
 const LOGS_DEPLOY_HISTORY_LINES_PER_FILE: usize = 400;
@@ -110,6 +113,10 @@ fn deploy_lock_dir() -> PathBuf {
 
 fn deploy_pending_dir() -> PathBuf {
     home_dir().join("deploy-pending")
+}
+
+fn deploy_interrupt_dir() -> PathBuf {
+    home_dir().join(".psht").join("deploy-interrupts")
 }
 
 fn cleanup_job_dir() -> PathBuf {
@@ -849,13 +856,23 @@ fn acquire_exact_tailscale_hostname_for_deploy(
     acquire_exact_tailscale_hostname_with_retry(
         container_app,
         app,
-        tailscale::join_with_state_in_container,
-        tailscale::join_with_auth_key_in_container,
+        |container, machine_name| {
+            check_deploy_interrupt(app, "tailscale exact-hostname acquisition")?;
+            tailscale::join_with_state_in_container(container, machine_name)
+        },
+        |container, machine_name| {
+            check_deploy_interrupt(app, "tailscale exact-hostname auth-key fallback")?;
+            tailscale::join_with_auth_key_in_container(container, machine_name)
+        },
         |container| {
+            check_deploy_interrupt(app, "tailscale health wait")?;
             wait_for_tailscale_online(container, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))
                 .map(|_| ())
         },
-        reset_tailscale_for_retry,
+        |container| {
+            check_deploy_interrupt(app, "tailscale retry reset")?;
+            reset_tailscale_for_retry(container)
+        },
         thread::sleep,
     )
 }
@@ -1886,6 +1903,7 @@ enum GitDeployStatus {
     Pending,
     Success,
     Failed,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1894,6 +1912,45 @@ struct GitDeployState {
     ref_name: String,
     sha: String,
     status: GitDeployStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct PendingGitDeployRequest {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    sha: String,
+    #[serde(default)]
+    force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interrupt_requested_at: Option<u64>,
+}
+
+impl PendingGitDeployRequest {
+    fn from_target(target: &GitCheckoutTarget, force: bool, request_id: Option<String>) -> Self {
+        Self {
+            ref_name: target.ref_name.clone(),
+            sha: target.sha.clone(),
+            force,
+            interrupt_requested_at: request_id.as_ref().map(|_| now_unix_secs()),
+            request_id,
+        }
+    }
+
+    fn target(&self) -> GitCheckoutTarget {
+        GitCheckoutTarget {
+            ref_name: self.ref_name.clone(),
+            sha: self.sha.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct DeployInterruptState {
+    request_id: String,
+    requested_at: u64,
+    target_sha: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2080,6 +2137,14 @@ fn pending_git_target_path_in(dir: &Path, app: &str) -> PathBuf {
 
 fn pending_git_target_path(app: &str) -> PathBuf {
     pending_git_target_path_in(&deploy_pending_dir(), app)
+}
+
+fn deploy_interrupt_path_in(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.toml"))
+}
+
+fn deploy_interrupt_path(app: &str) -> PathBuf {
+    deploy_interrupt_path_in(&deploy_interrupt_dir(), app)
 }
 
 fn cleanup_job_path_in(dir: &Path, app: &str) -> PathBuf {
@@ -2277,33 +2342,40 @@ fn clear_git_deploy_state(app: &str) -> Result<(), String> {
     clear_git_deploy_state_at(&git_deploy_state_path(app))
 }
 
-fn write_pending_git_target_to(path: &Path, target: &GitCheckoutTarget) -> Result<(), String> {
+fn write_pending_git_request_to(
+    path: &Path,
+    request: &PendingGitDeployRequest,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    let content = toml::to_string_pretty(target)
+    let content = toml::to_string_pretty(request)
         .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
     fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-fn write_pending_git_target(app: &str, target: &GitCheckoutTarget) -> Result<(), String> {
-    write_pending_git_target_to(&pending_git_target_path(app), target)
+fn write_pending_git_request(app: &str, request: &PendingGitDeployRequest) -> Result<(), String> {
+    write_pending_git_request_to(&pending_git_target_path(app), request)
 }
 
-fn read_pending_git_target_from(path: &Path) -> Result<Option<GitCheckoutTarget>, String> {
+fn read_pending_git_request_from(path: &Path) -> Result<Option<PendingGitDeployRequest>, String> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
     };
-    let target: GitCheckoutTarget =
+    let target: PendingGitDeployRequest =
         toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
     Ok(Some(target))
 }
 
-fn take_pending_git_target_from(path: &Path) -> Result<Option<GitCheckoutTarget>, String> {
-    let target = read_pending_git_target_from(path)?;
+fn read_pending_git_request(app: &str) -> Result<Option<PendingGitDeployRequest>, String> {
+    read_pending_git_request_from(&pending_git_target_path(app))
+}
+
+fn take_pending_git_request_from(path: &Path) -> Result<Option<PendingGitDeployRequest>, String> {
+    let target = read_pending_git_request_from(path)?;
     if target.is_none() {
         return Ok(None);
     }
@@ -2315,8 +2387,49 @@ fn take_pending_git_target_from(path: &Path) -> Result<Option<GitCheckoutTarget>
     Ok(target)
 }
 
-fn take_pending_git_target(app: &str) -> Result<Option<GitCheckoutTarget>, String> {
-    take_pending_git_target_from(&pending_git_target_path(app))
+fn take_pending_git_request(app: &str) -> Result<Option<PendingGitDeployRequest>, String> {
+    take_pending_git_request_from(&pending_git_target_path(app))
+}
+
+fn read_deploy_interrupt_from(path: &Path) -> Result<Option<DeployInterruptState>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let state: DeployInterruptState =
+        toml::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn read_deploy_interrupt(app: &str) -> Result<Option<DeployInterruptState>, String> {
+    read_deploy_interrupt_from(&deploy_interrupt_path(app))
+}
+
+fn write_deploy_interrupt_to(path: &Path, state: &DeployInterruptState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(state)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn request_deploy_interrupt(app: &str, state: &DeployInterruptState) -> Result<(), String> {
+    write_deploy_interrupt_to(&deploy_interrupt_path(app), state)
+}
+
+fn clear_deploy_interrupt_at(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", path.display())),
+    }
+}
+
+fn clear_deploy_interrupt(app: &str) -> Result<(), String> {
+    clear_deploy_interrupt_at(&deploy_interrupt_path(app))
 }
 
 fn read_cleanup_job_from(path: &Path) -> Result<Option<CleanupJobState>, String> {
@@ -2571,6 +2684,7 @@ fn candidate_app_name(app: &str, deploy_id: &str) -> String {
 
 fn wait_for_tcp_listener(
     app: &str,
+    deploy_app: Option<&str>,
     port: u16,
     timeout_secs: u64,
     label: &str,
@@ -2578,6 +2692,9 @@ fn wait_for_tcp_listener(
     let started = Instant::now();
     let mut next_heartbeat = DEPLOY_PROGRESS_HEARTBEAT_SECS;
     loop {
+        if let Some(deploy_app) = deploy_app {
+            check_deploy_interrupt(deploy_app, label)?;
+        }
         let output = container::exec_output(
             app,
             &format!(
@@ -3108,6 +3225,42 @@ fn start_deploy_log_session(app: &str) -> Option<deploy_log::DeployLogSession> {
     }
 }
 
+fn deploy_request_id() -> String {
+    format!("{}-{}", now_unix_secs(), std::process::id())
+}
+
+fn deploy_interrupted_error(phase: &str, state: &DeployInterruptState) -> String {
+    format!(
+        "{DEPLOY_INTERRUPT_ERR_PREFIX} (phase: {phase}, request: {}, requested_at: {})",
+        state.request_id, state.requested_at
+    )
+}
+
+fn is_deploy_interrupted_error(err: &str) -> bool {
+    err.starts_with(DEPLOY_INTERRUPT_ERR_PREFIX)
+}
+
+fn deploy_result_was_interrupted(result: &Result<(), String>) -> bool {
+    matches!(result, Err(err) if is_deploy_interrupted_error(err))
+}
+
+fn check_deploy_interrupt(app: &str, phase: &str) -> Result<(), String> {
+    if let Some(state) = read_deploy_interrupt(app)? {
+        return Err(deploy_interrupted_error(phase, &state));
+    }
+    Ok(())
+}
+
+fn should_process_pending_request(
+    active_target: Option<&GitCheckoutTarget>,
+    pending: &PendingGitDeployRequest,
+) -> bool {
+    if pending.force {
+        return true;
+    }
+    active_target.map(|target| target.sha.as_str()) != Some(pending.sha.as_str())
+}
+
 fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Result<(), String> {
     if let Some(target) = target {
         if !force {
@@ -3127,12 +3280,14 @@ fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Re
         }
     }
 
+    check_deploy_interrupt(app, "before checkout")?;
     eprintln!("-----> Checking out code");
     if let Some(target) = target {
         eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
     }
     let result = (|| {
         let build_dir = checkout_code(app, target)?;
+        check_deploy_interrupt(app, "after checkout")?;
         deploy_from(app, &build_dir)
     })();
 
@@ -3150,22 +3305,115 @@ fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Re
             Ok(())
         }
         Err(err) => {
-            if let Some(target) = target
-                && let Err(write_err) = write_git_deploy_state(app, target, GitDeployStatus::Failed)
-            {
-                eprintln!("       Warning: failed to record failed git deploy state: {write_err}");
+            if let Some(target) = target {
+                let status = if is_deploy_interrupted_error(&err) {
+                    GitDeployStatus::Interrupted
+                } else {
+                    GitDeployStatus::Failed
+                };
+                if let Err(write_err) = write_git_deploy_state(app, target, status) {
+                    eprintln!(
+                        "       Warning: failed to record failed git deploy state: {write_err}"
+                    );
+                }
             }
             Err(err)
         }
     }
 }
 
-fn queue_pending_git_deploy(app: &str, target: &GitCheckoutTarget) -> Result<(), String> {
-    write_pending_git_target(app, target)?;
+fn queue_pending_git_deploy(
+    app: &str,
+    target: &GitCheckoutTarget,
+    force: bool,
+    request_id: Option<String>,
+) -> Result<PendingGitDeployRequest, String> {
+    let request = PendingGitDeployRequest::from_target(target, force, request_id);
+    write_pending_git_request(app, &request)?;
     if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Pending) {
         eprintln!("       Warning: failed to record pending git deploy state: {err}");
     }
-    Ok(())
+    Ok(request)
+}
+
+fn wait_for_forced_pending_deploy_completion(
+    app: &str,
+    target: &GitCheckoutTarget,
+    request_id: &str,
+) -> Result<(), String> {
+    let mut last_status_line = String::new();
+    let started = Instant::now();
+    let mut next_heartbeat = DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS;
+
+    loop {
+        let lock_active = deploy_lock_path(app).exists();
+        let pending_request = read_pending_git_request(app)?;
+        let state = read_git_deploy_state(app)?;
+
+        if matches!(
+            state.as_ref(),
+            Some(GitDeployState {
+                sha,
+                status: GitDeployStatus::Success,
+                ..
+            }) if sha == &target.sha
+        ) {
+            eprintln!(
+                "=====> Forced deploy complete for {} ({})",
+                target.ref_name, target.sha
+            );
+            let _ = clear_deploy_interrupt(app);
+            return Ok(());
+        }
+
+        if !lock_active
+            && !matches!(pending_request.as_ref(), Some(request) if request.sha == target.sha)
+            && matches!(
+                state.as_ref(),
+                Some(GitDeployState {
+                    sha,
+                    status: GitDeployStatus::Failed | GitDeployStatus::Interrupted,
+                    ..
+                }) if sha == &target.sha
+            )
+        {
+            return Err(format!(
+                "forced deploy did not complete successfully for {} ({})",
+                target.ref_name, target.sha
+            ));
+        }
+
+        let status_line = if let Some(request) = pending_request.as_ref() {
+            let req_id = request.request_id.as_deref().unwrap_or("-");
+            if request.request_id.as_deref() != Some(request_id) {
+                format!(
+                    "forced request superseded by newer pending request {req_id}; waiting for latest"
+                )
+            } else if lock_active {
+                "interrupt requested; waiting for active deploy to stop".to_string()
+            } else {
+                "interrupt requested; waiting for forced deploy to start".to_string()
+            }
+        } else if lock_active {
+            "forced pending picked up; waiting for deploy completion".to_string()
+        } else {
+            match state.as_ref() {
+                Some(GitDeployState { sha, status, .. }) if sha == &target.sha => {
+                    format!("last deploy status for target is {:?}", status).to_lowercase()
+                }
+                _ => "waiting for deploy scheduler state".to_string(),
+            }
+        };
+
+        let elapsed = started.elapsed().as_secs();
+        if status_line != last_status_line || elapsed >= next_heartbeat {
+            eprintln!("       {status_line} ({elapsed}s elapsed)");
+            last_status_line = status_line;
+            next_heartbeat = elapsed.saturating_add(DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS);
+        }
+
+        thread::sleep(Duration::from_millis(DEPLOY_INTERRUPT_WAIT_POLL_MS));
+    }
 }
 
 pub fn deploy(
@@ -3182,7 +3430,25 @@ pub fn deploy(
 
     let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
         if let Some(target) = target.as_ref() {
-            queue_pending_git_deploy(app, target)?;
+            if force {
+                let request_id = deploy_request_id();
+                let request =
+                    queue_pending_git_deploy(app, target, true, Some(request_id.clone()))?;
+                request_deploy_interrupt(
+                    app,
+                    &DeployInterruptState {
+                        request_id: request_id.clone(),
+                        requested_at: now_unix_secs(),
+                        target_sha: target.sha.clone(),
+                    },
+                )?;
+                eprintln!(
+                    "-----> Deploy already in progress; interrupt requested for forced deploy"
+                );
+                eprintln!("       Ref: {} ({})", request.ref_name, request.sha);
+                return wait_for_forced_pending_deploy_completion(app, target, &request_id);
+            }
+            queue_pending_git_deploy(app, target, false, None)?;
             eprintln!("-----> Deploy already in progress; replaced pending deploy target");
             eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
             return Ok(());
@@ -3192,24 +3458,42 @@ pub fn deploy(
         ));
     };
     kick_pending_cleanup_worker(app);
+    if let Err(err) = clear_deploy_interrupt(app) {
+        eprintln!("       Warning: failed to clear pending deploy interrupt state: {err}");
+    }
 
     let mut active_force = force;
     loop {
         let result = deploy_once(app, target.as_ref(), active_force);
-        let Some(pending_target) = take_pending_git_target(app)? else {
+        let pending_request = take_pending_git_request(app)?;
+        let interrupted = deploy_result_was_interrupted(&result);
+        let Some(pending_request) = pending_request else {
+            if interrupted {
+                let _ = clear_deploy_interrupt(app);
+            }
             return result;
         };
-        if target.as_ref().map(|v| v.sha.as_str()) == Some(pending_target.sha.as_str()) {
+        if !should_process_pending_request(target.as_ref(), &pending_request) {
             return result;
+        }
+
+        if interrupted {
+            if let Err(err) = clear_deploy_interrupt(app) {
+                eprintln!("       Warning: failed to clear deploy interrupt state: {err}");
+            }
+            eprintln!("-----> Deploy interrupted; handing off to pending target");
         }
 
         eprintln!("-----> Processing pending deploy target");
         eprintln!(
             "       Ref: {} ({})",
-            pending_target.ref_name, pending_target.sha
+            pending_request.ref_name, pending_request.sha
         );
-        target = Some(pending_target);
-        active_force = false;
+        if pending_request.force {
+            eprintln!("       Forced redeploy requested");
+        }
+        target = Some(pending_request.target());
+        active_force = pending_request.force;
     }
 }
 
@@ -3279,6 +3563,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         ensure_project_default_profile(&current_project)?;
     }
     init_stacks_in(&stacks_dir())?;
+    check_deploy_interrupt(app, "blue/green preflight")?;
     let old_active_app = resolve_active_app_ref(app)?
         .ok_or_else(|| format!("app '{app}' not found for blue/green deploy"))?;
     let old_previous_app = read_app_runtime_state(app)?
@@ -3296,6 +3581,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     } else {
         None
     };
+    check_deploy_interrupt(app, "blue/green detect and env checks")?;
 
     if code_dir.join("psht-stack.sh").exists() {
         eprintln!("       Using custom stack");
@@ -3349,8 +3635,10 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("       Candidate: {candidate_app}");
     eprintln!("       Traffic remains on current container");
     wait_for_container_operation_quiet(&old_active_app, &current_project)?;
+    check_deploy_interrupt(app, "candidate preparation")?;
 
     let build_candidate_result = (|| -> Result<(), String> {
+        check_deploy_interrupt(app, "candidate build setup")?;
         let setup_image_cached = if reused_inactive_candidate {
             eprintln!("-----> Reusing inactive container as candidate");
             if !container::is_running(&candidate_app)? {
@@ -3454,6 +3742,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         };
 
         eprintln!("-----> Building candidate");
+        check_deploy_interrupt(app, "candidate build")?;
         container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
         if !setup_image_cached {
             install_apt_packages(&candidate_app, &config.apt_packages)?;
@@ -3507,6 +3796,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         .cloned();
 
     eprintln!("-----> Switching traffic");
+    check_deploy_interrupt(app, "before cutover")?;
     eprintln!("       Traffic remains on current container until cutover is complete");
     let mut old_proxy_removed = false;
     let mut old_storage_detached = false;
@@ -3517,6 +3807,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     let mut candidate_tailscale_state_attached = false;
 
     let cutover_result = (|| -> Result<Option<String>, String> {
+        check_deploy_interrupt(app, "cutover start")?;
         eprintln!("       Stopping current app process");
         stop_app_process_on_port(&old_active_app, port)?;
 
@@ -3542,8 +3833,10 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         launch_app_process(&candidate_app, port, &config.start_command, &app_env)?;
 
         eprintln!("-----> Waiting for candidate readiness");
+        check_deploy_interrupt(app, "cutover candidate readiness")?;
         wait_for_tcp_listener(
             &candidate_app,
+            Some(app),
             port,
             DEPLOY_TCP_READY_TIMEOUT_SECS,
             "candidate readiness",
@@ -3552,6 +3845,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         let tailnet_hostname = if skip_tailscale {
             None
         } else {
+            check_deploy_interrupt(app, "cutover tailscale switchover")?;
             let (tailscale_pool, tailscale_state_volume) = tailscale_volume
                 .as_ref()
                 .ok_or_else(|| "tailscale state volume should be available".to_string())?;
@@ -3602,6 +3896,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             name
         };
 
+        check_deploy_interrupt(app, "cutover finalize")?;
         caddy::add(app, port)?;
         write_app_runtime_state(app, &candidate_app, Some(&old_active_app))?;
 
@@ -3716,6 +4011,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Verifying live endpoint");
     wait_for_tcp_listener(
         &candidate_app,
+        Some(app),
         port,
         DEPLOY_TCP_READY_TIMEOUT_SECS,
         "post-cutover verification",
@@ -3735,6 +4031,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         ensure_project_default_profile(&current_project)?;
     }
     init_stacks_in(&stacks_dir())?;
+    check_deploy_interrupt(app, "in-place preflight")?;
 
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
@@ -3746,6 +4043,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     } else {
         None
     };
+    check_deploy_interrupt(app, "in-place detect and env checks")?;
 
     if code_dir.join("psht-stack.sh").exists() {
         eprintln!("       Using custom stack");
@@ -3789,7 +4087,9 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         true
     };
 
+    check_deploy_interrupt(app, "in-place setup evaluation")?;
     if needs_setup {
+        check_deploy_interrupt(app, "in-place setup start")?;
         wait_for_container_operation_quiet(app, &current_project)?;
 
         let setup_image_cached = container::setup_image_exists_in_project(
@@ -3850,6 +4150,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         }
 
         if !setup_image_cached {
+            check_deploy_interrupt(app, "in-place package setup")?;
             install_apt_packages(app, &config.apt_packages)?;
             if apt_fingerprint.is_some() {
                 eprintln!("-----> Caching setup image");
@@ -3881,6 +4182,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
                 )?;
             }
             eprintln!("-----> Connecting to tailnet");
+            check_deploy_interrupt(app, "in-place tailscale connection")?;
             tailnet_hostname = acquire_exact_tailscale_hostname_for_deploy(app, app)?;
         }
 
@@ -3889,9 +4191,11 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         container::add_proxy(app, port, port)?;
     }
 
+    check_deploy_interrupt(app, "in-place storage attach")?;
     container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
 
     eprintln!("-----> Pushing code to container");
+    check_deploy_interrupt(app, "in-place code push")?;
     container::push_code(app, &code_dir.to_string_lossy())?;
     persist_start_command(app, &config.start_command)?;
     persist_required_env(app, &config.required_env)?;
@@ -3905,6 +4209,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
     run_hook(app, "postinstall", config.postinstall_command.as_deref())?;
 
     eprintln!("-----> Starting app");
+    check_deploy_interrupt(app, "in-place app start")?;
     launch_app_process(app, port, &config.start_command, &app_env)?;
 
     if !skip_tailscale {
@@ -3916,6 +4221,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         }
     }
 
+    check_deploy_interrupt(app, "in-place finalize")?;
     caddy::add(app, port)?;
     write_app_runtime_state(app, app, None)?;
 
@@ -5743,8 +6049,12 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sha: "deadbeef".to_string(),
         };
-        write_pending_git_target_to(&path, &target).unwrap();
-        let loaded = read_pending_git_target_from(&path).unwrap().unwrap();
+        let request = PendingGitDeployRequest::from_target(&target, false, None);
+        write_pending_git_request_to(&path, &request).unwrap();
+        let loaded = read_pending_git_request_from(&path)
+            .unwrap()
+            .unwrap()
+            .target();
         assert_eq!(loaded, target);
     }
 
@@ -5760,10 +6070,74 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sha: "cafebabe".to_string(),
         };
-        write_pending_git_target_to(&path, &first).unwrap();
-        write_pending_git_target_to(&path, &second).unwrap();
-        let loaded = read_pending_git_target_from(&path).unwrap().unwrap();
+        write_pending_git_request_to(
+            &path,
+            &PendingGitDeployRequest::from_target(&first, false, None),
+        )
+        .unwrap();
+        write_pending_git_request_to(
+            &path,
+            &PendingGitDeployRequest::from_target(&second, false, None),
+        )
+        .unwrap();
+        let loaded = read_pending_git_request_from(&path)
+            .unwrap()
+            .unwrap()
+            .target();
         assert_eq!(loaded, second);
+    }
+
+    #[test]
+    fn pending_git_request_round_trip_preserves_force_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        let request = PendingGitDeployRequest {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            force: true,
+            request_id: Some("req-123".to_string()),
+            interrupt_requested_at: Some(123),
+        };
+
+        write_pending_git_request_to(&path, &request).unwrap();
+        let loaded = read_pending_git_request_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, request);
+    }
+
+    #[test]
+    fn pending_git_request_reads_legacy_target_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pending_git_target_path_in(tmp.path(), "myapp");
+        fs::write(
+            &path,
+            r#"ref = "refs/heads/main"
+sha = "deadbeef"
+"#,
+        )
+        .unwrap();
+
+        let loaded = read_pending_git_request_from(&path).unwrap().unwrap();
+        assert_eq!(loaded.ref_name, "refs/heads/main");
+        assert_eq!(loaded.sha, "deadbeef");
+        assert!(!loaded.force);
+        assert!(loaded.request_id.is_none());
+        assert!(loaded.interrupt_requested_at.is_none());
+    }
+
+    #[test]
+    fn deploy_interrupt_state_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = deploy_interrupt_path_in(tmp.path(), "myapp");
+        let state = DeployInterruptState {
+            request_id: "req-123".to_string(),
+            requested_at: 123,
+            target_sha: "deadbeef".to_string(),
+        };
+        write_deploy_interrupt_to(&path, &state).unwrap();
+        let loaded = read_deploy_interrupt_from(&path).unwrap().unwrap();
+        assert_eq!(loaded, state);
+        clear_deploy_interrupt_at(&path).unwrap();
+        assert!(read_deploy_interrupt_from(&path).unwrap().is_none());
     }
 
     #[test]
@@ -5787,8 +6161,15 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sha: "deadbeef".to_string(),
         };
-        write_pending_git_target_to(&path, &target).unwrap();
-        let taken = take_pending_git_target_from(&path).unwrap().unwrap();
+        write_pending_git_request_to(
+            &path,
+            &PendingGitDeployRequest::from_target(&target, false, None),
+        )
+        .unwrap();
+        let taken = take_pending_git_request_from(&path)
+            .unwrap()
+            .unwrap()
+            .target();
         assert_eq!(taken, target);
         assert!(!path.exists());
     }
@@ -5797,7 +6178,7 @@ mod tests {
     fn take_pending_git_target_missing_file_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = pending_git_target_path_in(tmp.path(), "myapp");
-        assert!(take_pending_git_target_from(&path).unwrap().is_none());
+        assert!(take_pending_git_request_from(&path).unwrap().is_none());
     }
 
     #[test]
@@ -5923,6 +6304,42 @@ mod tests {
             &target
         ));
         assert!(!git_target_already_succeeded_with_state(None, &target));
+    }
+
+    #[test]
+    fn should_process_pending_request_honors_force_for_same_sha() {
+        let active = GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+        };
+        let non_forced = PendingGitDeployRequest {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            force: false,
+            request_id: None,
+            interrupt_requested_at: None,
+        };
+        let forced = PendingGitDeployRequest {
+            ref_name: "refs/heads/main".to_string(),
+            sha: "deadbeef".to_string(),
+            force: true,
+            request_id: Some("req-123".to_string()),
+            interrupt_requested_at: Some(123),
+        };
+        assert!(!should_process_pending_request(Some(&active), &non_forced));
+        assert!(should_process_pending_request(Some(&active), &forced));
+    }
+
+    #[test]
+    fn deploy_interrupted_error_prefix_is_detected() {
+        let state = DeployInterruptState {
+            request_id: "req-123".to_string(),
+            requested_at: 123,
+            target_sha: "deadbeef".to_string(),
+        };
+        let msg = deploy_interrupted_error("cutover start", &state);
+        assert!(is_deploy_interrupted_error(&msg));
+        assert!(!is_deploy_interrupted_error("some other error"));
     }
 
     #[test]
