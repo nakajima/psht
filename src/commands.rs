@@ -5,7 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +53,8 @@ const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
+const TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS: u64 = 120;
+const TAILSCALE_STATE_GRACE_TIMEOUT_SECS: u64 = 30;
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 const DEPLOY_INTERRUPT_WAIT_POLL_MS: u64 = 1000;
@@ -59,7 +62,7 @@ const DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS: u64 = 5;
 const DEPLOY_FORCE_TAKEOVER_TIMEOUT_SECS: u64 = 30;
 const DEPLOY_FORCE_KILL_WAIT_MS: u64 = 150;
 const DEPLOY_FORCE_KILL_WAIT_CHECKS: u32 = 8;
-const DEPLOY_INTERRUPT_ERR_PREFIX: &str = "deploy interrupted by --force request";
+const DEPLOY_INTERRUPT_ERR_PREFIX: &str = "deploy interrupted";
 const HEALTH_DELEGATED_ENV: &str = "PSHT_HEALTH_DELEGATED";
 const LOGS_DEPLOY_HISTORY_FILES: usize = 12;
 const LOGS_DEPLOY_HISTORY_LINES_PER_FILE: usize = 400;
@@ -664,6 +667,38 @@ fn parse_tailscale_dns_name(json: &str) -> Option<String> {
     Some(name.trim_end_matches('.').to_string())
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TailscaleSelfSnapshot {
+    device_id: Option<String>,
+    hostname_label: Option<String>,
+    dns_name: Option<String>,
+    backend_state: String,
+    online: bool,
+    health: Vec<String>,
+    ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OwnedTailscaleCleanupResult {
+    removed_device_ids: Vec<String>,
+    retired_device_ids: Vec<String>,
+}
+
+fn value_as_nonempty_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 fn tailscale_dns_label(dns_name: &str) -> Option<&str> {
     let label = dns_name.trim_end_matches('.').split('.').next()?;
     if label.is_empty() { None } else { Some(label) }
@@ -673,6 +708,277 @@ fn tailscale_hostname_is_exact(dns_name: &str, app: &str) -> bool {
     tailscale_dns_label(dns_name)
         .map(|label| label.eq_ignore_ascii_case(app))
         .unwrap_or(false)
+}
+
+fn parse_tailscale_self_snapshot(json: &str) -> Result<TailscaleSelfSnapshot, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
+    let self_value = value
+        .get("Self")
+        .ok_or_else(|| "missing Self in tailscale status".to_string())?;
+    let serde_json::Value::Object(self_obj) = self_value else {
+        return Err("invalid Self in tailscale status".to_string());
+    };
+
+    let dns_name = self_obj
+        .get("DNSName")
+        .and_then(value_as_nonempty_string)
+        .map(|name| name.trim_end_matches('.').to_string());
+    let hostname_label = dns_name
+        .as_deref()
+        .and_then(tailscale_dns_label)
+        .map(|label| label.to_string())
+        .or_else(|| self_obj.get("HostName").and_then(value_as_nonempty_string));
+    let device_id = self_obj
+        .get("ID")
+        .and_then(value_as_nonempty_string)
+        .or_else(|| self_obj.get("NodeID").and_then(value_as_nonempty_string))
+        .or_else(|| self_obj.get("StableID").and_then(value_as_nonempty_string));
+    let backend_state = value
+        .get("BackendState")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let online = self_obj
+        .get("Online")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let health = value
+        .get("Health")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|entry| !entry.trim().is_empty())
+                .map(|entry| entry.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let ips = self_obj
+        .get("TailscaleIPs")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|ip| !ip.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(TailscaleSelfSnapshot {
+        device_id,
+        hostname_label,
+        dns_name,
+        backend_state,
+        online,
+        health,
+        ips,
+    })
+}
+
+fn read_tailscale_self_snapshot(container_app: &str) -> Result<TailscaleSelfSnapshot, String> {
+    let status_json = container::exec_output(container_app, "tailscale status --json")
+        .map_err(|e| format!("failed to read tailscale status from {container_app}: {e}"))?;
+    parse_tailscale_self_snapshot(&status_json)
+}
+
+fn tailscale_conflict_label_for_app(label: &str, app: &str) -> bool {
+    if label.eq_ignore_ascii_case(app) {
+        return true;
+    }
+
+    let app_lower = app.to_ascii_lowercase();
+    let label_lower = label.to_ascii_lowercase();
+    let Some(suffix) = label_lower.strip_prefix(&format!("{app_lower}-")) else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn tailnet_device_label(device: &tailscale::TailnetDevice) -> Option<String> {
+    if let Some(hostname) = device
+        .hostname_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|hostname| !hostname.is_empty())
+    {
+        return Some(hostname.to_string());
+    }
+    device
+        .dns_name
+        .as_deref()
+        .and_then(tailscale_dns_label)
+        .map(str::to_string)
+}
+
+fn resolve_tailscale_device_id_from_tailnet(
+    snapshot: &TailscaleSelfSnapshot,
+) -> Result<Option<String>, String> {
+    let has_matching_fields = snapshot
+        .dns_name
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || snapshot
+            .hostname_label
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if !has_matching_fields {
+        return Ok(None);
+    }
+
+    let token = tailscale::tailnet_access_token()?;
+    let devices = tailscale::list_tailnet_devices(&token)?;
+    let mut matches = Vec::new();
+    for device in devices {
+        let dns_matches = snapshot
+            .dns_name
+            .as_deref()
+            .zip(device.dns_name.as_deref())
+            .map(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+            .unwrap_or(false);
+        let label_matches = snapshot
+            .hostname_label
+            .as_deref()
+            .zip(tailnet_device_label(&device).as_deref())
+            .map(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+            .unwrap_or(false);
+        if dns_matches || label_matches {
+            matches.push(device.id);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+
+    if matches.len() > 1 {
+        return Err(format!(
+            "unable to resolve tailscale self device id uniquely; matched {}",
+            matches.join(", ")
+        ));
+    }
+    Ok(matches.into_iter().next())
+}
+
+fn track_owned_tailscale_device(
+    app: &str,
+    container_app: &str,
+    created_via: &str,
+) -> Result<Option<String>, String> {
+    let snapshot = read_tailscale_self_snapshot(container_app)?;
+    let mut device_id = snapshot.device_id.clone();
+    if device_id.is_none() {
+        device_id = resolve_tailscale_device_id_from_tailnet(&snapshot)?;
+    }
+    let device_id = device_id.ok_or_else(|| {
+        format!(
+            "tailscale self device id unavailable for {container_app} (dns: {}, state: {}, online: {})",
+            snapshot.dns_name.as_deref().unwrap_or("unknown"),
+            snapshot.backend_state,
+            snapshot.online
+        )
+    })?;
+
+    sqlite_store::upsert_owned_tailscale_device(
+        app,
+        &device_id,
+        snapshot.hostname_label.as_deref(),
+        snapshot.dns_name.as_deref(),
+        created_via,
+        Some(&instance_name_from_app_ref(container_app)),
+    )?;
+    Ok(snapshot.dns_name)
+}
+
+fn cleanup_owned_tailscale_hostname_conflicts(
+    app: &str,
+    current_device_id: Option<&str>,
+) -> Result<OwnedTailscaleCleanupResult, String> {
+    let tracked = sqlite_store::list_active_owned_tailscale_devices(app)?;
+
+    let token = tailscale::tailnet_access_token()?;
+    let devices = tailscale::list_tailnet_devices(&token)?;
+    let mut devices_by_id = BTreeMap::new();
+    for device in devices {
+        devices_by_id.insert(device.id.clone(), device);
+    }
+
+    let tracked_ids = tracked
+        .iter()
+        .map(|row| row.device_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut untracked_exact = Vec::new();
+    for device in devices_by_id.values() {
+        let is_tagged_psht = device.tags.iter().any(|tag| tag == "tag:psht");
+        if !is_tagged_psht {
+            continue;
+        }
+        let Some(label) = tailnet_device_label(device) else {
+            continue;
+        };
+        if !label.eq_ignore_ascii_case(app) {
+            continue;
+        }
+        if tracked_ids.contains(&device.id) {
+            continue;
+        }
+        if current_device_id == Some(device.id.as_str()) {
+            continue;
+        }
+        let display_name = device
+            .dns_name
+            .as_deref()
+            .unwrap_or(label.as_str())
+            .to_string();
+        untracked_exact.push(format!("{} ({display_name})", device.id));
+    }
+    if !untracked_exact.is_empty() {
+        untracked_exact.sort();
+        untracked_exact.dedup();
+        return Err(format!(
+            "exact hostname '{app}' is held by untracked tailscale device(s): {}",
+            untracked_exact.join(", ")
+        ));
+    }
+
+    let mut result = OwnedTailscaleCleanupResult::default();
+    let allow_exact_delete = current_device_id.is_some();
+
+    for row in tracked {
+        if current_device_id == Some(row.device_id.as_str()) {
+            continue;
+        }
+
+        let Some(device) = devices_by_id.get(&row.device_id) else {
+            sqlite_store::retire_owned_tailscale_device(app, &row.device_id)?;
+            result.retired_device_ids.push(row.device_id.clone());
+            continue;
+        };
+
+        if !device.tags.iter().any(|tag| tag == "tag:psht") {
+            continue;
+        }
+
+        let label = tailnet_device_label(device)
+            .or_else(|| row.hostname_label.clone())
+            .unwrap_or_default();
+        if label.is_empty() || !tailscale_conflict_label_for_app(&label, app) {
+            continue;
+        }
+        if !allow_exact_delete && label.eq_ignore_ascii_case(app) {
+            continue;
+        }
+
+        tailscale::delete_tailnet_device(&token, &row.device_id)?;
+        sqlite_store::retire_owned_tailscale_device(app, &row.device_id)?;
+        result.removed_device_ids.push(row.device_id.clone());
+    }
+
+    Ok(result)
 }
 
 fn tailscale_self_health_from_json(json: &str) -> Result<(String, bool, Vec<String>), String> {
@@ -752,6 +1058,14 @@ fn reset_tailscale_for_retry(container_app: &str) -> Result<(), String> {
     )
 }
 
+fn retry_attempt_budget(timeout_secs: u64, retry_sleep: Duration) -> u64 {
+    let sleep_ms = retry_sleep.as_millis().max(1);
+    let timeout_ms = u128::from(timeout_secs).saturating_mul(1000);
+    let attempts = timeout_ms / sleep_ms;
+    let attempts = attempts.max(1).saturating_add(1);
+    attempts.min(u128::from(u64::MAX)) as u64
+}
+
 fn acquire_exact_tailscale_hostname_with_retry<
     FStateJoin,
     FAuthJoin,
@@ -775,53 +1089,77 @@ where
     FSleep: FnMut(Duration),
 {
     let started = Instant::now();
-    let mut attempt: u64 = 0;
     let retry_sleep = Duration::from_millis(TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS);
+    let total_attempt_budget =
+        retry_attempt_budget(TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS, retry_sleep);
+    let state_attempt_budget =
+        retry_attempt_budget(TAILSCALE_STATE_GRACE_TIMEOUT_SECS, retry_sleep)
+            .min(total_attempt_budget);
+    let mut switched_to_auth_phase = false;
+    let mut last_observation = "no hostname observation yet".to_string();
 
-    loop {
-        attempt = attempt.saturating_add(1);
+    for attempt in 1..=total_attempt_budget {
         eprintln!(
             "       Acquiring exact tailscale hostname (attempt {attempt}, {}s elapsed)",
             started.elapsed().as_secs()
         );
 
-        let name = match join_with_state(container_app, app) {
-            Ok(name) => name,
-            Err(state_err) => {
-                eprintln!("       State-based tailscale join failed: {state_err}");
-                eprintln!("       Falling back to auth-key tailscale join");
-                match join_with_auth_key(container_app, app) {
-                    Ok(name) => name,
-                    Err(auth_err) => {
-                        eprintln!("       Auth-key tailscale join failed: {auth_err}");
-                        if let Err(reset_err) = reset_for_retry(container_app) {
-                            eprintln!(
-                                "       Warning: failed to reset tailscale before retry: {reset_err}"
-                            );
-                        }
-                        sleep(retry_sleep);
-                        continue;
+        let in_state_phase = attempt <= state_attempt_budget;
+        if !in_state_phase && !switched_to_auth_phase {
+            switched_to_auth_phase = true;
+            eprintln!(
+                "       State-based hostname recovery timed out after {}s; switching to auth-key recovery",
+                TAILSCALE_STATE_GRACE_TIMEOUT_SECS
+            );
+            if let Err(reset_err) = reset_for_retry(container_app) {
+                eprintln!("       Warning: failed to reset tailscale before fallback: {reset_err}");
+            }
+        }
+
+        let name = if in_state_phase {
+            match join_with_state(container_app, app) {
+                Ok(name) => name,
+                Err(state_err) => {
+                    last_observation = format!("state join failed: {state_err}");
+                    eprintln!("       State-based tailscale join failed: {state_err}");
+                    if let Err(reset_err) = reset_for_retry(container_app) {
+                        eprintln!(
+                            "       Warning: failed to reset tailscale before retry: {reset_err}"
+                        );
                     }
+                    sleep(retry_sleep);
+                    continue;
+                }
+            }
+        } else {
+            match join_with_auth_key(container_app, app) {
+                Ok(name) => name,
+                Err(auth_err) => {
+                    last_observation = format!("auth-key join failed: {auth_err}");
+                    eprintln!("       Auth-key tailscale join failed: {auth_err}");
+                    if let Err(reset_err) = reset_for_retry(container_app) {
+                        eprintln!(
+                            "       Warning: failed to reset tailscale before retry: {reset_err}"
+                        );
+                    }
+                    sleep(retry_sleep);
+                    continue;
                 }
             }
         };
 
         let Some(dns_name) = name.as_deref() else {
+            last_observation = "tailscale DNS name unavailable".to_string();
             eprintln!("       Tailscale DNS name unavailable yet; retrying");
-            if let Err(reset_err) = reset_for_retry(container_app) {
-                eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
-            }
             sleep(retry_sleep);
             continue;
         };
 
         if !tailscale_hostname_is_exact(dns_name, app) {
+            last_observation = format!("hostname mismatch: got '{dns_name}', expected '{app}'");
             eprintln!(
                 "       Hostname mismatch: got '{dns_name}', expected label '{app}'. Retrying..."
             );
-            if let Err(reset_err) = reset_for_retry(container_app) {
-                eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
-            }
             sleep(retry_sleep);
             continue;
         }
@@ -832,16 +1170,19 @@ where
                 return Ok(name);
             }
             Err(health_err) => {
+                last_observation = format!("tailscale not healthy yet: {health_err}");
                 eprintln!("       Tailscale not healthy yet: {health_err}");
-                if let Err(reset_err) = reset_for_retry(container_app) {
-                    eprintln!(
-                        "       Warning: failed to reset tailscale before retry: {reset_err}"
-                    );
-                }
                 sleep(retry_sleep);
             }
         }
     }
+
+    Err(format!(
+        "failed to acquire exact tailscale hostname '{app}' within {}s (state grace: {}s, attempts: {}); last observation: {last_observation}",
+        TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS,
+        TAILSCALE_STATE_GRACE_TIMEOUT_SECS,
+        total_attempt_budget
+    ))
 }
 
 fn acquire_exact_tailscale_hostname_for_deploy(
@@ -853,11 +1194,30 @@ fn acquire_exact_tailscale_hostname_for_deploy(
         app,
         |container, machine_name| {
             check_deploy_interrupt(app, "tailscale exact-hostname acquisition")?;
-            tailscale::join_with_state_in_container(container, machine_name)
+            let name = tailscale::join_with_state_in_container(container, machine_name)?;
+            if let Err(track_err) = track_owned_tailscale_device(app, container, "state") {
+                eprintln!("       Warning: failed to track tailscale state device: {track_err}");
+            }
+            Ok(name)
         },
         |container, machine_name| {
             check_deploy_interrupt(app, "tailscale exact-hostname auth-key fallback")?;
-            tailscale::join_with_auth_key_in_container(container, machine_name)
+            let current_device_id = read_tailscale_self_snapshot(container)
+                .ok()
+                .and_then(|snapshot| snapshot.device_id);
+            let cleanup =
+                cleanup_owned_tailscale_hostname_conflicts(app, current_device_id.as_deref())?;
+            if !cleanup.removed_device_ids.is_empty() || !cleanup.retired_device_ids.is_empty() {
+                eprintln!(
+                    "       Reclaimed tracked tailscale devices (removed: {}; retired: {})",
+                    join_or_none(&cleanup.removed_device_ids),
+                    join_or_none(&cleanup.retired_device_ids),
+                );
+            }
+
+            let name = tailscale::join_with_auth_key_in_container(container, machine_name)?;
+            let _ = track_owned_tailscale_device(app, container, "auth_key")?;
+            Ok(name)
         },
         |container| {
             check_deploy_interrupt(app, "tailscale health wait")?;
@@ -2001,6 +2361,46 @@ enum BusyOpPolicy {
 
 static ACTIVE_RECONCILE_LEASES: OnceLock<Mutex<HashMap<String, ActiveReconcileLease>>> =
     OnceLock::new();
+static DEPLOY_INTERRUPT_SIGNAL_PENDING: AtomicBool = AtomicBool::new(false);
+static DEPLOY_INTERRUPT_SIGNAL_INSTALLED: OnceLock<()> = OnceLock::new();
+
+#[cfg(unix)]
+const SIGHUP: i32 = 1;
+#[cfg(unix)]
+const SIGINT: i32 = 2;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGNAL_ERR: usize = usize::MAX;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+extern "C" fn mark_deploy_interrupt_signal(_signal: i32) {
+    DEPLOY_INTERRUPT_SIGNAL_PENDING.store(true, Ordering::SeqCst);
+}
+
+fn install_deploy_interrupt_signal_handlers() {
+    DEPLOY_INTERRUPT_SIGNAL_INSTALLED.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: Installing process signal handlers is required to map Ctrl-C/session
+            // hangup to deploy interruption. Handler only stores to an atomic flag.
+            unsafe {
+                for (signum, name) in [(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM"), (SIGHUP, "SIGHUP")]
+                {
+                    if signal(signum, mark_deploy_interrupt_signal) == SIGNAL_ERR {
+                        std::eprintln!(
+                            "warning: failed to install {name} handler; Ctrl-C cancel may be degraded"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
 
 fn app_ref_from_instance_name(instance: &str) -> Option<String> {
     let trimmed = instance.trim();
@@ -3974,12 +4374,51 @@ fn deploy_result_was_interrupted(result: &Result<(), String>) -> bool {
     matches!(result, Err(err) if is_deploy_interrupted_error(err))
 }
 
+fn deploy_interrupt_state_for_signal(app: &str) -> DeployInterruptState {
+    let now = now_unix_secs();
+    let target_sha = read_git_deploy_state(app)
+        .ok()
+        .flatten()
+        .map(|state| state.sha)
+        .unwrap_or_else(|| "unknown".to_string());
+    DeployInterruptState {
+        request_id: format!("signal-{}-{now}", process::id()),
+        requested_at: now,
+        target_sha,
+    }
+}
+
+fn check_signal_interrupt_without_persist(app: &str, phase: &str) -> Result<(), String> {
+    if !DEPLOY_INTERRUPT_SIGNAL_PENDING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let state = deploy_interrupt_state_for_signal(app);
+    Err(deploy_interrupted_error(phase, &state))
+}
+
+fn check_signal_interrupt_with_persist(app: &str, phase: &str) -> Result<(), String> {
+    if !DEPLOY_INTERRUPT_SIGNAL_PENDING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    if let Some(state) = read_deploy_interrupt(app)? {
+        return Err(deploy_interrupted_error(phase, &state));
+    }
+
+    let state = deploy_interrupt_state_for_signal(app);
+    if let Err(err) = request_deploy_interrupt(app, &state) {
+        eprintln!("       Warning: failed to record signal interrupt state: {err}");
+    }
+    Err(deploy_interrupted_error(phase, &state))
+}
+
 fn check_deploy_interrupt(app: &str, phase: &str) -> Result<(), String> {
     if let Err(err) = refresh_deploy_lock_heartbeat(app) {
         eprintln!("       Warning: failed to refresh deploy lock heartbeat: {err}");
     }
     refresh_active_reconcile_lease(app)
         .map_err(|err| format!("reconcile lease check failed during {phase}: {err}"))?;
+    check_signal_interrupt_with_persist(app, phase)?;
     if let Some(state) = read_deploy_interrupt(app)? {
         return Err(deploy_interrupted_error(phase, &state));
     }
@@ -4428,6 +4867,7 @@ pub fn deploy(
     force: bool,
 ) -> Result<(), String> {
     app_name::validate_app_name(app)?;
+    install_deploy_interrupt_signal_handlers();
     let source_payload = serde_json::json!({
         "mode": "git",
         "ref": git_ref,
@@ -4438,6 +4878,7 @@ pub fn deploy(
     let mut attempt: u64 = 0;
     let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
     loop {
+        check_signal_interrupt_without_persist(app, "deploy retry scheduling")?;
         attempt = attempt.saturating_add(1);
         if attempt > 1 {
             eprintln!("-----> Retrying deploy attempt {attempt}");
@@ -4446,6 +4887,7 @@ pub fn deploy(
             Ok(ctx) => ctx,
             Err(err) => {
                 print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                check_signal_interrupt_without_persist(app, "deploy retry backoff")?;
                 thread::sleep(Duration::from_secs(retry_sleep_secs));
                 retry_sleep_secs =
                     (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
@@ -4466,7 +4908,11 @@ pub fn deploy(
         match result {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if is_deploy_interrupted_error(&err) {
+                    return Err(err);
+                }
                 print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                check_signal_interrupt_without_persist(app, "deploy retry backoff")?;
                 thread::sleep(Duration::from_secs(retry_sleep_secs));
                 retry_sleep_secs =
                     (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
@@ -4560,6 +5006,7 @@ fn deploy_impl(
 
 pub fn push(app: &str, force: bool) -> Result<(), String> {
     app_name::validate_app_name(app)?;
+    install_deploy_interrupt_signal_handlers();
     let source_payload = serde_json::json!({
         "mode": "push",
         "force": force,
@@ -4568,6 +5015,7 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
     let mut attempt: u64 = 0;
     let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
     loop {
+        check_signal_interrupt_without_persist(app, "push retry scheduling")?;
         attempt = attempt.saturating_add(1);
         if attempt > 1 {
             eprintln!("-----> Retrying deploy attempt {attempt}");
@@ -4576,6 +5024,7 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
             Ok(ctx) => ctx,
             Err(err) => {
                 print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                check_signal_interrupt_without_persist(app, "push retry backoff")?;
                 thread::sleep(Duration::from_secs(retry_sleep_secs));
                 retry_sleep_secs =
                     (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
@@ -4592,7 +5041,11 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
         match result {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if is_deploy_interrupted_error(&err) {
+                    return Err(err);
+                }
                 print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                check_signal_interrupt_without_persist(app, "push retry backoff")?;
                 thread::sleep(Duration::from_secs(retry_sleep_secs));
                 retry_sleep_secs =
                     (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
@@ -6649,6 +7102,49 @@ pub fn doctor() -> Result<(), String> {
     }
 }
 
+fn cleanup_all_owned_tailscale_devices(app: &str) -> Result<(), String> {
+    let tracked = sqlite_store::list_active_owned_tailscale_devices(app)?;
+    if tracked.is_empty() {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    match tailscale::tailnet_access_token() {
+        Ok(token) => match tailscale::list_tailnet_devices(&token) {
+            Ok(devices) => {
+                let mut devices_by_id = BTreeMap::new();
+                for device in devices {
+                    devices_by_id.insert(device.id.clone(), device);
+                }
+
+                for row in &tracked {
+                    let Some(device) = devices_by_id.get(&row.device_id) else {
+                        continue;
+                    };
+                    if !device.tags.iter().any(|tag| tag == "tag:psht") {
+                        continue;
+                    }
+                    if let Err(err) = tailscale::delete_tailnet_device(&token, &row.device_id) {
+                        errors.push(format!("{}: {err}", row.device_id));
+                    }
+                }
+            }
+            Err(err) => errors.push(format!("failed to list tailnet devices: {err}")),
+        },
+        Err(err) => errors.push(format!("failed to acquire tailnet token: {err}")),
+    }
+
+    if let Err(err) = sqlite_store::retire_all_owned_tailscale_devices(app) {
+        errors.push(format!("failed to retire owned device rows: {err}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" | "))
+    }
+}
+
 fn resolve_active_app_for_tailscale(app: &str) -> Result<String, String> {
     resolve_existing_active_app_ref(app)
 }
@@ -6693,14 +7189,21 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
         &tailscale_state_volume,
     )?;
     container::ensure_tailscale_state_mount(&active_app, &tailscale_pool, &tailscale_state_volume)?;
-    let tailnet_hostname = match tailscale::join_with_state_in_container(&active_app, app) {
-        Ok(name) => name,
-        Err(state_err) => {
-            eprintln!("       State-based tailscale join failed: {state_err}");
-            eprintln!("       Falling back to auth-key tailscale join");
-            tailscale::join_with_auth_key_in_container(&active_app, app)?
-        }
-    };
+    let (tailnet_hostname, created_via) =
+        match tailscale::join_with_state_in_container(&active_app, app) {
+            Ok(name) => (name, "state"),
+            Err(state_err) => {
+                eprintln!("       State-based tailscale join failed: {state_err}");
+                eprintln!("       Falling back to auth-key tailscale join");
+                (
+                    tailscale::join_with_auth_key_in_container(&active_app, app)?,
+                    "auth_key",
+                )
+            }
+        };
+    if let Err(track_err) = track_owned_tailscale_device(app, &active_app, created_via) {
+        eprintln!("       Warning: failed to track tailscale device ownership: {track_err}");
+    }
     let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
     let port = allocate_port(app);
     if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
@@ -6803,6 +7306,9 @@ pub fn destroy(app: &str) -> Result<(), String> {
     delete_app_storage_volume(app)?;
     if let Err(e) = delete_app_tailscale_volume(app) {
         eprintln!("       Warning: failed to remove tailscale state volume: {e}");
+    }
+    if let Err(e) = cleanup_all_owned_tailscale_devices(app) {
+        eprintln!("       Warning: failed to clean up tracked tailscale devices: {e}");
     }
     if let Err(e) = remove_env_vars(app) {
         eprintln!("       Warning: failed to remove env vars: {e}");
@@ -7680,7 +8186,7 @@ devices:
         assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
         assert_eq!(auth_calls, 0);
         assert_eq!(health_calls, 1);
-        assert_eq!(reset_calls, 1);
+        assert_eq!(reset_calls, 0);
         assert_eq!(sleep_calls, 1);
     }
 
@@ -7714,10 +8220,64 @@ devices:
         .unwrap();
 
         assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
-        assert_eq!(state_calls, 1);
+        let retry_sleep = Duration::from_millis(TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS);
+        let state_budget = retry_attempt_budget(TAILSCALE_STATE_GRACE_TIMEOUT_SECS, retry_sleep);
+        assert_eq!(state_calls as u64, state_budget);
         assert_eq!(auth_calls, 1);
-        assert_eq!(reset_calls, 0);
-        assert_eq!(sleep_calls, 0);
+        assert_eq!(reset_calls as u64, state_budget + 1);
+        assert_eq!(sleep_calls as u64, state_budget);
+    }
+
+    #[test]
+    fn tailscale_conflict_label_matches_exact_and_numeric_suffix() {
+        assert!(tailscale_conflict_label_for_app(
+            "hyperlinked",
+            "hyperlinked"
+        ));
+        assert!(tailscale_conflict_label_for_app(
+            "hyperlinked-7",
+            "hyperlinked"
+        ));
+        assert!(!tailscale_conflict_label_for_app(
+            "hyperlinked-stage",
+            "hyperlinked"
+        ));
+        assert!(!tailscale_conflict_label_for_app(
+            "other-hyperlinked-1",
+            "hyperlinked"
+        ));
+    }
+
+    #[test]
+    fn parse_tailscale_self_snapshot_extracts_identity_fields() {
+        let json = r#"{
+            "BackendState":"Running",
+            "Health":[],
+            "Self":{
+                "ID":"n123",
+                "HostName":"hyperlinked",
+                "DNSName":"hyperlinked.tail.ts.net.",
+                "Online":true,
+                "TailscaleIPs":["100.64.1.2"]
+            }
+        }"#;
+        let snapshot = parse_tailscale_self_snapshot(json).unwrap();
+        assert_eq!(snapshot.device_id.as_deref(), Some("n123"));
+        assert_eq!(snapshot.hostname_label.as_deref(), Some("hyperlinked"));
+        assert_eq!(
+            snapshot.dns_name.as_deref(),
+            Some("hyperlinked.tail.ts.net")
+        );
+        assert_eq!(snapshot.backend_state, "Running");
+        assert!(snapshot.online);
+        assert_eq!(snapshot.ips, vec!["100.64.1.2".to_string()]);
+    }
+
+    #[test]
+    fn retry_attempt_budget_is_bounded_and_non_zero() {
+        let budget = retry_attempt_budget(30, Duration::from_millis(1_000));
+        assert!(budget >= 2);
+        assert_eq!(budget, 31);
     }
 
     #[test]

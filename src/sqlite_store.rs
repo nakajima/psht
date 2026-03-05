@@ -88,6 +88,19 @@ pub struct CleanupJobRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTailscaleDeviceRow {
+    pub app_id: String,
+    pub device_id: String,
+    pub hostname_label: Option<String>,
+    pub dns_name: Option<String>,
+    pub created_via: String,
+    pub source_instance: Option<String>,
+    pub first_seen_at_ms: i64,
+    pub last_seen_at_ms: i64,
+    pub retired_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppLeaseRow {
     pub app_id: String,
     pub lease_owner: String,
@@ -236,6 +249,25 @@ CREATE TABLE IF NOT EXISTS cleanup_jobs (
     updated_at INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tailscale_owned_devices (
+    app_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    hostname_label TEXT,
+    dns_name TEXT,
+    created_via TEXT NOT NULL,
+    source_instance TEXT,
+    first_seen_at_ms INTEGER NOT NULL,
+    last_seen_at_ms INTEGER NOT NULL,
+    retired_at_ms INTEGER,
+    PRIMARY KEY(app_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tailscale_owned_devices_app_active
+ON tailscale_owned_devices(app_id, retired_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_tailscale_owned_devices_hostname_active
+ON tailscale_owned_devices(hostname_label, retired_at_ms);
 
 CREATE TABLE IF NOT EXISTS app_leases (
     app_id TEXT PRIMARY KEY,
@@ -845,6 +877,105 @@ pub fn delete_cleanup_job(app_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn upsert_owned_tailscale_device(
+    app_id: &str,
+    device_id: &str,
+    hostname_label: Option<&str>,
+    dns_name: Option<&str>,
+    created_via: &str,
+    source_instance: Option<&str>,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    let now_ms = now_unix_ms();
+    conn.execute(
+        "INSERT INTO tailscale_owned_devices(
+            app_id, device_id, hostname_label, dns_name, created_via, source_instance,
+            first_seen_at_ms, last_seen_at_ms, retired_at_ms
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)
+         ON CONFLICT(app_id, device_id) DO UPDATE SET
+            hostname_label = excluded.hostname_label,
+            dns_name = excluded.dns_name,
+            created_via = excluded.created_via,
+            source_instance = excluded.source_instance,
+            last_seen_at_ms = excluded.last_seen_at_ms,
+            retired_at_ms = NULL",
+        params![
+            app_id,
+            device_id,
+            hostname_label,
+            dns_name,
+            created_via,
+            source_instance,
+            now_ms,
+        ],
+    )
+    .map_err(|e| format!("failed to upsert tailscale owned device for {app_id}: {e}"))?;
+    Ok(())
+}
+
+pub fn list_active_owned_tailscale_devices(
+    app_id: &str,
+) -> Result<Vec<OwnedTailscaleDeviceRow>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT app_id, device_id, hostname_label, dns_name, created_via, source_instance,
+                    first_seen_at_ms, last_seen_at_ms, retired_at_ms
+             FROM tailscale_owned_devices
+             WHERE app_id = ?1 AND retired_at_ms IS NULL
+             ORDER BY last_seen_at_ms DESC",
+        )
+        .map_err(|e| format!("failed to prepare owned tailscale device list query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![app_id], |row| {
+            Ok(OwnedTailscaleDeviceRow {
+                app_id: row.get(0)?,
+                device_id: row.get(1)?,
+                hostname_label: row.get(2)?,
+                dns_name: row.get(3)?,
+                created_via: row.get(4)?,
+                source_instance: row.get(5)?,
+                first_seen_at_ms: row.get(6)?,
+                last_seen_at_ms: row.get(7)?,
+                retired_at_ms: row.get(8)?,
+            })
+        })
+        .map_err(|e| format!("failed to query owned tailscale device list for {app_id}: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed to read owned tailscale device row: {e}"))?);
+    }
+    Ok(out)
+}
+
+pub fn retire_owned_tailscale_device(app_id: &str, device_id: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE tailscale_owned_devices
+         SET retired_at_ms = ?3
+         WHERE app_id = ?1 AND device_id = ?2 AND retired_at_ms IS NULL",
+        params![app_id, device_id, now_unix_ms()],
+    )
+    .map_err(|e| {
+        format!("failed to retire owned tailscale device {device_id} for {app_id}: {e}")
+    })?;
+    Ok(())
+}
+
+pub fn retire_all_owned_tailscale_devices(app_id: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE tailscale_owned_devices
+         SET retired_at_ms = ?2
+         WHERE app_id = ?1 AND retired_at_ms IS NULL",
+        params![app_id, now_unix_ms()],
+    )
+    .map_err(|e| format!("failed to retire all owned tailscale devices for {app_id}: {e}"))?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn get_app_lease(app_id: &str) -> Result<Option<AppLeaseRow>, String> {
     let conn = open_connection()?;
@@ -1139,6 +1270,57 @@ mod tests {
         assert_eq!(cleanup.attempts, 1);
         delete_cleanup_job(&app).unwrap();
         assert!(get_cleanup_job(&app).unwrap().is_none());
+    }
+
+    #[test]
+    fn owned_tailscale_device_round_trip() {
+        let app = unique_app("sqlite-tailnet-owned");
+        upsert_owned_tailscale_device(
+            &app,
+            "device-1",
+            Some("hyperlinked"),
+            Some("hyperlinked.tail.ts.net"),
+            "auth_key",
+            Some("psht-hyperlinked-build-1"),
+        )
+        .unwrap();
+
+        let rows = list_active_owned_tailscale_devices(&app).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].device_id, "device-1");
+        assert_eq!(rows[0].hostname_label.as_deref(), Some("hyperlinked"));
+
+        retire_owned_tailscale_device(&app, "device-1").unwrap();
+        assert!(
+            list_active_owned_tailscale_devices(&app)
+                .unwrap()
+                .is_empty()
+        );
+
+        upsert_owned_tailscale_device(
+            &app,
+            "device-2",
+            Some("hyperlinked-1"),
+            Some("hyperlinked-1.tail.ts.net"),
+            "auth_key",
+            Some("psht-hyperlinked-build-2"),
+        )
+        .unwrap();
+        upsert_owned_tailscale_device(
+            &app,
+            "device-3",
+            Some("hyperlinked"),
+            Some("hyperlinked.tail.ts.net"),
+            "state",
+            Some("psht-hyperlinked"),
+        )
+        .unwrap();
+        retire_all_owned_tailscale_devices(&app).unwrap();
+        assert!(
+            list_active_owned_tailscale_devices(&app)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

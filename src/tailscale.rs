@@ -5,6 +5,14 @@ use std::process::Command;
 
 use crate::container;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailnetDevice {
+    pub id: String,
+    pub hostname_label: Option<String>,
+    pub dns_name: Option<String>,
+    pub tags: Vec<String>,
+}
+
 fn credentials_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string());
     PathBuf::from(home).join(".config/tailscale-oauth")
@@ -74,6 +82,99 @@ fn parse_auth_key(json: &str) -> Result<String, String> {
         .ok_or_else(|| "missing key in auth key response".to_string())
 }
 
+fn value_as_nonempty_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_tailnet_device(value: &serde_json::Value) -> Option<TailnetDevice> {
+    let serde_json::Value::Object(obj) = value else {
+        return None;
+    };
+    let id = obj
+        .get("id")
+        .and_then(value_as_nonempty_string)
+        .or_else(|| obj.get("nodeId").and_then(value_as_nonempty_string))
+        .or_else(|| obj.get("deviceId").and_then(value_as_nonempty_string))?;
+
+    let hostname_label = obj
+        .get("hostname")
+        .and_then(value_as_nonempty_string)
+        .map(|hostname| hostname.trim_end_matches('.').to_string())
+        .and_then(|hostname| {
+            let trimmed = hostname.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+    let dns_name = obj
+        .get("name")
+        .and_then(value_as_nonempty_string)
+        .or_else(|| obj.get("dnsName").and_then(value_as_nonempty_string))
+        .map(|name| name.trim_end_matches('.').to_string())
+        .and_then(|name| {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+    let tags = obj
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(value_as_nonempty_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(TailnetDevice {
+        id,
+        hostname_label,
+        dns_name,
+        tags,
+    })
+}
+
+fn parse_tailnet_devices(json: &str) -> Result<Vec<TailnetDevice>, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("failed to parse tailscale device list response: {e}"))?;
+    let candidates = match &value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(obj) => obj
+            .get("devices")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "missing devices array in tailscale device list response".to_string())?,
+        _ => {
+            return Err("invalid tailscale device list response".to_string());
+        }
+    };
+
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if let Some(device) = parse_tailnet_device(candidate) {
+            out.push(device);
+        }
+    }
+    Ok(out)
+}
+
 fn oauth_token_request_args(client_id: &str, client_secret: &str) -> Vec<String> {
     vec![
         "-s".to_string(),
@@ -140,6 +241,43 @@ pub fn auth_key() -> Result<String, String> {
     let (client_id, client_secret) = read_credentials()?;
     let token = oauth_token(&client_id, &client_secret)?;
     create_auth_key(&token)
+}
+
+pub fn tailnet_access_token() -> Result<String, String> {
+    let (client_id, client_secret) = read_credentials()?;
+    oauth_token(&client_id, &client_secret)
+}
+
+pub fn list_tailnet_devices(token: &str) -> Result<Vec<TailnetDevice>, String> {
+    let output = Command::new("curl")
+        .args(["-s", "-X", "GET"])
+        .args(["-H", &format!("Authorization: Bearer {token}")])
+        .arg("https://api.tailscale.com/api/v2/tailnet/-/devices")
+        .output()
+        .map_err(|e| format!("failed to list tailnet devices: {e}"))?;
+    let response = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        return Err(format!("failed to list tailscale devices: {response}"));
+    }
+    parse_tailnet_devices(&response)
+}
+
+pub fn delete_tailnet_device(token: &str, device_id: &str) -> Result<(), String> {
+    let output = Command::new("curl")
+        .args(["-s", "-X", "DELETE"])
+        .args(["-H", &format!("Authorization: Bearer {token}")])
+        .arg(format!(
+            "https://api.tailscale.com/api/v2/device/{device_id}"
+        ))
+        .output()
+        .map_err(|e| format!("failed to delete tailscale device {device_id}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(format!(
+        "failed to delete tailscale device {device_id}: {response}"
+    ))
 }
 
 pub fn install_in_container(app: &str) -> Result<(), String> {
@@ -407,5 +545,48 @@ mod tests {
     fn parse_backend_state_missing_returns_none() {
         let json = r#"{"Self":{"DNSName":"psht-test.tail1234.ts.net."}}"#;
         assert!(parse_backend_state(json).is_none());
+    }
+
+    #[test]
+    fn parse_tailnet_devices_object_response() {
+        let json = r#"{
+          "devices": [
+            {
+              "id": "dev1",
+              "hostname": "hyperlinked-1",
+              "name": "hyperlinked-1.tail.ts.net.",
+              "tags": ["tag:psht"]
+            }
+          ]
+        }"#;
+        let devices = parse_tailnet_devices(json).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "dev1");
+        assert_eq!(devices[0].hostname_label.as_deref(), Some("hyperlinked-1"));
+        assert_eq!(
+            devices[0].dns_name.as_deref(),
+            Some("hyperlinked-1.tail.ts.net")
+        );
+        assert_eq!(devices[0].tags, vec!["tag:psht".to_string()]);
+    }
+
+    #[test]
+    fn parse_tailnet_devices_array_response() {
+        let json = r#"[
+          {
+            "nodeId": "123",
+            "hostname": "hyperlinked",
+            "dnsName": "hyperlinked.tail.ts.net",
+            "tags": []
+          }
+        ]"#;
+        let devices = parse_tailnet_devices(json).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "123");
+        assert_eq!(devices[0].hostname_label.as_deref(), Some("hyperlinked"));
+        assert_eq!(
+            devices[0].dns_name.as_deref(),
+            Some("hyperlinked.tail.ts.net")
+        );
     }
 }
