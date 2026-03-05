@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -43,8 +43,10 @@ const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
 const APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS: u64 = 3;
 const APP_LOG_TAIL_LINES: u32 = 40;
 const INSTALL_LOG_TAIL_LINES: u32 = 80;
-const CONTAINER_OP_WAIT_CHECKS: u32 = 80;
+const CONTAINER_OP_INITIAL_WAIT_CHECKS: u32 = 6;
+const CONTAINER_OP_RECHECK_WAIT_CHECKS: u32 = 6;
 const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
+const CONTAINER_OP_HEARTBEAT_SECS: u64 = 5;
 const CONTAINER_DELETE_RETRY_CHECKS: u32 = 20;
 const DEPLOY_LOCK_STALE_SECS: u64 = 6 * 60 * 60;
 const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
@@ -66,10 +68,12 @@ const INCUS_METADATA_TIMEOUT_SECS: u64 = 20;
 const TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS: u64 = 1000;
 const RECONCILE_LEASE_TTL_SECS: u64 = 30;
 const RECONCILE_LEASE_HEARTBEAT_SECS: u64 = 5;
-const RECONCILE_BUDGET_SECS: u64 = 90;
 const TAKEOVER_RETRY_MS: u64 = 1000;
 const TAKEOVER_MAX_CANCEL_PER_CYCLE: usize = 20;
 const BUSY_OP_POLICY_ENV: &str = "PSHT_BUSY_OP_POLICY";
+const BLOCKED_OP_BUDGET_SECS: u64 = 15;
+const DEPLOY_RETRY_INITIAL_SLEEP_SECS: u64 = 1;
+const DEPLOY_RETRY_MAX_SLEEP_SECS: u64 = 15;
 
 macro_rules! eprintln {
     () => {
@@ -2180,10 +2184,6 @@ fn reconcile_lease_heartbeat_secs() -> u64 {
     env_u64("PSHT_LEASE_HEARTBEAT_SECS", RECONCILE_LEASE_HEARTBEAT_SECS).max(1)
 }
 
-fn reconcile_budget_secs() -> u64 {
-    env_u64("PSHT_RECONCILE_BUDGET_SECS", RECONCILE_BUDGET_SECS).max(10)
-}
-
 fn takeover_retry_ms() -> u64 {
     env_u64("PSHT_TAKEOVER_RETRY_MS", TAKEOVER_RETRY_MS).max(100)
 }
@@ -2207,6 +2207,10 @@ fn busy_op_policy_from_raw(raw: Option<&str>) -> BusyOpPolicy {
 fn busy_op_policy() -> BusyOpPolicy {
     let raw = env::var(BUSY_OP_POLICY_ENV).ok();
     busy_op_policy_from_raw(raw.as_deref())
+}
+
+fn blocked_op_budget_secs() -> u64 {
+    env_u64("PSHT_BLOCKED_OP_BUDGET_SECS", BLOCKED_OP_BUDGET_SECS).max(1)
 }
 
 fn active_reconcile_leases() -> &'static Mutex<HashMap<String, ActiveReconcileLease>> {
@@ -3272,21 +3276,143 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
         .map_err(|e| format!("apt package install failed: {e}"))
 }
 
+fn blocking_op_age_secs(seen_at: &HashMap<String, Instant>, op_id: &str) -> u64 {
+    seen_at
+        .get(op_id)
+        .map(|seen| seen.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+fn blocking_ops_json(
+    blocking: &[container::BlockingOperation],
+    seen_at: &HashMap<String, Instant>,
+) -> Vec<serde_json::Value> {
+    blocking
+        .iter()
+        .map(|op| {
+            serde_json::json!({
+                "id": op.id,
+                "status": op.status,
+                "status_code": op.status_code,
+                "class": op.class,
+                "description": op.description,
+                "may_cancel": op.may_cancel,
+                "age_secs": blocking_op_age_secs(seen_at, &op.id),
+                "resources": op.resources,
+            })
+        })
+        .collect()
+}
+
+fn blocking_ops_summary(
+    blocking: &[container::BlockingOperation],
+    seen_at: &HashMap<String, Instant>,
+) -> String {
+    blocking
+        .iter()
+        .map(|op| {
+            format!(
+                "{}(class={},age={}s,cancelable={})",
+                op.id,
+                op.class,
+                blocking_op_age_secs(seen_at, &op.id),
+                op.may_cancel
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn target_is_currently_serving(target_app: &str, deploy_app: Option<&str>) -> bool {
+    let Some(deploy_app) = deploy_app else {
+        return false;
+    };
+    resolve_active_app_ref(deploy_app)
+        .ok()
+        .flatten()
+        .map(|active| active == target_app)
+        .unwrap_or(false)
+}
+
+fn blocked_operation_error(
+    app: &str,
+    project: &str,
+    budget_secs: u64,
+    phase: &str,
+    blocking: &[container::BlockingOperation],
+    seen_at: &HashMap<String, Instant>,
+    attempted_cancel_ids: &BTreeSet<String>,
+    attempted_force_reset: bool,
+    serving_target: bool,
+) -> String {
+    let mut lines = vec![format!(
+        "container '{app}' remained blocked after {budget_secs}s (phase={phase}); unresolved operations: {}",
+        blocking_ops_summary(blocking, seen_at)
+    )];
+    if !attempted_cancel_ids.is_empty() {
+        lines.push(format!(
+            "automatic actions: attempted operation cancellation for {} op(s): {}",
+            attempted_cancel_ids.len(),
+            attempted_cancel_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else {
+        lines.push("automatic actions: no cancelable operations were found".to_string());
+    }
+    if attempted_force_reset {
+        lines.push(
+            "automatic actions: attempted forced container reset (force-stop/delete)".to_string(),
+        );
+    }
+    if serving_target {
+        lines.push(format!(
+            "automatic actions: skipped destructive reset because '{app}' is the currently serving instance; cutover must complete first"
+        ));
+    }
+    lines.push(format!("inspect: incus --project {project} operation list"));
+    for op in blocking {
+        lines.push(format!(
+            "inspect op {}: incus --project {project} operation show {}",
+            op.id, op.id
+        ));
+    }
+    lines.join("\n")
+}
+
+fn print_deploy_failure_footer(app: &str, attempt: u64, err: &str, retry_sleep_secs: u64) {
+    eprintln!("-----> Deploy attempt {attempt} failed for {app}");
+    eprintln!("       Cause: {err}");
+    eprintln!(
+        "       Auto-recovery: retrying in {retry_sleep_secs}s (use `psht logs {app}` or `psht health` to inspect)"
+    );
+}
+
 fn wait_for_container_operation_quiet(
     app: &str,
     project: &str,
     deploy_app: Option<&str>,
 ) -> Result<(), String> {
     let policy = busy_op_policy();
-    let wait_window =
-        Duration::from_millis(CONTAINER_OP_WAIT_CHECKS as u64 * CONTAINER_OP_WAIT_SLEEP_MS);
-    let reconcile_budget = Duration::from_secs(reconcile_budget_secs());
-    let takeover_sleep = Duration::from_millis(takeover_retry_ms());
+    let initial_wait_window =
+        Duration::from_millis(CONTAINER_OP_INITIAL_WAIT_CHECKS as u64 * CONTAINER_OP_WAIT_SLEEP_MS);
+    let recheck_window =
+        Duration::from_millis(CONTAINER_OP_RECHECK_WAIT_CHECKS as u64 * CONTAINER_OP_WAIT_SLEEP_MS);
+    let wait_sleep = Duration::from_millis(CONTAINER_OP_WAIT_SLEEP_MS);
+    let reconcile_budget = Duration::from_secs(blocked_op_budget_secs());
+    let takeover_sleep = Duration::from_millis(takeover_retry_ms().max(CONTAINER_OP_WAIT_SLEEP_MS));
     let max_cancel_per_cycle = takeover_max_cancel_per_cycle();
     let started = Instant::now();
     let mut seen_at: HashMap<String, Instant> = HashMap::new();
     let mut canceled_ids: BTreeMap<String, usize> = BTreeMap::new();
+    let mut attempted_cancel_ids: BTreeSet<String> = BTreeSet::new();
     let mut announced_wait = false;
+    let mut last_heartbeat = Duration::from_secs(0);
+    let mut phase = "waiting";
+    let mut force_reset_attempted = false;
+    let mut warned_active_target = false;
     loop {
         if let Some(deploy_app) = deploy_app {
             check_deploy_interrupt(deploy_app, "waiting for active container operation")?;
@@ -3301,6 +3427,7 @@ fn wait_for_container_operation_quiet(
             }
             return Ok(());
         }
+
         let now = Instant::now();
         for op in &blocking {
             seen_at.entry(op.id.clone()).or_insert(now);
@@ -3309,31 +3436,23 @@ fn wait_for_container_operation_quiet(
             eprintln!("       Waiting for active container operation to finish...");
             announced_wait = true;
         }
-
-        if started.elapsed() < wait_window {
-            thread::sleep(Duration::from_millis(CONTAINER_OP_WAIT_SLEEP_MS));
-            continue;
+        let elapsed = started.elapsed();
+        if elapsed
+            >= last_heartbeat.saturating_add(Duration::from_secs(CONTAINER_OP_HEARTBEAT_SECS))
+        {
+            let ids = blocking
+                .iter()
+                .map(|op| op.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "       Blocked ({phase}, {}s/{}s): {ids}",
+                elapsed.as_secs(),
+                reconcile_budget.as_secs()
+            );
+            last_heartbeat = elapsed;
         }
 
-        let blocked_ops: Vec<serde_json::Value> = blocking
-            .iter()
-            .map(|op| {
-                let age_secs = seen_at
-                    .get(&op.id)
-                    .map(|seen| seen.elapsed().as_secs())
-                    .unwrap_or(0);
-                serde_json::json!({
-                    "id": op.id,
-                    "status": op.status,
-                    "status_code": op.status_code,
-                    "class": op.class,
-                    "description": op.description,
-                    "may_cancel": op.may_cancel,
-                    "age_secs": age_secs,
-                    "resources": op.resources,
-                })
-            })
-            .collect();
         update_reconcile_phase_from_lease(
             app,
             "Blocked",
@@ -3345,23 +3464,41 @@ fn wait_for_container_operation_quiet(
             "blocked",
             serde_json::json!({
                 "policy": format!("{policy:?}").to_ascii_lowercase(),
-                "blocking_ops": blocked_ops,
+                "phase": phase,
+                "blocking_ops": blocking_ops_json(&blocking, &seen_at),
             }),
         );
 
+        if elapsed < initial_wait_window {
+            phase = "waiting";
+            thread::sleep(wait_sleep);
+            continue;
+        }
+
         if policy == BusyOpPolicy::Diagnose {
-            return Err(format!(
-                "container '{app}' remains blocked by active operations after {}s (policy=diagnose); run `incus --project {project} operation list`",
-                wait_window.as_secs()
+            return Err(blocked_operation_error(
+                app,
+                project,
+                reconcile_budget.as_secs(),
+                phase,
+                &blocking,
+                &seen_at,
+                &attempted_cancel_ids,
+                force_reset_attempted,
+                target_is_currently_serving(app, deploy_app),
             ));
         }
 
         let mut canceled_this_cycle = Vec::new();
+        phase = "canceling";
         for op in &blocking {
             if canceled_this_cycle.len() >= max_cancel_per_cycle {
                 break;
             }
             if !op.may_cancel {
+                continue;
+            }
+            if !attempted_cancel_ids.insert(op.id.clone()) {
                 continue;
             }
             if let Err(err) = container::cancel_operation_in_project(project, &op.id) {
@@ -3392,23 +3529,61 @@ fn wait_for_container_operation_quiet(
                 }),
             );
             update_reconcile_phase_from_lease(app, "Reconciling", None);
+            thread::sleep(takeover_sleep);
+            continue;
         }
 
-        if started.elapsed() >= reconcile_budget {
-            let unresolved: Vec<String> = blocking
-                .iter()
-                .map(|op| {
-                    let age_secs = seen_at
-                        .get(&op.id)
-                        .map(|seen| seen.elapsed().as_secs())
-                        .unwrap_or(0);
-                    format!("{}(age={}s,cancelable={})", op.id, age_secs, op.may_cancel)
-                })
-                .collect();
-            return Err(format!(
-                "container '{app}' is still blocked after {}s; unresolved operations: {}",
+        if elapsed < initial_wait_window.saturating_add(recheck_window) {
+            phase = "rechecking";
+            thread::sleep(wait_sleep);
+            continue;
+        }
+
+        let serving_target = target_is_currently_serving(app, deploy_app);
+        if !force_reset_attempted && !serving_target {
+            phase = "force-reset";
+            force_reset_attempted = true;
+            if container::exists_in_project(app, project) {
+                let _ = container::exec_cmd(app, "tailscale down >/dev/null 2>&1 || true");
+                let _ =
+                    container::exec_cmd(app, "systemctl stop tailscaled >/dev/null 2>&1 || true");
+            }
+            if container::exists_in_project(app, project) {
+                if let Err(err) = container::force_stop_in_project(app, project) {
+                    eprintln!("       Warning: failed to force-stop container '{app}': {err}");
+                } else {
+                    eprintln!("       Requested force-stop for blocked container '{app}'");
+                }
+            }
+            if container::exists_in_project(app, project) {
+                if let Err(err) = container::delete_in_project(app, project) {
+                    eprintln!("       Warning: failed to delete blocked container '{app}': {err}");
+                } else {
+                    eprintln!("       Deleted blocked container '{app}' to unblock deploy");
+                }
+            }
+            thread::sleep(takeover_sleep);
+            continue;
+        }
+
+        if serving_target && !warned_active_target {
+            warned_active_target = true;
+            eprintln!(
+                "       Blocking operations target active instance '{app}'; waiting for cutover before destructive reset"
+            );
+        }
+
+        if elapsed >= reconcile_budget {
+            return Err(blocked_operation_error(
+                app,
+                project,
                 reconcile_budget.as_secs(),
-                unresolved.join(", ")
+                phase,
+                &blocking,
+                &seen_at,
+                &attempted_cancel_ids,
+                force_reset_attempted,
+                serving_target,
             ));
         }
 
@@ -4081,21 +4256,44 @@ pub fn deploy(
         "force": force,
     })
     .to_string();
-    let ctx = begin_reconcile_intent(app, "deploy", "git", &source_payload)?;
-    reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
-
-    let result = deploy_impl(app, git_ref, git_sha, force, &ctx);
-    let revision = parse_git_checkout_target(git_ref, git_sha)
-        .ok()
-        .and_then(|target| target.map(|target| target.sha))
-        .or_else(|| {
-            read_git_deploy_state(app)
-                .ok()
-                .flatten()
-                .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha))
-        });
-    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
-    result
+    let mut attempt: u64 = 0;
+    let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
+    loop {
+        attempt = attempt.saturating_add(1);
+        if attempt > 1 {
+            eprintln!("-----> Retrying deploy attempt {attempt}");
+        }
+        let ctx = match begin_reconcile_intent(app, "deploy", "git", &source_payload) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                thread::sleep(Duration::from_secs(retry_sleep_secs));
+                retry_sleep_secs =
+                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
+                continue;
+            }
+        };
+        reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
+        let result = deploy_impl(app, git_ref, git_sha, force, &ctx);
+        let revision = parse_git_checkout_target(git_ref, git_sha)
+            .ok()
+            .and_then(|target| target.map(|target| target.sha))
+            .or_else(|| {
+                read_git_deploy_state(app).ok().flatten().and_then(|state| {
+                    (state.status == GitDeployStatus::Success).then_some(state.sha)
+                })
+            });
+        complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                thread::sleep(Duration::from_secs(retry_sleep_secs));
+                retry_sleep_secs =
+                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
+            }
+        }
+    }
 }
 
 fn deploy_impl(
@@ -4188,15 +4386,40 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
         "force": force,
     })
     .to_string();
-    let ctx = begin_reconcile_intent(app, "push", "tar-stdin", &source_payload)?;
-    reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
-    let result = push_impl(app, force, &ctx);
-    let revision = read_git_deploy_state(app)
-        .ok()
-        .flatten()
-        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
-    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
-    result
+    let mut attempt: u64 = 0;
+    let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
+    loop {
+        attempt = attempt.saturating_add(1);
+        if attempt > 1 {
+            eprintln!("-----> Retrying deploy attempt {attempt}");
+        }
+        let ctx = match begin_reconcile_intent(app, "push", "tar-stdin", &source_payload) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                thread::sleep(Duration::from_secs(retry_sleep_secs));
+                retry_sleep_secs =
+                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
+                continue;
+            }
+        };
+        reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
+        let result = push_impl(app, force, &ctx);
+        let revision = read_git_deploy_state(app)
+            .ok()
+            .flatten()
+            .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
+        complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
+                thread::sleep(Duration::from_secs(retry_sleep_secs));
+                retry_sleep_secs =
+                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
+            }
+        }
+    }
 }
 
 fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(), String> {
@@ -4337,7 +4560,16 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     eprintln!("-----> Preparing candidate container");
     eprintln!("       Candidate: {candidate_app}");
     eprintln!("       Traffic remains on current container");
-    wait_for_container_operation_quiet(&old_active_app, &current_project, Some(app))?;
+    if let Err(err) =
+        wait_for_container_operation_quiet(&old_active_app, &current_project, Some(app))
+    {
+        if target_is_currently_serving(&old_active_app, Some(app)) {
+            eprintln!("       Active container is blocked; proceeding with cutover-first recovery");
+            eprintln!("       Details: {err}");
+        } else {
+            return Err(err);
+        }
+    }
     check_deploy_interrupt(app, "candidate preparation")?;
 
     let build_candidate_result = (|| -> Result<(), String> {

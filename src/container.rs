@@ -634,12 +634,32 @@ pub fn stop(app: &str) -> Result<(), String> {
     incus().arg("stop").arg(container_name(app)).run()
 }
 
+pub fn force_stop_in_project(app: &str, project: &str) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("stop")
+        .arg(container_name(app))
+        .arg("--force")
+        .run()
+}
+
 pub fn start(app: &str) -> Result<(), String> {
     incus().arg("start").arg(container_name(app)).run()
 }
 
 pub fn delete(app: &str) -> Result<(), String> {
     incus().arg("delete").arg(container_name(app)).run()
+}
+
+pub fn delete_in_project(app: &str, project: &str) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("delete")
+        .arg(container_name(app))
+        .arg("--force")
+        .run()
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
@@ -836,6 +856,18 @@ pub fn publish_setup_image_in_project(
 
 pub fn exists(app: &str) -> bool {
     incus()
+        .arg("info")
+        .arg(container_name(app))
+        .build()
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn exists_in_project(app: &str, project: &str) -> bool {
+    incus()
+        .arg("--project")
+        .arg(project)
         .arg("info")
         .arg(container_name(app))
         .build()
