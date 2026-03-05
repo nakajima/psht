@@ -664,7 +664,12 @@ fn prompt_tty(prompt: &str) -> Result<String, String> {
 fn parse_tailscale_dns_name(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let name = value.pointer("/Self/DNSName")?.as_str()?;
-    Some(name.trim_end_matches('.').to_string())
+    let trimmed = name.trim().trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -870,6 +875,16 @@ fn track_owned_tailscale_device(
     created_via: &str,
 ) -> Result<Option<String>, String> {
     let snapshot = read_tailscale_self_snapshot(container_app)?;
+    if snapshot
+        .dns_name
+        .as_deref()
+        .map(str::trim)
+        .map(|dns| dns.is_empty())
+        .unwrap_or(true)
+    {
+        return Ok(None);
+    }
+
     let mut device_id = snapshot.device_id.clone();
     if device_id.is_none() {
         device_id = resolve_tailscale_device_id_from_tailnet(&snapshot)?;
@@ -1090,21 +1105,30 @@ where
 {
     let started = Instant::now();
     let retry_sleep = Duration::from_millis(TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS);
+    let total_timeout = Duration::from_secs(TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS);
+    let state_timeout = Duration::from_secs(TAILSCALE_STATE_GRACE_TIMEOUT_SECS);
     let total_attempt_budget =
         retry_attempt_budget(TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS, retry_sleep);
     let state_attempt_budget =
         retry_attempt_budget(TAILSCALE_STATE_GRACE_TIMEOUT_SECS, retry_sleep)
             .min(total_attempt_budget);
+    let mut attempt: u64 = 0;
     let mut switched_to_auth_phase = false;
     let mut last_observation = "no hostname observation yet".to_string();
 
-    for attempt in 1..=total_attempt_budget {
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= total_timeout || attempt >= total_attempt_budget {
+            break;
+        }
+        attempt = attempt.saturating_add(1);
+
         eprintln!(
             "       Acquiring exact tailscale hostname (attempt {attempt}, {}s elapsed)",
-            started.elapsed().as_secs()
+            elapsed.as_secs()
         );
 
-        let in_state_phase = attempt <= state_attempt_budget;
+        let in_state_phase = elapsed < state_timeout && attempt <= state_attempt_budget;
         if !in_state_phase && !switched_to_auth_phase {
             switched_to_auth_phase = true;
             eprintln!(
@@ -1179,9 +1203,7 @@ where
 
     Err(format!(
         "failed to acquire exact tailscale hostname '{app}' within {}s (state grace: {}s, attempts: {}); last observation: {last_observation}",
-        TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS,
-        TAILSCALE_STATE_GRACE_TIMEOUT_SECS,
-        total_attempt_budget
+        TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS, TAILSCALE_STATE_GRACE_TIMEOUT_SECS, attempt
     ))
 }
 
@@ -1195,7 +1217,12 @@ fn acquire_exact_tailscale_hostname_for_deploy(
         |container, machine_name| {
             check_deploy_interrupt(app, "tailscale exact-hostname acquisition")?;
             let name = tailscale::join_with_state_in_container(container, machine_name)?;
-            if let Err(track_err) = track_owned_tailscale_device(app, container, "state") {
+            if name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|dns| !dns.is_empty())
+                && let Err(track_err) = track_owned_tailscale_device(app, container, "state")
+            {
                 eprintln!("       Warning: failed to track tailscale state device: {track_err}");
             }
             Ok(name)
@@ -1216,7 +1243,14 @@ fn acquire_exact_tailscale_hostname_for_deploy(
             }
 
             let name = tailscale::join_with_auth_key_in_container(container, machine_name)?;
-            let _ = track_owned_tailscale_device(app, container, "auth_key")?;
+            if name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|dns| !dns.is_empty())
+                && let Err(track_err) = track_owned_tailscale_device(app, container, "auth_key")
+            {
+                eprintln!("       Warning: failed to track tailscale auth-key device: {track_err}");
+            }
             Ok(name)
         },
         |container| {
@@ -8124,6 +8158,12 @@ devices:
             parse_tailscale_dns_name(json),
             Some("psht.tailnet.ts.net".to_string())
         );
+    }
+
+    #[test]
+    fn parse_tailscale_dns_name_ignores_empty() {
+        let json = r#"{"Self":{"DNSName":""}}"#;
+        assert!(parse_tailscale_dns_name(json).is_none());
     }
 
     #[test]

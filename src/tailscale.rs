@@ -65,7 +65,12 @@ fn parse_oauth_token(json: &str) -> Result<String, String> {
 fn parse_self_dns_name(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let name = value["Self"]["DNSName"].as_str()?;
-    Some(name.trim_end_matches('.').to_string())
+    let trimmed = name.trim().trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn parse_backend_state(json: &str) -> Option<String> {
@@ -155,15 +160,32 @@ fn parse_tailnet_device(value: &serde_json::Value) -> Option<TailnetDevice> {
 fn parse_tailnet_devices(json: &str) -> Result<Vec<TailnetDevice>, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("failed to parse tailscale device list response: {e}"))?;
-    let candidates = match &value {
-        serde_json::Value::Array(items) => items,
-        serde_json::Value::Object(obj) => obj
-            .get("devices")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "missing devices array in tailscale device list response".to_string())?,
-        _ => {
-            return Err("invalid tailscale device list response".to_string());
+    let candidates: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(obj) => {
+            let mut resolved: Option<Vec<&serde_json::Value>> = None;
+            for key in ["devices", "nodes", "machines"] {
+                if let Some(items) = obj.get(key).and_then(serde_json::Value::as_array) {
+                    resolved = Some(items.iter().collect());
+                    break;
+                }
+                if let Some(items) = obj.get(key).and_then(serde_json::Value::as_object) {
+                    resolved = Some(items.values().collect());
+                    break;
+                }
+            }
+            if let Some(items) = resolved {
+                items
+            } else if parse_tailnet_device(&value).is_some() {
+                vec![&value]
+            } else {
+                return Err(
+                    "missing supported device list key in tailscale device list response"
+                        .to_string(),
+                );
+            }
         }
+        _ => return Err("invalid tailscale device list response".to_string()),
     };
 
     let mut out = Vec::new();
@@ -513,6 +535,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_self_dns_name_empty_is_none() {
+        let json = r#"{"Self":{"DNSName":""}}"#;
+        assert!(parse_self_dns_name(json).is_none());
+    }
+
+    #[test]
     fn parse_backend_state_from_status() {
         let json = r#"{"BackendState":"Running","Self":{"DNSName":"psht-test.tail1234.ts.net."}}"#;
         assert_eq!(parse_backend_state(json).as_deref(), Some("Running"));
@@ -588,5 +616,22 @@ mod tests {
             devices[0].dns_name.as_deref(),
             Some("hyperlinked.tail.ts.net")
         );
+    }
+
+    #[test]
+    fn parse_tailnet_devices_nodes_response() {
+        let json = r#"{
+          "nodes": [
+            {
+              "id": "node-9",
+              "hostname": "hyperlinked",
+              "name": "hyperlinked.tail.ts.net."
+            }
+          ]
+        }"#;
+        let devices = parse_tailnet_devices(json).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "node-9");
+        assert_eq!(devices[0].hostname_label.as_deref(), Some("hyperlinked"));
     }
 }

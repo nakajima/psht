@@ -39,11 +39,11 @@ Check to see how apps are doing.
 
 ## on ur local computer, after u set up the server
 
-```sh
-$ ssh psht@<host> setup | sh
-```
+Install `psht` from the latest release (same version as your server is recommended), then configure your project host in `~/.psht/config.toml`:
 
-This will set up the `psht` cli on your computer.
+```toml
+host = "<host>"
+```
 
 ### client commands
 
@@ -79,12 +79,23 @@ Set environment variables for the app.
 
 #### `psht update`
 
-Update the `psht` cli to whatever is on the server.
+Fetch update metadata from the server and update your local `psht` CLI natively in Rust.
 
 ## other stuff
 
 Use `psht deploy --force` to force a deploy even when the binary payload hash is unchanged.
 For git projects, `psht deploy` now verifies the last successful deploy when `git push` is up to date, and retries automatically if the last attempt failed.
+`psht deploy` now runs as an auto-recovery loop: it keeps retrying until deploy succeeds.
+
+When a deploy is blocked by Incus operations, psht now uses a fixed escalation path:
+
+1. wait briefly
+2. cancel blocking operations
+3. recheck
+4. for any non-cancelable blocking op, force-stop + delete the blocked non-serving target instance, then continue
+
+Blocked-operation recovery uses a default 15-second budget per cycle.
+You can override this with `PSHT_BLOCKED_OP_BUDGET_SECS`.
 
 `psht.toml` (project root) is used for release deploys and optional deploy hooks:
 
