@@ -54,7 +54,6 @@ const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
 const TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS: u64 = 120;
-const TAILSCALE_STATE_GRACE_TIMEOUT_SECS: u64 = 30;
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 const DEPLOY_INTERRUPT_WAIT_POLL_MS: u64 = 1000;
@@ -1088,6 +1087,10 @@ fn reset_tailscale_for_retry(container_app: &str) -> Result<(), String> {
     )
 }
 
+fn state_join_requires_auth_key(state_err: &str) -> bool {
+    state_err.contains("tailscale state requires login")
+}
+
 fn retry_attempt_budget(timeout_secs: u64, retry_sleep: Duration) -> u64 {
     let sleep_ms = retry_sleep.as_millis().max(1);
     let timeout_ms = u128::from(timeout_secs).saturating_mul(1000);
@@ -1121,14 +1124,10 @@ where
     let started = Instant::now();
     let retry_sleep = Duration::from_millis(TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS);
     let total_timeout = Duration::from_secs(TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS);
-    let state_timeout = Duration::from_secs(TAILSCALE_STATE_GRACE_TIMEOUT_SECS);
     let total_attempt_budget =
         retry_attempt_budget(TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS, retry_sleep);
-    let state_attempt_budget =
-        retry_attempt_budget(TAILSCALE_STATE_GRACE_TIMEOUT_SECS, retry_sleep)
-            .min(total_attempt_budget);
     let mut attempt: u64 = 0;
-    let mut switched_to_auth_phase = false;
+    let mut in_auth_phase = false;
     let mut last_observation = "no hostname observation yet".to_string();
     let mut last_logged_cleanup_lookup_error: Option<String> = None;
 
@@ -1144,24 +1143,18 @@ where
             elapsed.as_secs()
         );
 
-        let in_state_phase = elapsed < state_timeout && attempt <= state_attempt_budget;
-        if !in_state_phase && !switched_to_auth_phase {
-            switched_to_auth_phase = true;
-            eprintln!(
-                "       State-based hostname recovery timed out after {}s; switching to auth-key recovery",
-                TAILSCALE_STATE_GRACE_TIMEOUT_SECS
-            );
-            if let Err(reset_err) = reset_for_retry(container_app) {
-                eprintln!("       Warning: failed to reset tailscale before fallback: {reset_err}");
-            }
-        }
-
-        let join_attempt = if in_state_phase {
+        let join_attempt = if !in_auth_phase {
             match join_with_state(container_app, app) {
                 Ok(attempt) => attempt,
                 Err(state_err) => {
                     last_observation = format!("state join failed: {state_err}");
                     eprintln!("       State-based tailscale join failed: {state_err}");
+                    if state_join_requires_auth_key(&state_err) {
+                        in_auth_phase = true;
+                        eprintln!(
+                            "       State-based tailscale state is unusable; switching to auth-key recovery"
+                        );
+                    }
                     if let Err(reset_err) = reset_for_retry(container_app) {
                         eprintln!(
                             "       Warning: failed to reset tailscale before retry: {reset_err}"
@@ -1188,7 +1181,7 @@ where
             }
         };
         let name = join_attempt.dns_name;
-        let active_cleanup_lookup_error = if !in_state_phase {
+        let active_cleanup_lookup_error = if in_auth_phase {
             let active_cleanup_lookup_error = join_attempt.cleanup_lookup_error;
             if let Some(err) = active_cleanup_lookup_error.as_deref() {
                 if last_logged_cleanup_lookup_error.as_deref() != Some(err) {
@@ -1210,7 +1203,7 @@ where
         let Some(dns_name) = name.as_deref() else {
             last_observation = "tailscale DNS name unavailable".to_string();
             eprintln!("       Tailscale DNS name unavailable yet; retrying");
-            if !in_state_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
+            if in_auth_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
                 return Err(format!(
                     "failed to acquire exact tailscale hostname '{app}' after auth-key join because ownership cleanup was unavailable: {err}; observed dns: unavailable"
                 ));
@@ -1224,7 +1217,7 @@ where
             eprintln!(
                 "       Hostname mismatch: got '{dns_name}', expected label '{app}'. Retrying..."
             );
-            if !in_state_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
+            if in_auth_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
                 return Err(format!(
                     "failed to acquire exact tailscale hostname '{app}' after auth-key join because ownership cleanup was unavailable: {err}; observed dns: {dns_name}"
                 ));
@@ -1247,8 +1240,8 @@ where
     }
 
     Err(format!(
-        "failed to acquire exact tailscale hostname '{app}' within {}s (state grace: {}s, attempts: {}); last observation: {last_observation}",
-        TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS, TAILSCALE_STATE_GRACE_TIMEOUT_SECS, attempt
+        "failed to acquire exact tailscale hostname '{app}' within {}s (attempts: {}); last observation: {last_observation}",
+        TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS, attempt
     ))
 }
 
@@ -8288,7 +8281,8 @@ devices:
     }
 
     #[test]
-    fn acquire_exact_tailscale_hostname_falls_back_to_auth_key_when_state_fails() {
+    fn acquire_exact_tailscale_hostname_falls_back_to_auth_key_immediately_when_state_requires_login(
+    ) {
         let mut state_calls = 0usize;
         let mut auth_calls = 0usize;
         let mut reset_calls = 0usize;
@@ -8299,7 +8293,7 @@ devices:
             "hyperlinked",
             |_container, _app| {
                 state_calls += 1;
-                Err("state unavailable".to_string())
+                Err("tailscale state requires login (state: NeedsLogin)".to_string())
             },
             |_container, _app| {
                 auth_calls += 1;
@@ -8319,12 +8313,44 @@ devices:
         .unwrap();
 
         assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
-        let retry_sleep = Duration::from_millis(TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS);
-        let state_budget = retry_attempt_budget(TAILSCALE_STATE_GRACE_TIMEOUT_SECS, retry_sleep);
-        assert_eq!(state_calls as u64, state_budget);
+        assert_eq!(state_calls, 1);
         assert_eq!(auth_calls, 1);
-        assert_eq!(reset_calls as u64, state_budget + 1);
-        assert_eq!(sleep_calls as u64, state_budget);
+        assert_eq!(reset_calls, 1);
+        assert_eq!(sleep_calls, 1);
+    }
+
+    #[test]
+    fn acquire_exact_tailscale_hostname_stays_on_auth_key_after_state_requires_login() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut auth_results = std::collections::VecDeque::from([
+            Ok(Some("hyperlinked-1.tail.ts.net".to_string())),
+            Ok(Some("hyperlinked.tail.ts.net".to_string())),
+        ]);
+
+        let name = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Err("tailscale state requires login (state: NoState)".to_string())
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                auth_results
+                    .pop_front()
+                    .expect("auth result should exist for each auth attempt")
+                    .map(TailscaleJoinAttempt::from_dns_name)
+            },
+            |_container| Ok(()),
+            |_container| Ok(()),
+            |_duration| {},
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 2);
     }
 
     #[test]
@@ -8337,7 +8363,7 @@ devices:
             "hyperlinked",
             |_container, _app| {
                 state_calls += 1;
-                Err("state unavailable".to_string())
+                Err("tailscale state requires login (state: NeedsLogin)".to_string())
             },
             |_container, _app| {
                 auth_calls += 1;
@@ -8354,7 +8380,7 @@ devices:
 
         assert!(err.contains("ownership cleanup was unavailable"));
         assert!(err.contains("hyperlinked-1.tail.ts.net"));
-        assert!(state_calls > 0);
+        assert_eq!(state_calls, 1);
         assert_eq!(auth_calls, 1);
     }
 

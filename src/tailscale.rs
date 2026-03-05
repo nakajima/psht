@@ -387,7 +387,7 @@ fn join_with_up_command(container_app: &str, up_command: &str) -> Result<Option<
     let ts_hostname = dns_name_in_container(container_app);
     match ts_hostname {
         Some(ref name) => eprintln!("       Joined tailnet as {name}"),
-        None => eprintln!("       Joined tailnet"),
+        None => eprintln!("       Joined tailnet; DNS name unavailable yet"),
     }
 
     Ok(ts_hostname)
@@ -427,7 +427,7 @@ pub fn join_with_state_in_container(
     let ts_hostname = dns_name_in_container(container_app);
     match ts_hostname {
         Some(ref name) => eprintln!("       Joined tailnet as {name}"),
-        None => eprintln!("       Joined tailnet"),
+        None => eprintln!("       State-based tailscale recovery has no DNS name yet"),
     }
 
     Ok(ts_hostname)
