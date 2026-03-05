@@ -3299,6 +3299,7 @@ fn blocking_ops_json(
                 "may_cancel": op.may_cancel,
                 "age_secs": blocking_op_age_secs(seen_at, &op.id),
                 "resources": op.resources,
+                "instance_names": op.instance_names,
             })
         })
         .collect()
@@ -3312,26 +3313,45 @@ fn blocking_ops_summary(
         .iter()
         .map(|op| {
             format!(
-                "{}(class={},age={}s,cancelable={})",
+                "{}(class={},age={}s,cancelable={},targets={})",
                 op.id,
                 op.class,
                 blocking_op_age_secs(seen_at, &op.id),
-                op.may_cancel
+                op.may_cancel,
+                if op.instance_names.is_empty() {
+                    "[]".to_string()
+                } else {
+                    op.instance_names.join("|")
+                }
             )
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn target_is_currently_serving(target_app: &str, deploy_app: Option<&str>) -> bool {
+fn target_is_currently_serving(target: &str, deploy_app: Option<&str>) -> bool {
     let Some(deploy_app) = deploy_app else {
         return false;
     };
-    resolve_active_app_ref(deploy_app)
-        .ok()
-        .flatten()
-        .map(|active| active == target_app)
+    let Some(active_app_ref) = resolve_active_app_ref(deploy_app).ok().flatten() else {
+        return false;
+    };
+    if active_app_ref == target {
+        return true;
+    }
+    if instance_name_from_app_ref(&active_app_ref) == target {
+        return true;
+    }
+    app_ref_from_instance_name(target)
+        .map(|target_ref| target_ref == active_app_ref)
         .unwrap_or(false)
+}
+
+fn blocking_op_targets(op: &container::BlockingOperation, fallback_app_ref: &str) -> Vec<String> {
+    if !op.instance_names.is_empty() {
+        return op.instance_names.clone();
+    }
+    vec![instance_name_from_app_ref(fallback_app_ref)]
 }
 
 fn blocked_operation_error(
@@ -3342,8 +3362,8 @@ fn blocked_operation_error(
     blocking: &[container::BlockingOperation],
     seen_at: &HashMap<String, Instant>,
     attempted_cancel_ids: &BTreeSet<String>,
-    attempted_force_reset: bool,
-    serving_target: bool,
+    forced_actions: &[String],
+    skipped_actions: &[String],
 ) -> String {
     let mut lines = vec![format!(
         "container '{app}' remained blocked after {budget_secs}s (phase={phase}); unresolved operations: {}",
@@ -3362,14 +3382,19 @@ fn blocked_operation_error(
     } else {
         lines.push("automatic actions: no cancelable operations were found".to_string());
     }
-    if attempted_force_reset {
-        lines.push(
-            "automatic actions: attempted forced container reset (force-stop/delete)".to_string(),
-        );
-    }
-    if serving_target {
+    if forced_actions.is_empty() {
+        lines
+            .push("automatic actions: no forced target-instance resets were performed".to_string());
+    } else {
         lines.push(format!(
-            "automatic actions: skipped destructive reset because '{app}' is the currently serving instance; cutover must complete first"
+            "automatic actions: forced target-instance resets: {}",
+            forced_actions.join(" | ")
+        ));
+    }
+    if !skipped_actions.is_empty() {
+        lines.push(format!(
+            "automatic actions: skipped actions: {}",
+            skipped_actions.join(" | ")
         ));
     }
     lines.push(format!("inspect: incus --project {project} operation list"));
@@ -3408,11 +3433,12 @@ fn wait_for_container_operation_quiet(
     let mut seen_at: HashMap<String, Instant> = HashMap::new();
     let mut canceled_ids: BTreeMap<String, usize> = BTreeMap::new();
     let mut attempted_cancel_ids: BTreeSet<String> = BTreeSet::new();
+    let mut attempted_force_targets: BTreeSet<String> = BTreeSet::new();
+    let mut forced_actions = Vec::new();
+    let mut skipped_actions = Vec::new();
     let mut announced_wait = false;
     let mut last_heartbeat = Duration::from_secs(0);
     let mut phase = "waiting";
-    let mut force_reset_attempted = false;
-    let mut warned_active_target = false;
     loop {
         if let Some(deploy_app) = deploy_app {
             check_deploy_interrupt(deploy_app, "waiting for active container operation")?;
@@ -3484,8 +3510,8 @@ fn wait_for_container_operation_quiet(
                 &blocking,
                 &seen_at,
                 &attempted_cancel_ids,
-                force_reset_attempted,
-                target_is_currently_serving(app, deploy_app),
+                &forced_actions,
+                &skipped_actions,
             ));
         }
 
@@ -3539,38 +3565,82 @@ fn wait_for_container_operation_quiet(
             continue;
         }
 
-        let serving_target = target_is_currently_serving(app, deploy_app);
-        if !force_reset_attempted && !serving_target {
-            phase = "force-reset";
-            force_reset_attempted = true;
-            if container::exists_in_project(app, project) {
-                let _ = container::exec_cmd(app, "tailscale down >/dev/null 2>&1 || true");
-                let _ =
-                    container::exec_cmd(app, "systemctl stop tailscaled >/dev/null 2>&1 || true");
+        phase = "force-reset";
+        let mut forced_this_cycle = Vec::new();
+        for op in &blocking {
+            if op.may_cancel {
+                continue;
             }
-            if container::exists_in_project(app, project) {
-                if let Err(err) = container::force_stop_in_project(app, project) {
-                    eprintln!("       Warning: failed to force-stop container '{app}': {err}");
-                } else {
-                    eprintln!("       Requested force-stop for blocked container '{app}'");
+            let targets = blocking_op_targets(op, app);
+            if op.instance_names.is_empty() {
+                skipped_actions.push(format!(
+                    "op {} had no parsed target; using fallback target {}",
+                    op.id, targets[0]
+                ));
+            }
+            for target_instance in targets {
+                if !attempted_force_targets.insert(target_instance.clone()) {
+                    continue;
                 }
-            }
-            if container::exists_in_project(app, project) {
-                if let Err(err) = container::delete_in_project(app, project) {
-                    eprintln!("       Warning: failed to delete blocked container '{app}': {err}");
-                } else {
-                    eprintln!("       Deleted blocked container '{app}' to unblock deploy");
+                if target_is_currently_serving(&target_instance, deploy_app) {
+                    let reason = format!(
+                        "skipped reset for serving target {target_instance} (op {})",
+                        op.id
+                    );
+                    skipped_actions.push(reason.clone());
+                    eprintln!("       {reason}; cutover must finish before destructive cleanup");
+                    continue;
                 }
+                let mut action_steps = Vec::new();
+                if container::exists_instance_in_project(&target_instance, project) {
+                    let _ = container::exec_cmd_in_instance_project(
+                        &target_instance,
+                        project,
+                        "tailscale down >/dev/null 2>&1 || true",
+                    );
+                    let _ = container::exec_cmd_in_instance_project(
+                        &target_instance,
+                        project,
+                        "systemctl stop tailscaled >/dev/null 2>&1 || true",
+                    );
+                    match container::force_stop_instance_in_project(&target_instance, project) {
+                        Ok(()) => action_steps.push("force-stop ok".to_string()),
+                        Err(err) => action_steps.push(format!("force-stop failed: {err}")),
+                    }
+                    match container::delete_instance_in_project(&target_instance, project) {
+                        Ok(()) => action_steps.push("delete ok".to_string()),
+                        Err(err) => action_steps.push(format!("delete failed: {err}")),
+                    }
+                } else {
+                    action_steps.push("target already absent".to_string());
+                }
+                let action_record = format!(
+                    "{} (op {}): {}",
+                    target_instance,
+                    op.id,
+                    action_steps.join("; ")
+                );
+                forced_this_cycle.push(action_record.clone());
+                forced_actions.push(action_record);
             }
+        }
+        if !forced_this_cycle.is_empty() {
+            eprintln!(
+                "       Requested forced reset for {} target instance(s)",
+                forced_this_cycle.len()
+            );
+            append_reconcile_attempt_record(
+                app,
+                "wait-for-container-operation",
+                "takeover",
+                serde_json::json!({
+                    "policy": format!("{policy:?}").to_ascii_lowercase(),
+                    "forced_targets": forced_this_cycle,
+                }),
+            );
+            update_reconcile_phase_from_lease(app, "Reconciling", None);
             thread::sleep(takeover_sleep);
             continue;
-        }
-
-        if serving_target && !warned_active_target {
-            warned_active_target = true;
-            eprintln!(
-                "       Blocking operations target active instance '{app}'; waiting for cutover before destructive reset"
-            );
         }
 
         if elapsed >= reconcile_budget {
@@ -3582,8 +3652,8 @@ fn wait_for_container_operation_quiet(
                 &blocking,
                 &seen_at,
                 &attempted_cancel_ids,
-                force_reset_attempted,
-                serving_target,
+                &forced_actions,
+                &skipped_actions,
             ));
         }
 

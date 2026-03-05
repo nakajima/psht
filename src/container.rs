@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -73,6 +73,7 @@ pub struct BlockingOperation {
     pub description: String,
     pub may_cancel: bool,
     pub resources: Vec<String>,
+    pub instance_names: Vec<String>,
 }
 
 pub struct IncusCommand {
@@ -634,32 +635,12 @@ pub fn stop(app: &str) -> Result<(), String> {
     incus().arg("stop").arg(container_name(app)).run()
 }
 
-pub fn force_stop_in_project(app: &str, project: &str) -> Result<(), String> {
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("stop")
-        .arg(container_name(app))
-        .arg("--force")
-        .run()
-}
-
 pub fn start(app: &str) -> Result<(), String> {
     incus().arg("start").arg(container_name(app)).run()
 }
 
 pub fn delete(app: &str) -> Result<(), String> {
     incus().arg("delete").arg(container_name(app)).run()
-}
-
-pub fn delete_in_project(app: &str, project: &str) -> Result<(), String> {
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("delete")
-        .arg(container_name(app))
-        .arg("--force")
-        .run()
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
@@ -864,21 +845,82 @@ pub fn exists(app: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn exists_in_project(app: &str, project: &str) -> bool {
+pub fn exists_instance_in_project(instance_name: &str, project: &str) -> bool {
     incus()
         .arg("--project")
         .arg(project)
         .arg("info")
-        .arg(container_name(app))
+        .arg(instance_name)
         .build()
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
+pub fn force_stop_instance_in_project(instance_name: &str, project: &str) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("stop")
+        .arg(instance_name)
+        .arg("--force")
+        .run()
+}
+
+pub fn delete_instance_in_project(instance_name: &str, project: &str) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("delete")
+        .arg(instance_name)
+        .arg("--force")
+        .run()
+}
+
+pub fn exec_cmd_in_instance_project(
+    instance_name: &str,
+    project: &str,
+    cmd: &str,
+) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("exec")
+        .arg(instance_name)
+        .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
+        .run()
+}
+
+fn instance_name_from_resource(resource: &str) -> Option<String> {
+    let trimmed = resource.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = trimmed
+        .split('?')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let suffix = if let Some(v) = path.strip_prefix("/1.0/instances/") {
+        v
+    } else if let Some(v) = path.strip_prefix("/1.0/containers/") {
+        v
+    } else {
+        return None;
+    };
+    let name = suffix.split('/').next().unwrap_or("").trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 fn operation_resource_matches_container(resource: &str, container_name: &str) -> bool {
-    resource.contains(&format!("/instances/{container_name}"))
-        || resource.contains(&format!("/containers/{container_name}"))
+    matches!(
+        instance_name_from_resource(resource).as_deref(),
+        Some(name) if name == container_name
+    )
 }
 
 fn operation_id(op: &OperationInfo) -> Option<String> {
@@ -912,10 +954,14 @@ fn blocking_operations_in(
             continue;
         }
         let mut matched_resources = Vec::new();
+        let mut matched_instances = BTreeSet::new();
         for resources in op.resources.values() {
             for resource in resources {
                 if operation_resource_matches_container(resource, container_name) {
                     matched_resources.push(resource.to_string());
+                    if let Some(instance_name) = instance_name_from_resource(resource) {
+                        matched_instances.insert(instance_name);
+                    }
                 }
             }
         }
@@ -937,6 +983,7 @@ fn blocking_operations_in(
             description: op.description,
             may_cancel: op.may_cancel,
             resources: matched_resources,
+            instance_names: matched_instances.into_iter().collect(),
         });
     }
     Ok(blocking)
@@ -1479,6 +1526,22 @@ mod tests {
     }
 
     #[test]
+    fn instance_name_from_resource_extracts_instances_and_containers() {
+        assert_eq!(
+            instance_name_from_resource("/1.0/instances/psht-demo?project=user-1001").as_deref(),
+            Some("psht-demo")
+        );
+        assert_eq!(
+            instance_name_from_resource("/1.0/containers/psht-demo/").as_deref(),
+            Some("psht-demo")
+        );
+        assert_eq!(
+            instance_name_from_resource("/1.0/networks/br0").as_deref(),
+            None
+        );
+    }
+
+    #[test]
     fn has_running_operation_in_detects_busy_container() {
         let json = r#"[{
   "id":"op-1",
@@ -1518,6 +1581,7 @@ mod tests {
         assert_eq!(ops[0].id, "7f4f3e8d");
         assert!(ops[0].may_cancel);
         assert_eq!(ops[0].class, "task");
+        assert_eq!(ops[0].instance_names, vec!["psht-demo"]);
     }
 
     #[test]
