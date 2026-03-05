@@ -7248,6 +7248,30 @@ pub fn tailscale_status(app: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn join_tailscale_for_repair_with_fallback<FStateJoin, FAuthJoin>(
+    mut join_with_state: FStateJoin,
+    mut join_with_auth_key: FAuthJoin,
+) -> Result<(Option<String>, &'static str), String>
+where
+    FStateJoin: FnMut() -> Result<Option<String>, String>,
+    FAuthJoin: FnMut() -> Result<Option<String>, String>,
+{
+    match join_with_state() {
+        Ok(Some(name)) => Ok((Some(name), "state")),
+        Ok(None) => {
+            eprintln!(
+                "       State-based tailscale recovery produced no DNS name; falling back to auth-key tailscale join"
+            );
+            Ok((join_with_auth_key()?, "auth_key"))
+        }
+        Err(state_err) => {
+            eprintln!("       State-based tailscale join failed: {state_err}");
+            eprintln!("       Falling back to auth-key tailscale join");
+            Ok((join_with_auth_key()?, "auth_key"))
+        }
+    }
+}
+
 pub fn tailscale_up(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let active_app = resolve_active_app_for_tailscale(app)?;
@@ -7270,30 +7294,22 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
         &tailscale_state_volume,
     )?;
     container::ensure_tailscale_state_mount(&active_app, &tailscale_pool, &tailscale_state_volume)?;
-    let (tailnet_hostname, created_via) =
-        match tailscale::join_with_state_in_container(&active_app, app) {
-            Ok(name) => (name, "state"),
-            Err(state_err) => {
-                eprintln!("       State-based tailscale join failed: {state_err}");
-                eprintln!("       Falling back to auth-key tailscale join");
-                (
-                    tailscale::join_with_auth_key_in_container(&active_app, app)?,
-                    "auth_key",
-                )
-            }
-        };
+    let (tailnet_hostname, created_via) = join_tailscale_for_repair_with_fallback(
+        || tailscale::join_with_state_in_container(&active_app, app),
+        || tailscale::join_with_auth_key_in_container(&active_app, app),
+    )?;
     if let Err(track_err) = track_owned_tailscale_device(app, &active_app, created_via) {
         eprintln!("       Warning: failed to track tailscale device ownership: {track_err}");
-    }
-    let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
-    let port = allocate_port(app);
-    if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
-        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
     }
     let (_, _, health) =
         wait_for_tailscale_online(&active_app, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))?;
     if !health.is_empty() {
         eprintln!("       Warning: {}", health.join(" | "));
+    }
+    let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
+    let port = allocate_port(app);
+    if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
+        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
     }
     if let Some(ref name) = tailnet_hostname
         && !tailscale_hostname_is_exact(name, app)
@@ -8380,6 +8396,75 @@ devices:
 
         assert!(err.contains("ownership cleanup was unavailable"));
         assert!(err.contains("hyperlinked-1.tail.ts.net"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 1);
+    }
+
+    #[test]
+    fn join_tailscale_for_repair_with_fallback_prefers_state_with_dns_name() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+
+        let (name, created_via) = join_tailscale_for_repair_with_fallback(
+            || {
+                state_calls += 1;
+                Ok(Some("hyperlinked.tail.ts.net".to_string()))
+            },
+            || {
+                auth_calls += 1;
+                Ok(Some("unexpected.tail.ts.net".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(created_via, "state");
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 0);
+    }
+
+    #[test]
+    fn join_tailscale_for_repair_with_fallback_uses_auth_key_when_state_has_no_dns() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+
+        let (name, created_via) = join_tailscale_for_repair_with_fallback(
+            || {
+                state_calls += 1;
+                Ok(None)
+            },
+            || {
+                auth_calls += 1;
+                Ok(Some("hyperlinked.tail.ts.net".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(created_via, "auth_key");
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 1);
+    }
+
+    #[test]
+    fn join_tailscale_for_repair_with_fallback_uses_auth_key_when_state_errors() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+
+        let (name, created_via) = join_tailscale_for_repair_with_fallback(
+            || {
+                state_calls += 1;
+                Err("state unavailable".to_string())
+            },
+            || {
+                auth_calls += 1;
+                Ok(Some("hyperlinked.tail.ts.net".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(created_via, "auth_key");
         assert_eq!(state_calls, 1);
         assert_eq!(auth_calls, 1);
     }
