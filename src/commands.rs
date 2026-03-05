@@ -689,6 +689,21 @@ struct OwnedTailscaleCleanupResult {
     retired_device_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TailscaleJoinAttempt {
+    dns_name: Option<String>,
+    cleanup_lookup_error: Option<String>,
+}
+
+impl TailscaleJoinAttempt {
+    fn from_dns_name(dns_name: Option<String>) -> Self {
+        Self {
+            dns_name,
+            cleanup_lookup_error: None,
+        }
+    }
+}
+
 fn value_as_nonempty_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(raw) => {
@@ -1097,8 +1112,8 @@ fn acquire_exact_tailscale_hostname_with_retry<
     mut sleep: FSleep,
 ) -> Result<Option<String>, String>
 where
-    FStateJoin: FnMut(&str, &str) -> Result<Option<String>, String>,
-    FAuthJoin: FnMut(&str, &str) -> Result<Option<String>, String>,
+    FStateJoin: FnMut(&str, &str) -> Result<TailscaleJoinAttempt, String>,
+    FAuthJoin: FnMut(&str, &str) -> Result<TailscaleJoinAttempt, String>,
     FWaitHealthy: FnMut(&str) -> Result<(), String>,
     FReset: FnMut(&str) -> Result<(), String>,
     FSleep: FnMut(Duration),
@@ -1115,6 +1130,7 @@ where
     let mut attempt: u64 = 0;
     let mut switched_to_auth_phase = false;
     let mut last_observation = "no hostname observation yet".to_string();
+    let mut last_logged_cleanup_lookup_error: Option<String> = None;
 
     loop {
         let elapsed = started.elapsed();
@@ -1140,9 +1156,9 @@ where
             }
         }
 
-        let name = if in_state_phase {
+        let join_attempt = if in_state_phase {
             match join_with_state(container_app, app) {
-                Ok(name) => name,
+                Ok(attempt) => attempt,
                 Err(state_err) => {
                     last_observation = format!("state join failed: {state_err}");
                     eprintln!("       State-based tailscale join failed: {state_err}");
@@ -1157,7 +1173,7 @@ where
             }
         } else {
             match join_with_auth_key(container_app, app) {
-                Ok(name) => name,
+                Ok(attempt) => attempt,
                 Err(auth_err) => {
                     last_observation = format!("auth-key join failed: {auth_err}");
                     eprintln!("       Auth-key tailscale join failed: {auth_err}");
@@ -1171,10 +1187,34 @@ where
                 }
             }
         };
+        let name = join_attempt.dns_name;
+        let active_cleanup_lookup_error = if !in_state_phase {
+            let active_cleanup_lookup_error = join_attempt.cleanup_lookup_error;
+            if let Some(err) = active_cleanup_lookup_error.as_deref() {
+                if last_logged_cleanup_lookup_error.as_deref() != Some(err) {
+                    eprintln!(
+                        "       Warning: unable to inspect tailnet devices during auth-key recovery: {err}"
+                    );
+                    last_logged_cleanup_lookup_error = Some(err.to_string());
+                } else {
+                    eprintln!(
+                        "       Warning: tailnet device lookup still failing during auth-key recovery"
+                    );
+                }
+            }
+            active_cleanup_lookup_error
+        } else {
+            None
+        };
 
         let Some(dns_name) = name.as_deref() else {
             last_observation = "tailscale DNS name unavailable".to_string();
             eprintln!("       Tailscale DNS name unavailable yet; retrying");
+            if !in_state_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
+                return Err(format!(
+                    "failed to acquire exact tailscale hostname '{app}' after auth-key join because ownership cleanup was unavailable: {err}; observed dns: unavailable"
+                ));
+            }
             sleep(retry_sleep);
             continue;
         };
@@ -1184,6 +1224,11 @@ where
             eprintln!(
                 "       Hostname mismatch: got '{dns_name}', expected label '{app}'. Retrying..."
             );
+            if !in_state_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
+                return Err(format!(
+                    "failed to acquire exact tailscale hostname '{app}' after auth-key join because ownership cleanup was unavailable: {err}; observed dns: {dns_name}"
+                ));
+            }
             sleep(retry_sleep);
             continue;
         }
@@ -1225,21 +1270,27 @@ fn acquire_exact_tailscale_hostname_for_deploy(
             {
                 eprintln!("       Warning: failed to track tailscale state device: {track_err}");
             }
-            Ok(name)
+            Ok(TailscaleJoinAttempt::from_dns_name(name))
         },
         |container, machine_name| {
             check_deploy_interrupt(app, "tailscale exact-hostname auth-key fallback")?;
             let current_device_id = read_tailscale_self_snapshot(container)
                 .ok()
                 .and_then(|snapshot| snapshot.device_id);
-            let cleanup =
-                cleanup_owned_tailscale_hostname_conflicts(app, current_device_id.as_deref())?;
-            if !cleanup.removed_device_ids.is_empty() || !cleanup.retired_device_ids.is_empty() {
-                eprintln!(
-                    "       Reclaimed tracked tailscale devices (removed: {}; retired: {})",
-                    join_or_none(&cleanup.removed_device_ids),
-                    join_or_none(&cleanup.retired_device_ids),
-                );
+            let mut cleanup_lookup_error = None;
+            match cleanup_owned_tailscale_hostname_conflicts(app, current_device_id.as_deref()) {
+                Ok(cleanup) => {
+                    if !cleanup.removed_device_ids.is_empty()
+                        || !cleanup.retired_device_ids.is_empty()
+                    {
+                        eprintln!(
+                            "       Reclaimed tracked tailscale devices (removed: {}; retired: {})",
+                            join_or_none(&cleanup.removed_device_ids),
+                            join_or_none(&cleanup.retired_device_ids),
+                        );
+                    }
+                }
+                Err(err) => cleanup_lookup_error = Some(err),
             }
 
             let name = tailscale::join_with_auth_key_in_container(container, machine_name)?;
@@ -1251,7 +1302,10 @@ fn acquire_exact_tailscale_hostname_for_deploy(
             {
                 eprintln!("       Warning: failed to track tailscale auth-key device: {track_err}");
             }
-            Ok(name)
+            Ok(TailscaleJoinAttempt {
+                dns_name: name,
+                cleanup_lookup_error,
+            })
         },
         |container| {
             check_deploy_interrupt(app, "tailscale health wait")?;
@@ -8204,10 +8258,13 @@ devices:
                 state_results
                     .pop_front()
                     .expect("state result should exist for each attempt")
+                    .map(TailscaleJoinAttempt::from_dns_name)
             },
             |_container, _app| {
                 auth_calls += 1;
-                Ok(Some("unexpected.tail.ts.net".to_string()))
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "unexpected.tail.ts.net".to_string(),
+                )))
             },
             |_container| {
                 health_calls += 1;
@@ -8246,7 +8303,9 @@ devices:
             },
             |_container, _app| {
                 auth_calls += 1;
-                Ok(Some("hyperlinked.tail.ts.net".to_string()))
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "hyperlinked.tail.ts.net".to_string(),
+                )))
             },
             |_container| Ok(()),
             |_container| {
@@ -8266,6 +8325,37 @@ devices:
         assert_eq!(auth_calls, 1);
         assert_eq!(reset_calls as u64, state_budget + 1);
         assert_eq!(sleep_calls as u64, state_budget);
+    }
+
+    #[test]
+    fn acquire_exact_tailscale_hostname_fails_fast_when_cleanup_lookup_unavailable_and_non_exact() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+
+        let err = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Err("state unavailable".to_string())
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(TailscaleJoinAttempt {
+                    dns_name: Some("hyperlinked-1.tail.ts.net".to_string()),
+                    cleanup_lookup_error: Some("device list unavailable".to_string()),
+                })
+            },
+            |_container| Ok(()),
+            |_container| Ok(()),
+            |_duration| {},
+        )
+        .unwrap_err();
+
+        assert!(err.contains("ownership cleanup was unavailable"));
+        assert!(err.contains("hyperlinked-1.tail.ts.net"));
+        assert!(state_calls > 0);
+        assert_eq!(auth_calls, 1);
     }
 
     #[test]

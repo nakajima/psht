@@ -157,32 +157,59 @@ fn parse_tailnet_device(value: &serde_json::Value) -> Option<TailnetDevice> {
     })
 }
 
+fn response_preview(raw: &str, max_chars: usize) -> String {
+    let mut preview = raw.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.chars().count() > max_chars {
+        preview = preview.chars().take(max_chars).collect::<String>();
+        preview.push_str("...");
+    }
+    if preview.is_empty() {
+        "<empty>".to_string()
+    } else {
+        preview
+    }
+}
+
+fn device_candidates_from_object<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<&'a serde_json::Value>> {
+    for key in ["devices", "nodes", "machines", "items", "results"] {
+        if let Some(items) = obj.get(key).and_then(serde_json::Value::as_array) {
+            return Some(items.iter().collect());
+        }
+        if let Some(items) = obj.get(key).and_then(serde_json::Value::as_object) {
+            return Some(items.values().collect());
+        }
+    }
+    None
+}
+
 fn parse_tailnet_devices(json: &str) -> Result<Vec<TailnetDevice>, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("failed to parse tailscale device list response: {e}"))?;
     let candidates: Vec<&serde_json::Value> = match &value {
         serde_json::Value::Array(items) => items.iter().collect(),
         serde_json::Value::Object(obj) => {
-            let mut resolved: Option<Vec<&serde_json::Value>> = None;
-            for key in ["devices", "nodes", "machines"] {
-                if let Some(items) = obj.get(key).and_then(serde_json::Value::as_array) {
-                    resolved = Some(items.iter().collect());
-                    break;
-                }
-                if let Some(items) = obj.get(key).and_then(serde_json::Value::as_object) {
-                    resolved = Some(items.values().collect());
-                    break;
-                }
-            }
-            if let Some(items) = resolved {
+            if let Some(items) = device_candidates_from_object(obj) {
+                items
+            } else if let Some(data_obj) = obj.get("data").and_then(serde_json::Value::as_object)
+                && let Some(items) = device_candidates_from_object(data_obj)
+            {
                 items
             } else if parse_tailnet_device(&value).is_some() {
                 vec![&value]
             } else {
-                return Err(
-                    "missing supported device list key in tailscale device list response"
-                        .to_string(),
-                );
+                let mut keys = obj.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                let keys = if keys.is_empty() {
+                    "none".to_string()
+                } else {
+                    keys.join(", ")
+                };
+                return Err(format!(
+                    "missing supported device list key in tailscale device list response (top-level keys: {keys}; preview: {})",
+                    response_preview(json, 200)
+                ));
             }
         }
         _ => return Err("invalid tailscale device list response".to_string()),
@@ -195,6 +222,17 @@ fn parse_tailnet_devices(json: &str) -> Result<Vec<TailnetDevice>, String> {
         }
     }
     Ok(out)
+}
+
+fn split_curl_body_and_status(raw: &str) -> (String, Option<u16>) {
+    let trimmed = raw.trim_end_matches('\n');
+    if let Some((body, status)) = trimmed.rsplit_once('\n') {
+        let status = status.trim();
+        if status.len() == 3 && status.chars().all(|ch| ch.is_ascii_digit()) {
+            return (body.to_string(), status.parse::<u16>().ok());
+        }
+    }
+    (raw.to_string(), None)
 }
 
 fn oauth_token_request_args(client_id: &str, client_secret: &str) -> Vec<String> {
@@ -272,16 +310,37 @@ pub fn tailnet_access_token() -> Result<String, String> {
 
 pub fn list_tailnet_devices(token: &str) -> Result<Vec<TailnetDevice>, String> {
     let output = Command::new("curl")
-        .args(["-s", "-X", "GET"])
+        .args(["-sS", "-w", "\n%{http_code}", "-X", "GET"])
         .args(["-H", &format!("Authorization: Bearer {token}")])
         .arg("https://api.tailscale.com/api/v2/tailnet/-/devices")
         .output()
         .map_err(|e| format!("failed to list tailnet devices: {e}"))?;
     let response = String::from_utf8_lossy(&output.stdout).to_string();
+    let (body, status_code) = split_curl_body_and_status(&response);
     if !output.status.success() {
-        return Err(format!("failed to list tailscale devices: {response}"));
+        return Err(format!(
+            "failed to list tailscale devices (curl status {}): {}",
+            output.status,
+            response_preview(&body, 220)
+        ));
     }
-    parse_tailnet_devices(&response)
+    if let Some(code) = status_code
+        && !(200..300).contains(&code)
+    {
+        return Err(format!(
+            "failed to list tailscale devices (http {code}): {}",
+            response_preview(&body, 220)
+        ));
+    }
+    parse_tailnet_devices(&body).map_err(|err| {
+        format!(
+            "{err}; http status: {}; body: {}",
+            status_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            response_preview(&body, 220)
+        )
+    })
 }
 
 pub fn delete_tailnet_device(token: &str, device_id: &str) -> Result<(), String> {
@@ -633,5 +692,39 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, "node-9");
         assert_eq!(devices[0].hostname_label.as_deref(), Some("hyperlinked"));
+    }
+
+    #[test]
+    fn parse_tailnet_devices_nested_data_items_response() {
+        let json = r#"{
+          "data": {
+            "items": [
+              {
+                "id": "dev-42",
+                "hostname": "hyperlinked",
+                "name": "hyperlinked.tail.ts.net"
+              }
+            ]
+          }
+        }"#;
+        let devices = parse_tailnet_devices(json).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "dev-42");
+        assert_eq!(devices[0].hostname_label.as_deref(), Some("hyperlinked"));
+    }
+
+    #[test]
+    fn parse_tailnet_devices_error_includes_keys_and_preview() {
+        let json = r#"{"foo":{"bar":1},"error":"unsupported"}"#;
+        let err = parse_tailnet_devices(json).unwrap_err();
+        assert!(err.contains("top-level keys:"));
+        assert!(err.contains("preview:"));
+    }
+
+    #[test]
+    fn split_curl_body_and_status_parses_status_line() {
+        let (body, code) = split_curl_body_and_status("{\"ok\":true}\n200");
+        assert_eq!(body, "{\"ok\":true}");
+        assert_eq!(code, Some(200));
     }
 }
