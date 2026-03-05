@@ -47,11 +47,32 @@ pub struct ContainerInfo {
 #[derive(Debug, Deserialize)]
 struct OperationInfo {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
+    class: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
     status: String,
     #[serde(default)]
     status_code: i64,
     #[serde(default)]
+    may_cancel: bool,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
     resources: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockingOperation {
+    pub id: String,
+    pub status: String,
+    pub status_code: i64,
+    pub class: String,
+    pub description: String,
+    pub may_cancel: bool,
+    pub resources: Vec<String>,
 }
 
 pub struct IncusCommand {
@@ -828,24 +849,69 @@ fn operation_resource_matches_container(resource: &str, container_name: &str) ->
         || resource.contains(&format!("/containers/{container_name}"))
 }
 
-fn has_running_operation_in(operations_json: &str, container_name: &str) -> Result<bool, String> {
+fn operation_id(op: &OperationInfo) -> Option<String> {
+    if !op.id.trim().is_empty() {
+        return Some(op.id.trim().to_string());
+    }
+    let from_url = op
+        .url
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if from_url.is_empty() {
+        None
+    } else {
+        Some(from_url.to_string())
+    }
+}
+
+fn blocking_operations_in(
+    operations_json: &str,
+    container_name: &str,
+) -> Result<Vec<BlockingOperation>, String> {
     let ops: Vec<OperationInfo> = serde_json::from_str(operations_json)
         .map_err(|e| format!("failed to parse incus operation list: {e}"))?;
+    let mut blocking = Vec::new();
     for op in ops {
         let running = op.status.eq_ignore_ascii_case("running") || op.status_code == 103;
         if !running {
             continue;
         }
+        let mut matched_resources = Vec::new();
         for resources in op.resources.values() {
-            if resources
-                .iter()
-                .any(|resource| operation_resource_matches_container(resource, container_name))
-            {
-                return Ok(true);
+            for resource in resources {
+                if operation_resource_matches_container(resource, container_name) {
+                    matched_resources.push(resource.to_string());
+                }
             }
         }
+        if matched_resources.is_empty() {
+            continue;
+        }
+        let id = operation_id(&op).unwrap_or_else(|| {
+            format!(
+                "unknown-{}-{}",
+                op.class.trim().to_lowercase(),
+                op.status_code
+            )
+        });
+        blocking.push(BlockingOperation {
+            id,
+            status: op.status,
+            status_code: op.status_code,
+            class: op.class,
+            description: op.description,
+            may_cancel: op.may_cancel,
+            resources: matched_resources,
+        });
     }
-    Ok(false)
+    Ok(blocking)
+}
+
+fn has_running_operation_in(operations_json: &str, container_name: &str) -> Result<bool, String> {
+    Ok(!blocking_operations_in(operations_json, container_name)?.is_empty())
 }
 
 #[allow(dead_code)]
@@ -857,14 +923,31 @@ pub fn has_running_operation(app: &str) -> Result<bool, String> {
     has_running_operation_in(&operations, &name)
 }
 
-pub fn has_running_operation_in_project(app: &str, project: &str) -> Result<bool, String> {
+pub fn list_blocking_operations_in_project(
+    app: &str,
+    project: &str,
+) -> Result<Vec<BlockingOperation>, String> {
     let name = container_name(app);
     let operations = incus()
         .arg("--project")
         .arg(project)
         .args(&["operation", "list", "--format=json"])
         .output()?;
-    has_running_operation_in(&operations, &name)
+    blocking_operations_in(&operations, &name)
+}
+
+pub fn cancel_operation_in_project(project: &str, operation_id: &str) -> Result<(), String> {
+    let id = operation_id.trim();
+    if id.is_empty() {
+        return Err("cannot cancel operation with empty id".to_string());
+    }
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("operation")
+        .arg("cancel")
+        .arg(id)
+        .run()
 }
 
 #[cfg(test)]
@@ -1366,8 +1449,10 @@ mod tests {
     #[test]
     fn has_running_operation_in_detects_busy_container() {
         let json = r#"[{
+  "id":"op-1",
   "status":"Running",
   "status_code":103,
+  "may_cancel":true,
   "resources":{"instances":["/1.0/instances/psht-demo?project=user-1001"]}
 }]"#;
         let busy = has_running_operation_in(json, "psht-demo").unwrap();
@@ -1383,6 +1468,24 @@ mod tests {
 }]"#;
         let busy = has_running_operation_in(json, "psht-demo").unwrap();
         assert!(!busy);
+    }
+
+    #[test]
+    fn blocking_operations_in_extracts_id_from_url() {
+        let json = r#"[{
+  "url":"/1.0/operations/7f4f3e8d",
+  "status":"Running",
+  "status_code":103,
+  "class":"task",
+  "description":"Updating instance",
+  "may_cancel":true,
+  "resources":{"instances":["/1.0/instances/psht-demo?project=user-1001"]}
+}]"#;
+        let ops = blocking_operations_in(json, "psht-demo").unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].id, "7f4f3e8d");
+        assert!(ops[0].may_cancel);
+        assert_eq!(ops[0].class, "task");
     }
 
     #[test]

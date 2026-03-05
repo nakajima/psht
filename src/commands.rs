@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,6 +64,12 @@ const LOGS_DEPLOY_HISTORY_LINES_PER_FILE: usize = 400;
 const TAILSCALE_STATE_SEED_PATH: &str = "/var/lib/psht-tailscale-state";
 const INCUS_METADATA_TIMEOUT_SECS: u64 = 20;
 const TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS: u64 = 1000;
+const RECONCILE_LEASE_TTL_SECS: u64 = 30;
+const RECONCILE_LEASE_HEARTBEAT_SECS: u64 = 5;
+const RECONCILE_BUDGET_SECS: u64 = 90;
+const TAKEOVER_RETRY_MS: u64 = 1000;
+const TAKEOVER_MAX_CANCEL_PER_CYCLE: usize = 20;
+const BUSY_OP_POLICY_ENV: &str = "PSHT_BUSY_OP_POLICY";
 
 macro_rules! eprintln {
     () => {
@@ -1972,6 +1979,25 @@ struct ReconcileIntentContext {
     source_summary: String,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveReconcileLease {
+    owner: String,
+    epoch: i64,
+    intent_id: String,
+    generation: i64,
+    last_heartbeat: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyOpPolicy {
+    Auto,
+    Diagnose,
+    Force,
+}
+
+static ACTIVE_RECONCILE_LEASES: OnceLock<Mutex<HashMap<String, ActiveReconcileLease>>> =
+    OnceLock::new();
+
 fn app_ref_from_instance_name(instance: &str) -> Option<String> {
     let trimmed = instance.trim();
     if trimmed.is_empty() {
@@ -2130,6 +2156,207 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn env_u64(name: &str, default_value: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default_value)
+}
+
+fn reconcile_lease_ttl_secs() -> u64 {
+    env_u64("PSHT_LEASE_TTL_SECS", RECONCILE_LEASE_TTL_SECS).max(5)
+}
+
+fn reconcile_lease_heartbeat_secs() -> u64 {
+    env_u64("PSHT_LEASE_HEARTBEAT_SECS", RECONCILE_LEASE_HEARTBEAT_SECS).max(1)
+}
+
+fn reconcile_budget_secs() -> u64 {
+    env_u64("PSHT_RECONCILE_BUDGET_SECS", RECONCILE_BUDGET_SECS).max(10)
+}
+
+fn takeover_retry_ms() -> u64 {
+    env_u64("PSHT_TAKEOVER_RETRY_MS", TAKEOVER_RETRY_MS).max(100)
+}
+
+fn takeover_max_cancel_per_cycle() -> usize {
+    env_u64(
+        "PSHT_TAKEOVER_MAX_CANCEL_PER_CYCLE",
+        TAKEOVER_MAX_CANCEL_PER_CYCLE as u64,
+    )
+    .max(1) as usize
+}
+
+fn busy_op_policy_from_raw(raw: Option<&str>) -> BusyOpPolicy {
+    match raw.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("diagnose") => BusyOpPolicy::Diagnose,
+        Some("force") => BusyOpPolicy::Force,
+        _ => BusyOpPolicy::Auto,
+    }
+}
+
+fn busy_op_policy() -> BusyOpPolicy {
+    let raw = env::var(BUSY_OP_POLICY_ENV).ok();
+    busy_op_policy_from_raw(raw.as_deref())
+}
+
+fn active_reconcile_leases() -> &'static Mutex<HashMap<String, ActiveReconcileLease>> {
+    ACTIVE_RECONCILE_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_active_reconcile_lease(app: &str, lease: ActiveReconcileLease) {
+    if let Ok(mut map) = active_reconcile_leases().lock() {
+        map.insert(app.to_string(), lease);
+    }
+}
+
+fn active_reconcile_lease_for(app: &str) -> Option<ActiveReconcileLease> {
+    active_reconcile_leases()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(app).cloned())
+}
+
+fn remove_active_reconcile_lease(app: &str) {
+    if let Ok(mut map) = active_reconcile_leases().lock() {
+        map.remove(app);
+    }
+}
+
+fn append_reconcile_attempt_record(
+    app: &str,
+    step_name: &str,
+    result: &str,
+    detail_json: serde_json::Value,
+) {
+    let Some(active) = active_reconcile_lease_for(app) else {
+        return;
+    };
+    let started = now_unix_ms();
+    let row = sqlite_store::ReconcileAttemptRow {
+        app_id: app.to_string(),
+        intent_id: active.intent_id.clone(),
+        generation: active.generation,
+        step_name: step_name.to_string(),
+        started_at_ms: started,
+        finished_at_ms: Some(started),
+        result: result.to_string(),
+        detail_json: detail_json.to_string(),
+    };
+    if let Err(err) = sqlite_store::append_reconcile_attempt(&row) {
+        eprintln!("       Warning: failed to append reconcile attempt: {err}");
+    }
+}
+
+fn update_reconcile_phase_from_lease(app: &str, phase: &str, last_error: Option<&str>) {
+    let Some(active) = active_reconcile_lease_for(app) else {
+        return;
+    };
+    let (active_instance, previous_instance) = runtime_state_snapshot(app);
+    let active_revision = read_git_deploy_state(app)
+        .ok()
+        .flatten()
+        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
+    let health_json = if phase.eq_ignore_ascii_case("blocked") {
+        "{\"healthy\":false,\"reason\":\"blocked\"}".to_string()
+    } else {
+        "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string()
+    };
+    let last_error_json = last_error.map(|value| serde_json::json!({ "error": value }).to_string());
+    let _ = sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+        app_id: app.to_string(),
+        observed_generation: active.generation,
+        phase: phase.to_string(),
+        active_instance,
+        candidate_instance: None,
+        previous_instance,
+        active_revision,
+        candidate_revision: None,
+        health_json,
+        last_error_json,
+        recovery_actions_json: "[]".to_string(),
+    });
+}
+
+fn refresh_active_reconcile_lease(app: &str) -> Result<(), String> {
+    let Some(active) = active_reconcile_lease_for(app) else {
+        return Ok(());
+    };
+    if active.last_heartbeat.elapsed().as_secs() < reconcile_lease_heartbeat_secs() {
+        return Ok(());
+    }
+
+    sqlite_store::heartbeat_app_lease(
+        app,
+        &active.owner,
+        active.epoch,
+        (reconcile_lease_ttl_secs() * 1000) as i64,
+    )?;
+
+    if let Ok(mut map) = active_reconcile_leases().lock()
+        && let Some(entry) = map.get_mut(app)
+    {
+        entry.last_heartbeat = Instant::now();
+    }
+    Ok(())
+}
+
+struct ReconcileLeaseGuard {
+    app: String,
+    owner: String,
+    epoch: i64,
+}
+
+impl Drop for ReconcileLeaseGuard {
+    fn drop(&mut self) {
+        remove_active_reconcile_lease(&self.app);
+        if let Err(err) = sqlite_store::release_app_lease(&self.app, &self.owner, self.epoch) {
+            std::eprintln!(
+                "warning: failed to release reconcile lease for {}: {}",
+                self.app,
+                err
+            );
+        }
+    }
+}
+
+fn acquire_reconcile_lease(
+    app: &str,
+    ctx: &ReconcileIntentContext,
+) -> Result<ReconcileLeaseGuard, String> {
+    let owner = format!("{}:{}:{}", hostname(), std::process::id(), ctx.intent_id);
+    let lease = sqlite_store::acquire_app_lease(
+        app,
+        &owner,
+        &ctx.intent_id,
+        ctx.generation,
+        (reconcile_lease_ttl_secs() * 1000) as i64,
+    )?;
+
+    register_active_reconcile_lease(
+        app,
+        ActiveReconcileLease {
+            owner: lease.lease_owner.clone(),
+            epoch: lease.lease_epoch,
+            intent_id: lease.intent_id.clone(),
+            generation: lease.generation,
+            last_heartbeat: Instant::now(),
+        },
+    );
+    Ok(ReconcileLeaseGuard {
+        app: app.to_string(),
+        owner: lease.lease_owner,
+        epoch: lease.lease_epoch,
+    })
 }
 
 fn parse_deploy_lock_metadata(content: &str) -> DeployLockMetadata {
@@ -3050,26 +3277,143 @@ fn wait_for_container_operation_quiet(
     project: &str,
     deploy_app: Option<&str>,
 ) -> Result<(), String> {
+    let policy = busy_op_policy();
+    let wait_window =
+        Duration::from_millis(CONTAINER_OP_WAIT_CHECKS as u64 * CONTAINER_OP_WAIT_SLEEP_MS);
+    let reconcile_budget = Duration::from_secs(reconcile_budget_secs());
+    let takeover_sleep = Duration::from_millis(takeover_retry_ms());
+    let max_cancel_per_cycle = takeover_max_cancel_per_cycle();
+    let started = Instant::now();
+    let mut seen_at: HashMap<String, Instant> = HashMap::new();
+    let mut canceled_ids: BTreeMap<String, usize> = BTreeMap::new();
     let mut announced_wait = false;
-    for _ in 0..CONTAINER_OP_WAIT_CHECKS {
+    loop {
         if let Some(deploy_app) = deploy_app {
             check_deploy_interrupt(deploy_app, "waiting for active container operation")?;
         }
-        if !container::has_running_operation_in_project(app, project)? {
+        let blocking = container::list_blocking_operations_in_project(app, project)?;
+        if blocking.is_empty() {
             if announced_wait {
                 eprintln!("       Active operation finished");
             }
+            if announced_wait {
+                update_reconcile_phase_from_lease(app, "Reconciling", None);
+            }
             return Ok(());
+        }
+        let now = Instant::now();
+        for op in &blocking {
+            seen_at.entry(op.id.clone()).or_insert(now);
         }
         if !announced_wait {
             eprintln!("       Waiting for active container operation to finish...");
             announced_wait = true;
         }
-        thread::sleep(Duration::from_millis(CONTAINER_OP_WAIT_SLEEP_MS));
+
+        if started.elapsed() < wait_window {
+            thread::sleep(Duration::from_millis(CONTAINER_OP_WAIT_SLEEP_MS));
+            continue;
+        }
+
+        let blocked_ops: Vec<serde_json::Value> = blocking
+            .iter()
+            .map(|op| {
+                let age_secs = seen_at
+                    .get(&op.id)
+                    .map(|seen| seen.elapsed().as_secs())
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "id": op.id,
+                    "status": op.status,
+                    "status_code": op.status_code,
+                    "class": op.class,
+                    "description": op.description,
+                    "may_cancel": op.may_cancel,
+                    "age_secs": age_secs,
+                    "resources": op.resources,
+                })
+            })
+            .collect();
+        update_reconcile_phase_from_lease(
+            app,
+            "Blocked",
+            Some("container has active blocking operation(s)"),
+        );
+        append_reconcile_attempt_record(
+            app,
+            "wait-for-container-operation",
+            "blocked",
+            serde_json::json!({
+                "policy": format!("{policy:?}").to_ascii_lowercase(),
+                "blocking_ops": blocked_ops,
+            }),
+        );
+
+        if policy == BusyOpPolicy::Diagnose {
+            return Err(format!(
+                "container '{app}' remains blocked by active operations after {}s (policy=diagnose); run `incus --project {project} operation list`",
+                wait_window.as_secs()
+            ));
+        }
+
+        let mut canceled_this_cycle = Vec::new();
+        for op in &blocking {
+            if canceled_this_cycle.len() >= max_cancel_per_cycle {
+                break;
+            }
+            if !op.may_cancel {
+                continue;
+            }
+            if let Err(err) = container::cancel_operation_in_project(project, &op.id) {
+                eprintln!(
+                    "       Warning: failed to cancel blocking operation {}: {err}",
+                    op.id
+                );
+            } else {
+                let count = canceled_ids.entry(op.id.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+                canceled_this_cycle.push(op.id.clone());
+            }
+        }
+
+        if !canceled_this_cycle.is_empty() {
+            eprintln!(
+                "       Requested cancellation for {} blocking operation(s): {}",
+                canceled_this_cycle.len(),
+                canceled_this_cycle.join(", ")
+            );
+            append_reconcile_attempt_record(
+                app,
+                "wait-for-container-operation",
+                "takeover",
+                serde_json::json!({
+                    "policy": format!("{policy:?}").to_ascii_lowercase(),
+                    "canceled_ops": canceled_this_cycle,
+                }),
+            );
+            update_reconcile_phase_from_lease(app, "Reconciling", None);
+        }
+
+        if started.elapsed() >= reconcile_budget {
+            let unresolved: Vec<String> = blocking
+                .iter()
+                .map(|op| {
+                    let age_secs = seen_at
+                        .get(&op.id)
+                        .map(|seen| seen.elapsed().as_secs())
+                        .unwrap_or(0);
+                    format!("{}(age={}s,cancelable={})", op.id, age_secs, op.may_cancel)
+                })
+                .collect();
+            return Err(format!(
+                "container '{app}' is still blocked after {}s; unresolved operations: {}",
+                reconcile_budget.as_secs(),
+                unresolved.join(", ")
+            ));
+        }
+
+        thread::sleep(takeover_sleep);
     }
-    Err(format!(
-        "container '{app}' is busy with an active operation; retry deploy after it completes"
-    ))
 }
 
 fn ensure_create_prereqs(project: &str) -> Result<(), String> {
@@ -3280,6 +3624,8 @@ fn check_deploy_interrupt(app: &str, phase: &str) -> Result<(), String> {
     if let Err(err) = refresh_deploy_lock_heartbeat(app) {
         eprintln!("       Warning: failed to refresh deploy lock heartbeat: {err}");
     }
+    refresh_active_reconcile_lease(app)
+        .map_err(|err| format!("reconcile lease check failed during {phase}: {err}"))?;
     if let Some(state) = read_deploy_interrupt(app)? {
         return Err(deploy_interrupted_error(phase, &state));
     }
@@ -3738,7 +4084,7 @@ pub fn deploy(
     let ctx = begin_reconcile_intent(app, "deploy", "git", &source_payload)?;
     reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
 
-    let result = deploy_impl(app, git_ref, git_sha, force);
+    let result = deploy_impl(app, git_ref, git_sha, force, &ctx);
     let revision = parse_git_checkout_target(git_ref, git_sha)
         .ok()
         .and_then(|target| target.map(|target| target.sha))
@@ -3757,6 +4103,7 @@ fn deploy_impl(
     git_ref: Option<&str>,
     git_sha: Option<&str>,
     force: bool,
+    ctx: &ReconcileIntentContext,
 ) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let _deploy_log_session = start_deploy_log_session(app);
@@ -3797,6 +4144,7 @@ fn deploy_impl(
     if let Err(err) = clear_deploy_interrupt(app) {
         eprintln!("       Warning: failed to clear pending deploy interrupt state: {err}");
     }
+    let _reconcile_lease = acquire_reconcile_lease(app, ctx)?;
 
     let mut active_force = force;
     loop {
@@ -3842,7 +4190,7 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
     .to_string();
     let ctx = begin_reconcile_intent(app, "push", "tar-stdin", &source_payload)?;
     reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
-    let result = push_impl(app, force);
+    let result = push_impl(app, force, &ctx);
     let revision = read_git_deploy_state(app)
         .ok()
         .flatten()
@@ -3851,7 +4199,7 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
     result
 }
 
-fn push_impl(app: &str, force: bool) -> Result<(), String> {
+fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let _deploy_log_session = start_deploy_log_session(app);
     eprintln!("-----> Deploying {app}");
@@ -3861,6 +4209,7 @@ fn push_impl(app: &str, force: bool) -> Result<(), String> {
             "deploy already in progress for '{app}'; retry after it completes"
         ));
     };
+    let _reconcile_lease = acquire_reconcile_lease(app, ctx)?;
     kick_pending_cleanup_worker(app);
 
     let code_dir = home_dir().join(app);
@@ -6971,6 +7320,17 @@ devices:
         assert!(version_is_newer("1.0.0", "0.99.99"));
         assert!(!version_is_newer("0.2.28", "0.2.28"));
         assert!(!version_is_newer("0.2.27", "0.2.28"));
+    }
+
+    #[test]
+    fn busy_op_policy_from_raw_parses_supported_values() {
+        assert_eq!(
+            busy_op_policy_from_raw(Some("diagnose")),
+            BusyOpPolicy::Diagnose
+        );
+        assert_eq!(busy_op_policy_from_raw(Some("force")), BusyOpPolicy::Force);
+        assert_eq!(busy_op_policy_from_raw(Some("AUTO")), BusyOpPolicy::Auto);
+        assert_eq!(busy_op_policy_from_raw(None), BusyOpPolicy::Auto);
     }
 
     #[test]

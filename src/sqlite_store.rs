@@ -87,6 +87,29 @@ pub struct CleanupJobRow {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLeaseRow {
+    pub app_id: String,
+    pub lease_owner: String,
+    pub lease_epoch: i64,
+    pub heartbeat_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub intent_id: String,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileAttemptRow {
+    pub app_id: String,
+    pub intent_id: String,
+    pub generation: i64,
+    pub step_name: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub result: String,
+    pub detail_json: String,
+}
+
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
@@ -212,6 +235,28 @@ CREATE TABLE IF NOT EXISTS cleanup_jobs (
     scheduled_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_leases (
+    app_id TEXT PRIMARY KEY,
+    lease_owner TEXT NOT NULL,
+    lease_epoch INTEGER NOT NULL,
+    heartbeat_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    intent_id TEXT NOT NULL,
+    generation INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reconcile_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    step_name TEXT NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    finished_at_ms INTEGER,
+    result TEXT NOT NULL,
+    detail_json TEXT NOT NULL
 );
 "#,
     )
@@ -800,6 +845,177 @@ pub fn delete_cleanup_job(app_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
+pub fn get_app_lease(app_id: &str) -> Result<Option<AppLeaseRow>, String> {
+    let conn = open_connection()?;
+    conn.query_row(
+        "SELECT app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
+         FROM app_leases WHERE app_id = ?1",
+        params![app_id],
+        |row| {
+            Ok(AppLeaseRow {
+                app_id: row.get(0)?,
+                lease_owner: row.get(1)?,
+                lease_epoch: row.get(2)?,
+                heartbeat_at_ms: row.get(3)?,
+                expires_at_ms: row.get(4)?,
+                intent_id: row.get(5)?,
+                generation: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| format!("failed to read app lease for {app_id}: {e}"))
+}
+
+pub fn acquire_app_lease(
+    app_id: &str,
+    lease_owner: &str,
+    intent_id: &str,
+    generation: i64,
+    ttl_ms: i64,
+) -> Result<AppLeaseRow, String> {
+    let mut conn = open_connection()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to begin sqlite transaction for lease {app_id}: {e}"))?;
+
+    let existing = tx
+        .query_row(
+            "SELECT app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
+             FROM app_leases WHERE app_id = ?1",
+            params![app_id],
+            |row| {
+                Ok(AppLeaseRow {
+                    app_id: row.get(0)?,
+                    lease_owner: row.get(1)?,
+                    lease_epoch: row.get(2)?,
+                    heartbeat_at_ms: row.get(3)?,
+                    expires_at_ms: row.get(4)?,
+                    intent_id: row.get(5)?,
+                    generation: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("failed to read existing app lease for {app_id}: {e}"))?;
+
+    let now_ms = now_unix_ms();
+    if let Some(existing) = existing.as_ref()
+        && existing.expires_at_ms > now_ms
+        && existing.lease_owner != lease_owner
+    {
+        return Err(format!(
+            "reconcile lease for '{app_id}' is held by '{}' until {}",
+            existing.lease_owner, existing.expires_at_ms
+        ));
+    }
+
+    let lease_epoch = existing
+        .as_ref()
+        .map(|lease| lease.lease_epoch.saturating_add(1))
+        .unwrap_or(1);
+    let effective_ttl_ms = ttl_ms.max(1_000);
+    let expires_at_ms = now_ms.saturating_add(effective_ttl_ms);
+    tx.execute(
+        "INSERT INTO app_leases(
+            app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(app_id) DO UPDATE SET
+            lease_owner = excluded.lease_owner,
+            lease_epoch = excluded.lease_epoch,
+            heartbeat_at_ms = excluded.heartbeat_at_ms,
+            expires_at_ms = excluded.expires_at_ms,
+            intent_id = excluded.intent_id,
+            generation = excluded.generation",
+        params![
+            app_id,
+            lease_owner,
+            lease_epoch,
+            now_ms,
+            expires_at_ms,
+            intent_id,
+            generation
+        ],
+    )
+    .map_err(|e| format!("failed to acquire app lease for {app_id}: {e}"))?;
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit app lease for {app_id}: {e}"))?;
+
+    Ok(AppLeaseRow {
+        app_id: app_id.to_string(),
+        lease_owner: lease_owner.to_string(),
+        lease_epoch,
+        heartbeat_at_ms: now_ms,
+        expires_at_ms,
+        intent_id: intent_id.to_string(),
+        generation,
+    })
+}
+
+pub fn heartbeat_app_lease(
+    app_id: &str,
+    lease_owner: &str,
+    lease_epoch: i64,
+    ttl_ms: i64,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    let now_ms = now_unix_ms();
+    let effective_ttl_ms = ttl_ms.max(1_000);
+    let updated = conn
+        .execute(
+            "UPDATE app_leases
+             SET heartbeat_at_ms = ?4, expires_at_ms = ?5
+             WHERE app_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3",
+            params![
+                app_id,
+                lease_owner,
+                lease_epoch,
+                now_ms,
+                now_ms.saturating_add(effective_ttl_ms)
+            ],
+        )
+        .map_err(|e| format!("failed to heartbeat app lease for {app_id}: {e}"))?;
+    if updated == 0 {
+        return Err(format!(
+            "reconcile lease lost for '{app_id}' (owner={lease_owner}, epoch={lease_epoch})"
+        ));
+    }
+    Ok(())
+}
+
+pub fn release_app_lease(app_id: &str, lease_owner: &str, lease_epoch: i64) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "DELETE FROM app_leases WHERE app_id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3",
+        params![app_id, lease_owner, lease_epoch],
+    )
+    .map_err(|e| format!("failed to release app lease for {app_id}: {e}"))?;
+    Ok(())
+}
+
+pub fn append_reconcile_attempt(row: &ReconcileAttemptRow) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT INTO reconcile_attempts(
+            app_id, intent_id, generation, step_name, started_at_ms, finished_at_ms, result, detail_json
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.app_id,
+            row.intent_id,
+            row.generation,
+            row.step_name,
+            row.started_at_ms,
+            row.finished_at_ms,
+            row.result,
+            row.detail_json
+        ],
+    )
+    .map_err(|e| format!("failed to append reconcile attempt for {}: {e}", row.app_id))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1139,45 @@ mod tests {
         assert_eq!(cleanup.attempts, 1);
         delete_cleanup_job(&app).unwrap();
         assert!(get_cleanup_job(&app).unwrap().is_none());
+    }
+
+    #[test]
+    fn app_lease_acquire_heartbeat_release_round_trip() {
+        let app = unique_app("sqlite-lease");
+        let lease = acquire_app_lease(&app, "owner-a", "intent-a", 1, 5_000).unwrap();
+        assert_eq!(lease.lease_owner, "owner-a");
+        assert_eq!(lease.intent_id, "intent-a");
+
+        let loaded = get_app_lease(&app).unwrap().unwrap();
+        assert_eq!(loaded.lease_owner, "owner-a");
+        assert_eq!(loaded.lease_epoch, lease.lease_epoch);
+
+        heartbeat_app_lease(&app, "owner-a", lease.lease_epoch, 5_000).unwrap();
+        release_app_lease(&app, "owner-a", lease.lease_epoch).unwrap();
+        assert!(get_app_lease(&app).unwrap().is_none());
+    }
+
+    #[test]
+    fn app_lease_blocks_other_owner_until_expired() {
+        let app = unique_app("sqlite-lease-block");
+        let _ = acquire_app_lease(&app, "owner-a", "intent-a", 1, 5_000).unwrap();
+        let err = acquire_app_lease(&app, "owner-b", "intent-b", 2, 5_000).unwrap_err();
+        assert!(err.contains("held by 'owner-a'"));
+    }
+
+    #[test]
+    fn reconcile_attempt_append_succeeds() {
+        let app = unique_app("sqlite-attempt");
+        append_reconcile_attempt(&ReconcileAttemptRow {
+            app_id: app,
+            intent_id: "intent-1".to_string(),
+            generation: 1,
+            step_name: "wait-for-operation".to_string(),
+            started_at_ms: 1_000,
+            finished_at_ms: Some(1_100),
+            result: "blocked".to_string(),
+            detail_json: "{\"ops\":1}".to_string(),
+        })
+        .unwrap();
     }
 }
