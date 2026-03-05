@@ -593,17 +593,6 @@ pub fn push_file(app: &str, local_path: &str, remote_path: &str) -> Result<(), S
         .run()
 }
 
-pub fn add_proxy(app: &str, host_port: u16, container_port: u16) -> Result<(), String> {
-    incus()
-        .args(&["config", "device", "add"])
-        .arg(container_name(app))
-        .arg("port")
-        .arg("proxy")
-        .arg(format!("listen=tcp:0.0.0.0:{host_port}"))
-        .arg(format!("connect=tcp:127.0.0.1:{container_port}"))
-        .run()
-}
-
 pub fn add_proxy_in_project(
     instance_name: &str,
     host_port: u16,

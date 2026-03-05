@@ -3718,9 +3718,9 @@ fn ensure_proxy_attached_with_recovery(
     project: &str,
     host_port: u16,
     container_port: u16,
-    removable_owners: &BTreeSet<String>,
 ) -> Result<(), String> {
     let target_instance = instance_name_from_app_ref(target_app_ref);
+    let family_app = deploy_app_family_from_app_ref(target_app_ref);
     let first_err =
         match container::add_proxy_in_project(&target_instance, host_port, container_port, project)
         {
@@ -3736,14 +3736,14 @@ fn ensure_proxy_attached_with_recovery(
     }
 
     let mut removed = Vec::new();
-    let mut skipped = Vec::new();
+    let mut non_family_owners = Vec::new();
     let mut remove_errors = Vec::new();
     for owner in owners {
         if owner == target_instance {
             continue;
         }
-        if !removable_owners.contains(&owner) {
-            skipped.push(owner);
+        if !is_instance_in_app_family(&family_app, &owner) {
+            non_family_owners.push(owner);
             continue;
         }
         match container::remove_proxy_in_project(&owner, project) {
@@ -3761,22 +3761,57 @@ fn ensure_proxy_attached_with_recovery(
 
     match container::add_proxy_in_project(&target_instance, host_port, container_port, project) {
         Ok(()) => {
-            if !removed.is_empty() || !skipped.is_empty() {
+            if !removed.is_empty() || !non_family_owners.is_empty() {
                 eprintln!(
-                    "       Recovered proxy :{host_port} for {target_instance} (removed: {}; skipped: {})",
+                    "       Recovered proxy :{host_port} for {target_instance} (removed: {}; non-family owners: {})",
                     join_or_none(&removed),
-                    join_or_none(&skipped)
+                    join_or_none(&non_family_owners)
                 );
             }
             Ok(())
         }
-        Err(retry_err) => Err(format!(
-            "failed to attach proxy device to {target_instance} on :{host_port} after owner cleanup: {retry_err}; initial error: {first_err}; removed owners: {}; skipped owners: {}; remove errors: {}",
-            join_or_none(&removed),
-            join_or_none(&skipped),
-            join_or_none(&remove_errors)
-        )),
+        Err(retry_err) => {
+            let remaining_non_family = container::proxy_port_owners_in_project(project, host_port)
+                .unwrap_or_else(|_| non_family_owners.clone())
+                .into_iter()
+                .filter(|owner| {
+                    owner != &target_instance && !is_instance_in_app_family(&family_app, owner)
+                })
+                .collect::<Vec<_>>();
+            Err(format!(
+                "failed to attach proxy device to {target_instance} on :{host_port} after same-app cleanup: {retry_err}; initial error: {first_err}; removed owners: {}; non-family owners: {}; remove errors: {}",
+                join_or_none(&removed),
+                join_or_none(&remaining_non_family),
+                join_or_none(&remove_errors)
+            ))
+        }
     }
+}
+
+fn deploy_app_family_from_app_ref(app_ref: &str) -> String {
+    let app_ref = app_ref.trim();
+    if app_ref.is_empty() {
+        return app_ref.to_string();
+    }
+
+    for marker in ["-build-", "-prev-", "-failed-"] {
+        if let Some((base, suffix)) = app_ref.rsplit_once(marker)
+            && !base.is_empty()
+            && !suffix.is_empty()
+            && suffix.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return base.to_string();
+        }
+    }
+
+    app_ref.to_string()
+}
+
+fn is_instance_in_app_family(app: &str, instance_name: &str) -> bool {
+    let Some(candidate_app_ref) = app_ref_from_instance_name(instance_name) else {
+        return false;
+    };
+    candidate_app_ref == app || is_transient_deploy_app_for(app, &candidate_app_ref)
 }
 
 fn is_transient_deploy_app_for(app: &str, candidate: &str) -> bool {
@@ -4873,13 +4908,6 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         .as_ref()
         .filter(|previous_app| *previous_app != &candidate_app && *previous_app != &old_active_app)
         .cloned();
-    let mut proxy_recovery_owners = BTreeSet::new();
-    proxy_recovery_owners.insert(instance_name_from_app_ref(&old_active_app));
-    proxy_recovery_owners.insert(instance_name_from_app_ref(&candidate_app));
-    if let Some(previous_app) = old_previous_app.as_ref() {
-        proxy_recovery_owners.insert(instance_name_from_app_ref(previous_app));
-    }
-
     eprintln!("-----> Switching traffic");
     check_deploy_interrupt(app, "before cutover")?;
     eprintln!("       Traffic remains on current container until cutover is complete");
@@ -4914,13 +4942,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         candidate_storage_attached = true;
 
         eprintln!("       Attaching proxy to new active container");
-        ensure_proxy_attached_with_recovery(
-            &candidate_app,
-            &current_project,
-            port,
-            port,
-            &proxy_recovery_owners,
-        )?;
+        ensure_proxy_attached_with_recovery(&candidate_app, &current_project, port, port)?;
         candidate_proxy_attached = true;
 
         eprintln!("       Starting app in new active container");
@@ -5030,7 +5052,6 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                     &current_project,
                     port,
                     port,
-                    &proxy_recovery_owners,
                 ) {
                     rollback_issues.push(format!(
                         "failed to restore previous proxy device: {proxy_err}"
@@ -5307,7 +5328,7 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
 
         let port = allocate_port(app);
         eprintln!("-----> Setting up port forwarding on :{port}");
-        container::add_proxy(app, port, port)?;
+        ensure_proxy_attached_with_recovery(app, &current_project, port, port)?;
     }
 
     check_deploy_interrupt(app, "in-place storage attach")?;
@@ -7190,6 +7211,48 @@ mod tests {
         assert!(!is_transient_deploy_app_for(
             "hyperlinked",
             "other-build-100"
+        ));
+    }
+
+    #[test]
+    fn deploy_app_family_is_derived_from_transient_refs() {
+        assert_eq!(
+            deploy_app_family_from_app_ref("hyperlinked-build-100"),
+            "hyperlinked"
+        );
+        assert_eq!(
+            deploy_app_family_from_app_ref("hyperlinked-prev-100"),
+            "hyperlinked"
+        );
+        assert_eq!(
+            deploy_app_family_from_app_ref("hyperlinked-failed-100"),
+            "hyperlinked"
+        );
+        assert_eq!(deploy_app_family_from_app_ref("hyperlinked"), "hyperlinked");
+        assert_eq!(
+            deploy_app_family_from_app_ref("hyperlinked-build-next"),
+            "hyperlinked-build-next"
+        );
+    }
+
+    #[test]
+    fn instance_membership_detects_full_app_family() {
+        assert!(is_instance_in_app_family("hyperlinked", "psht-hyperlinked"));
+        assert!(is_instance_in_app_family(
+            "hyperlinked",
+            "psht-hyperlinked-build-1772593344"
+        ));
+        assert!(is_instance_in_app_family(
+            "hyperlinked",
+            "psht-hyperlinked-prev-1772593344"
+        ));
+        assert!(is_instance_in_app_family(
+            "hyperlinked",
+            "psht-hyperlinked-failed-1772593344"
+        ));
+        assert!(!is_instance_in_app_family(
+            "hyperlinked",
+            "psht-other-build-1772593344"
         ));
     }
 
