@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::io::BufRead;
 use std::process::{Command, Stdio};
@@ -603,6 +604,24 @@ pub fn add_proxy(app: &str, host_port: u16, container_port: u16) -> Result<(), S
         .run()
 }
 
+pub fn add_proxy_in_project(
+    instance_name: &str,
+    host_port: u16,
+    container_port: u16,
+    project: &str,
+) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .args(&["config", "device", "add"])
+        .arg(instance_name)
+        .arg("port")
+        .arg("proxy")
+        .arg(format!("listen=tcp:0.0.0.0:{host_port}"))
+        .arg(format!("connect=tcp:127.0.0.1:{container_port}"))
+        .run()
+}
+
 pub fn remove_proxy(app: &str) -> Result<(), String> {
     let name = container_name(app);
     let output = incus()
@@ -622,6 +641,98 @@ pub fn remove_proxy(app: &str) -> Result<(), String> {
     Err(format!(
         "incus config device remove {name} port failed: {stderr}"
     ))
+}
+
+pub fn remove_proxy_in_project(instance_name: &str, project: &str) -> Result<(), String> {
+    let output = incus()
+        .arg("--project")
+        .arg(project)
+        .args(&["config", "device", "remove"])
+        .arg(instance_name)
+        .arg("port")
+        .build()
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to run incus --project {project} config device remove {instance_name} port: {e}"
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if is_missing_device_error(&stderr) {
+        return Ok(());
+    }
+    Err(format!(
+        "incus --project {project} config device remove {instance_name} port failed: {stderr}"
+    ))
+}
+
+fn proxy_device_listen_value(device: &Value) -> Option<&str> {
+    let Value::Object(map) = device else {
+        return None;
+    };
+    let dev_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+    if !dev_type.eq_ignore_ascii_case("proxy") {
+        return None;
+    }
+    map.get("listen").and_then(Value::as_str).map(str::trim)
+}
+
+fn listen_value_matches_port(listen: &str, host_port: u16) -> bool {
+    let listen = listen.trim();
+    if !listen.starts_with("tcp:") {
+        return false;
+    }
+    listen
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        == Some(host_port)
+}
+
+fn proxy_port_owners_from_list_json(
+    list_json: &str,
+    host_port: u16,
+) -> Result<Vec<String>, String> {
+    let instances: Vec<Value> = serde_json::from_str(list_json)
+        .map_err(|e| format!("failed to parse incus list for proxy owner detection: {e}"))?;
+    let mut owners = BTreeSet::new();
+    for instance in instances {
+        let Value::Object(obj) = instance else {
+            continue;
+        };
+        let Some(name) = obj.get("name").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        for key in ["expanded_devices", "devices"] {
+            let Some(Value::Object(devices)) = obj.get(key) else {
+                continue;
+            };
+            for device in devices.values() {
+                let Some(listen) = proxy_device_listen_value(device) else {
+                    continue;
+                };
+                if listen_value_matches_port(listen, host_port) {
+                    owners.insert(name.to_string());
+                }
+            }
+        }
+    }
+    Ok(owners.into_iter().collect())
+}
+
+pub fn proxy_port_owners_in_project(project: &str, host_port: u16) -> Result<Vec<String>, String> {
+    let output = incus()
+        .arg("--project")
+        .arg(project)
+        .args(&["list", "--format=json"])
+        .output()?;
+    proxy_port_owners_from_list_json(&output, host_port)
 }
 
 #[allow(dead_code)]
@@ -1539,6 +1650,45 @@ mod tests {
             instance_name_from_resource("/1.0/networks/br0").as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn proxy_port_owners_from_list_json_finds_proxy_listeners() {
+        let json = r#"[
+  {
+    "name": "psht-hyperlinked",
+    "expanded_devices": {
+      "eth0": {"type":"nic"},
+      "port": {
+        "type":"proxy",
+        "listen":"tcp:0.0.0.0:3430",
+        "connect":"tcp:127.0.0.1:3430"
+      }
+    }
+  },
+  {
+    "name": "psht-other",
+    "devices": {
+      "port": {
+        "type":"proxy",
+        "listen":"tcp:[::]:3430",
+        "connect":"tcp:127.0.0.1:3430"
+      }
+    }
+  },
+  {
+    "name": "psht-unrelated",
+    "expanded_devices": {
+      "port": {
+        "type":"proxy",
+        "listen":"tcp:0.0.0.0:3555",
+        "connect":"tcp:127.0.0.1:3555"
+      }
+    }
+  }
+]"#;
+        let owners = proxy_port_owners_from_list_json(json, 3430).unwrap();
+        assert_eq!(owners, vec!["psht-hyperlinked", "psht-other"]);
     }
 
     #[test]

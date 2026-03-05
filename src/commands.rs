@@ -3705,6 +3705,80 @@ fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String>
     Ok(())
 }
 
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn ensure_proxy_attached_with_recovery(
+    target_app_ref: &str,
+    project: &str,
+    host_port: u16,
+    container_port: u16,
+    removable_owners: &BTreeSet<String>,
+) -> Result<(), String> {
+    let target_instance = instance_name_from_app_ref(target_app_ref);
+    let first_err =
+        match container::add_proxy_in_project(&target_instance, host_port, container_port, project)
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+    let owners = container::proxy_port_owners_in_project(project, host_port)?;
+    if owners.is_empty() {
+        return Err(format!(
+            "failed to attach proxy device to {target_instance} on :{host_port}: {first_err}; no proxy owners discovered in project {project}"
+        ));
+    }
+
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut remove_errors = Vec::new();
+    for owner in owners {
+        if owner == target_instance {
+            continue;
+        }
+        if !removable_owners.contains(&owner) {
+            skipped.push(owner);
+            continue;
+        }
+        match container::remove_proxy_in_project(&owner, project) {
+            Ok(()) => removed.push(owner),
+            Err(err) => remove_errors.push(format!("{owner}: {err}")),
+        }
+    }
+
+    if !remove_errors.is_empty() {
+        eprintln!(
+            "       Warning: failed removing stale proxy owners for :{host_port}: {}",
+            remove_errors.join(" | ")
+        );
+    }
+
+    match container::add_proxy_in_project(&target_instance, host_port, container_port, project) {
+        Ok(()) => {
+            if !removed.is_empty() || !skipped.is_empty() {
+                eprintln!(
+                    "       Recovered proxy :{host_port} for {target_instance} (removed: {}; skipped: {})",
+                    join_or_none(&removed),
+                    join_or_none(&skipped)
+                );
+            }
+            Ok(())
+        }
+        Err(retry_err) => Err(format!(
+            "failed to attach proxy device to {target_instance} on :{host_port} after owner cleanup: {retry_err}; initial error: {first_err}; removed owners: {}; skipped owners: {}; remove errors: {}",
+            join_or_none(&removed),
+            join_or_none(&skipped),
+            join_or_none(&remove_errors)
+        )),
+    }
+}
+
 fn is_transient_deploy_app_for(app: &str, candidate: &str) -> bool {
     let build_prefix = format!("{app}-build-");
     if let Some(suffix) = candidate.strip_prefix(&build_prefix) {
@@ -4799,6 +4873,12 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         .as_ref()
         .filter(|previous_app| *previous_app != &candidate_app && *previous_app != &old_active_app)
         .cloned();
+    let mut proxy_recovery_owners = BTreeSet::new();
+    proxy_recovery_owners.insert(instance_name_from_app_ref(&old_active_app));
+    proxy_recovery_owners.insert(instance_name_from_app_ref(&candidate_app));
+    if let Some(previous_app) = old_previous_app.as_ref() {
+        proxy_recovery_owners.insert(instance_name_from_app_ref(previous_app));
+    }
 
     eprintln!("-----> Switching traffic");
     check_deploy_interrupt(app, "before cutover")?;
@@ -4817,7 +4897,10 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         stop_app_process_on_port(&old_active_app, port)?;
 
         eprintln!("       Removing old proxy device");
-        container::remove_proxy(&old_active_app)?;
+        container::remove_proxy_in_project(
+            &instance_name_from_app_ref(&old_active_app),
+            &current_project,
+        )?;
         old_proxy_removed = true;
 
         eprintln!("       Detaching storage from current container");
@@ -4831,7 +4914,13 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         candidate_storage_attached = true;
 
         eprintln!("       Attaching proxy to new active container");
-        container::add_proxy(&candidate_app, port, port)?;
+        ensure_proxy_attached_with_recovery(
+            &candidate_app,
+            &current_project,
+            port,
+            port,
+            &proxy_recovery_owners,
+        )?;
         candidate_proxy_attached = true;
 
         eprintln!("       Starting app in new active container");
@@ -4912,9 +5001,17 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         Ok(name) => name,
         Err(err) => {
             eprintln!("-----> Cutover failed; rolling back traffic");
+            let mut rollback_issues = Vec::new();
 
             if candidate_proxy_attached {
-                let _ = container::remove_proxy(&candidate_app);
+                if let Err(remove_err) = container::remove_proxy_in_project(
+                    &instance_name_from_app_ref(&candidate_app),
+                    &current_project,
+                ) {
+                    rollback_issues.push(format!(
+                        "failed to detach candidate proxy device: {remove_err}"
+                    ));
+                }
             }
             if candidate_storage_attached {
                 let _ = container::remove_storage_mount(&candidate_app);
@@ -4928,7 +5025,17 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                 );
             }
             if old_proxy_removed {
-                let _ = container::add_proxy(&old_active_app, port, port);
+                if let Err(proxy_err) = ensure_proxy_attached_with_recovery(
+                    &old_active_app,
+                    &current_project,
+                    port,
+                    port,
+                    &proxy_recovery_owners,
+                ) {
+                    rollback_issues.push(format!(
+                        "failed to restore previous proxy device: {proxy_err}"
+                    ));
+                }
             }
 
             if let Ok(restored_start_command) = read_start_command(&old_active_app) {
@@ -4989,8 +5096,15 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                 let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
             }
 
+            if !rollback_issues.is_empty() {
+                eprintln!(
+                    "       Warning: rollback completed with issues: {}",
+                    rollback_issues.join(" | ")
+                );
+            }
             return Err(format!(
-                "deploy cutover failed and rollback was applied: {err}"
+                "deploy cutover failed and rollback was applied: {err}; rollback issues: {}",
+                join_or_none(&rollback_issues)
             ));
         }
     };

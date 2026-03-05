@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "psht"
-version = "0.2.52"
+version = "0.2.54"
 dependencies = [
  "clap",
  "exec",
