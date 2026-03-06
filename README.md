@@ -22,6 +22,13 @@ $ sudo psht-server bootstrap
 ```
 
 This will setup incus, a `psht` user and git hooks. You'll need a tailscale key so that apps can automatically be added to your tailnet.
+For Tailscale OAuth, configure these scopes:
+
+- `Keys: Write` with `tag:psht`
+- `Devices: Core Read`
+- `Devices: Core Write`
+
+OAuth settings: https://login.tailscale.com/admin/settings/oauth
 
 ### server commands
 

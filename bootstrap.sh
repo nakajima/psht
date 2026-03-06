@@ -80,7 +80,10 @@ else
     echo ""
     echo "       2. Create a credential at:"
     echo "          https://login.tailscale.com/admin/settings/oauth"
-    echo "          Under Scopes > Keys, check Write and select tag:psht."
+    echo "          Under Scopes, configure:"
+    echo "            - Keys: Write, tag:psht"
+    echo "            - Devices: Core Read"
+    echo "            - Devices: Core Write"
     echo ""
     printf "       Have you completed the steps above? (y/n) "
     read -r CONFIRM < /dev/tty

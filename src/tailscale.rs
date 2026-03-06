@@ -343,6 +343,40 @@ pub fn list_tailnet_devices(token: &str) -> Result<Vec<TailnetDevice>, String> {
     })
 }
 
+pub fn can_delete_tailnet_devices(token: &str) -> Result<bool, String> {
+    let probe_id = "psht-permission-probe-does-not-exist";
+    let output = Command::new("curl")
+        .args(["-sS", "-w", "\n%{http_code}", "-X", "DELETE"])
+        .args(["-H", &format!("Authorization: Bearer {token}")])
+        .arg(format!(
+            "https://api.tailscale.com/api/v2/device/{probe_id}"
+        ))
+        .output()
+        .map_err(|e| format!("failed to probe tailscale device delete permission: {e}"))?;
+    let response = String::from_utf8_lossy(&output.stdout).to_string();
+    let (body, status_code) = split_curl_body_and_status(&response);
+    if !output.status.success() {
+        return Err(format!(
+            "failed to probe tailscale device delete permission (curl status {}): {}",
+            output.status,
+            response_preview(&body, 220)
+        ));
+    }
+    match status_code {
+        Some(403) => Ok(false),
+        Some(400) | Some(404) => Ok(true),
+        Some(code) if (200..300).contains(&code) => Ok(true),
+        Some(code) => Err(format!(
+            "failed to probe tailscale device delete permission (http {code}): {}",
+            response_preview(&body, 220)
+        )),
+        None => Err(format!(
+            "failed to probe tailscale device delete permission: missing http status; body: {}",
+            response_preview(&body, 220)
+        )),
+    }
+}
+
 pub fn delete_tailnet_device(token: &str, device_id: &str) -> Result<(), String> {
     let output = Command::new("curl")
         .args(["-s", "-X", "DELETE"])
@@ -413,9 +447,9 @@ pub fn join_with_state_in_container(
             format!("failed to read tailscale state from container '{container_app}': {e}")
         })?;
     if let Some(state) = parse_backend_state(&status_json)
-        && (state == "NeedsLogin" || state == "NoState")
+        && (state == "NeedsLogin" || state == "NoState" || state == "Stopped")
     {
-        return Err(format!("tailscale state requires login (state: {state})"));
+        return Err(format!("tailscale state is unusable (state: {state})"));
     }
 
     // Prefer non-interactive settings update to avoid blocking on login prompts.

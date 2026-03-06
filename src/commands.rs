@@ -54,6 +54,10 @@ const UPGRADE_CHECK_TTL_SECS: u64 = 6 * 60 * 60;
 const TAILSCALE_ONLINE_WAIT_SECS: u64 = 20;
 const TAILSCALE_ONLINE_WAIT_POLL_MS: u64 = 500;
 const TAILSCALE_EXACT_HOSTNAME_TOTAL_TIMEOUT_SECS: u64 = 120;
+const TAILSCALE_OAUTH_SETTINGS_URL: &str = "https://login.tailscale.com/admin/settings/oauth";
+const TAILSCALE_OAUTH_SCOPE_HINT: &str =
+    "Keys: Write (tag:psht), Devices: Core Read, Devices: Core Write";
+const TAILSCALE_CLEANUP_PERMISSION_DENIED_MARKER: &str = "__tailscale_cleanup_permission_denied__";
 const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
 const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 const DEPLOY_INTERRUPT_WAIT_POLL_MS: u64 = 1000;
@@ -1036,6 +1040,76 @@ fn tailscale_self_health_from_json(json: &str) -> Result<(String, bool, Vec<Stri
     Ok((backend_state, online, health))
 }
 
+fn tailscale_api_permission_denied(err: &str) -> bool {
+    let lowered = err.to_ascii_lowercase();
+    lowered.contains("http 403")
+        || lowered.contains("not have enough permissions")
+        || lowered.contains("not enough permissions")
+        || lowered.contains("permission denied")
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TailscaleOauthPermissionCheck {
+    token_error: Option<String>,
+    devices_read_error: Option<String>,
+    devices_write_error: Option<String>,
+}
+
+impl TailscaleOauthPermissionCheck {
+    fn all_ok(&self) -> bool {
+        self.token_error.is_none()
+            && self.devices_read_error.is_none()
+            && self.devices_write_error.is_none()
+    }
+}
+
+fn check_tailscale_oauth_permissions() -> TailscaleOauthPermissionCheck {
+    let mut check = TailscaleOauthPermissionCheck::default();
+    let token = match tailscale::tailnet_access_token() {
+        Ok(token) => token,
+        Err(err) => {
+            check.token_error = Some(format!("failed to acquire tailnet OAuth token: {err}"));
+            return check;
+        }
+    };
+
+    if let Err(err) = tailscale::list_tailnet_devices(&token) {
+        check.devices_read_error = Some(err);
+    }
+    match tailscale::can_delete_tailnet_devices(&token) {
+        Ok(true) => {}
+        Ok(false) => {
+            check.devices_write_error = Some(
+                "tailnet OAuth actor does not have permission to delete devices".to_string(),
+            );
+        }
+        Err(err) => check.devices_write_error = Some(err),
+    }
+
+    check
+}
+
+fn format_tailscale_oauth_permission_failure(check: &TailscaleOauthPermissionCheck) -> String {
+    let mut lines = Vec::new();
+    if let Some(err) = check.token_error.as_deref() {
+        lines.push(format!("OAuth token: {err}"));
+    }
+    if let Some(err) = check.devices_read_error.as_deref() {
+        lines.push(format!("Devices read: {err}"));
+    }
+    if let Some(err) = check.devices_write_error.as_deref() {
+        lines.push(format!("Devices write: {err}"));
+    }
+    if lines.is_empty() {
+        lines.push("unknown OAuth permission validation failure".to_string());
+    }
+
+    format!(
+        "tailscale OAuth credential is missing required permissions or failed validation:\n       {}\n       Required OAuth scopes: {TAILSCALE_OAUTH_SCOPE_HINT}\n       Configure at: {TAILSCALE_OAUTH_SETTINGS_URL}",
+        lines.join("\n       ")
+    )
+}
+
 fn wait_for_tailscale_online(
     app: &str,
     timeout: Duration,
@@ -1085,10 +1159,6 @@ fn reset_tailscale_for_retry(container_app: &str) -> Result<(), String> {
         container_app,
         "systemctl stop tailscaled >/dev/null 2>&1 || true",
     )
-}
-
-fn state_join_requires_auth_key(state_err: &str) -> bool {
-    state_err.contains("tailscale state requires login")
 }
 
 fn retry_attempt_budget(timeout_secs: u64, retry_sleep: Duration) -> u64 {
@@ -1143,18 +1213,17 @@ where
             elapsed.as_secs()
         );
 
-        let join_attempt = if !in_auth_phase {
+        let used_auth_phase = in_auth_phase;
+        let join_attempt = if !used_auth_phase {
             match join_with_state(container_app, app) {
                 Ok(attempt) => attempt,
                 Err(state_err) => {
                     last_observation = format!("state join failed: {state_err}");
                     eprintln!("       State-based tailscale join failed: {state_err}");
-                    if state_join_requires_auth_key(&state_err) {
-                        in_auth_phase = true;
-                        eprintln!(
-                            "       State-based tailscale state is unusable; switching to auth-key recovery"
-                        );
-                    }
+                    in_auth_phase = true;
+                    eprintln!(
+                        "       State-based tailscale recovery failed; switching to auth-key recovery"
+                    );
                     if let Err(reset_err) = reset_for_retry(container_app) {
                         eprintln!(
                             "       Warning: failed to reset tailscale before retry: {reset_err}"
@@ -1181,10 +1250,20 @@ where
             }
         };
         let name = join_attempt.dns_name;
-        let active_cleanup_lookup_error = if in_auth_phase {
+        let active_cleanup_lookup_error = if used_auth_phase {
             let active_cleanup_lookup_error = join_attempt.cleanup_lookup_error;
             if let Some(err) = active_cleanup_lookup_error.as_deref() {
-                if last_logged_cleanup_lookup_error.as_deref() != Some(err) {
+                if tailscale_api_permission_denied(err) {
+                    if last_logged_cleanup_lookup_error.as_deref()
+                        != Some(TAILSCALE_CLEANUP_PERMISSION_DENIED_MARKER)
+                    {
+                        eprintln!(
+                            "       Warning: tailnet device cleanup skipped (OAuth scopes missing: {TAILSCALE_OAUTH_SCOPE_HINT}). Run `sudo psht-server doctor`."
+                        );
+                        last_logged_cleanup_lookup_error =
+                            Some(TAILSCALE_CLEANUP_PERMISSION_DENIED_MARKER.to_string());
+                    }
+                } else if last_logged_cleanup_lookup_error.as_deref() != Some(err) {
                     eprintln!(
                         "       Warning: unable to inspect tailnet devices during auth-key recovery: {err}"
                     );
@@ -1203,10 +1282,22 @@ where
         let Some(dns_name) = name.as_deref() else {
             last_observation = "tailscale DNS name unavailable".to_string();
             eprintln!("       Tailscale DNS name unavailable yet; retrying");
-            if in_auth_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
+            if !used_auth_phase {
+                in_auth_phase = true;
+                eprintln!(
+                    "       State-based tailscale recovery produced no DNS name; switching to auth-key recovery"
+                );
+            }
+            if used_auth_phase
+                && let Some(err) = active_cleanup_lookup_error.as_deref()
+                && !tailscale_api_permission_denied(err)
+            {
                 return Err(format!(
                     "failed to acquire exact tailscale hostname '{app}' after auth-key join because ownership cleanup was unavailable: {err}; observed dns: unavailable"
                 ));
+            }
+            if let Err(reset_err) = reset_for_retry(container_app) {
+                eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
             }
             sleep(retry_sleep);
             continue;
@@ -1217,10 +1308,22 @@ where
             eprintln!(
                 "       Hostname mismatch: got '{dns_name}', expected label '{app}'. Retrying..."
             );
-            if in_auth_phase && let Some(err) = active_cleanup_lookup_error.as_deref() {
+            if !used_auth_phase {
+                in_auth_phase = true;
+                eprintln!(
+                    "       State-based tailscale hostname was not exact; switching to auth-key recovery"
+                );
+            }
+            if used_auth_phase
+                && let Some(err) = active_cleanup_lookup_error.as_deref()
+                && !tailscale_api_permission_denied(err)
+            {
                 return Err(format!(
                     "failed to acquire exact tailscale hostname '{app}' after auth-key join because ownership cleanup was unavailable: {err}; observed dns: {dns_name}"
                 ));
+            }
+            if let Err(reset_err) = reset_for_retry(container_app) {
+                eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
             }
             sleep(retry_sleep);
             continue;
@@ -1234,6 +1337,15 @@ where
             Err(health_err) => {
                 last_observation = format!("tailscale not healthy yet: {health_err}");
                 eprintln!("       Tailscale not healthy yet: {health_err}");
+                if !used_auth_phase {
+                    in_auth_phase = true;
+                    eprintln!(
+                        "       State-based tailscale health check failed; switching to auth-key recovery"
+                    );
+                }
+                if let Err(reset_err) = reset_for_retry(container_app) {
+                    eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
+                }
                 sleep(retry_sleep);
             }
         }
@@ -6678,8 +6790,11 @@ pub fn bootstrap() -> Result<(), String> {
             println!("          https://login.tailscale.com/admin/acls/visual/tags/add");
             println!();
             println!("       2. Create a credential at:");
-            println!("          https://login.tailscale.com/admin/settings/oauth");
-            println!("          Under Scopes > Keys, check Write and select tag:psht.");
+            println!("          {TAILSCALE_OAUTH_SETTINGS_URL}");
+            println!("          Under Scopes, configure:");
+            println!("            - Keys: Write, tag:psht");
+            println!("            - Devices: Core Read");
+            println!("            - Devices: Core Write");
             println!();
 
             let confirm = prompt_tty("       Have you completed the steps above? (y/n) ")?;
@@ -6693,6 +6808,12 @@ pub fn bootstrap() -> Result<(), String> {
             let client_id = prompt_tty("OAuth client ID: ")?;
             let client_secret = prompt_tty("OAuth client secret: ")?;
             write_oauth_config(&oauth_config, client_id.trim(), client_secret.trim())?;
+        }
+
+        eprintln!("-----> Validating Tailscale OAuth permissions");
+        let oauth_check = check_tailscale_oauth_permissions();
+        if !oauth_check.all_ok() {
+            return Err(format_tailscale_oauth_permission_failure(&oauth_check));
         }
     }
 
@@ -7146,11 +7267,52 @@ pub fn doctor() -> Result<(), String> {
             &mut failed,
         );
         let oauth_config = home_dir().join(".config/tailscale-oauth");
+        let oauth_exists = oauth_config.is_file();
         doctor_check(
             "$PSHT_HOME/.config/tailscale-oauth exists",
-            oauth_config.is_file(),
+            oauth_exists,
             &mut failed,
         );
+        if oauth_exists {
+            let oauth_check = check_tailscale_oauth_permissions();
+            let token_ok = oauth_check.token_error.is_none();
+            doctor_check("tailscale OAuth token fetch", token_ok, &mut failed);
+            if let Some(err) = oauth_check.token_error.as_deref() {
+                println!("         reason: {err}");
+                println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
+            }
+
+            let read_ok = token_ok && oauth_check.devices_read_error.is_none();
+            doctor_check("tailscale device api read permission", read_ok, &mut failed);
+            if !read_ok {
+                let reason = oauth_check
+                    .devices_read_error
+                    .as_deref()
+                    .or(oauth_check.token_error.as_deref())
+                    .unwrap_or("unknown");
+                println!("         reason: {reason}");
+                println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
+            }
+
+            let write_ok = token_ok && oauth_check.devices_write_error.is_none();
+            doctor_check("tailscale device api write permission", write_ok, &mut failed);
+            if !write_ok {
+                let reason = oauth_check
+                    .devices_write_error
+                    .as_deref()
+                    .or(oauth_check.token_error.as_deref())
+                    .unwrap_or("unknown");
+                println!("         reason: {reason}");
+                println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
+            }
+        } else {
+            doctor_check("tailscale OAuth token fetch", false, &mut failed);
+            doctor_check("tailscale device api read permission", false, &mut failed);
+            doctor_check("tailscale device api write permission", false, &mut failed);
+            println!("         reason: tailscale OAuth config is missing");
+            println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
+            println!("         configure at: {TAILSCALE_OAUTH_SETTINGS_URL}");
+        }
     }
 
     println!();
@@ -8250,11 +8412,8 @@ devices:
     }
 
     #[test]
-    fn acquire_exact_tailscale_hostname_retries_until_exact() {
-        let mut state_results = std::collections::VecDeque::from([
-            Ok(Some("hyperlinked-1.tail.ts.net".to_string())),
-            Ok(Some("hyperlinked.tail.ts.net".to_string())),
-        ]);
+    fn acquire_exact_tailscale_hostname_uses_state_when_exact_and_healthy() {
+        let mut state_calls = 0usize;
         let mut auth_calls = 0usize;
         let mut reset_calls = 0usize;
         let mut sleep_calls = 0usize;
@@ -8264,10 +8423,10 @@ devices:
             "candidate",
             "hyperlinked",
             |_container, _app| {
-                state_results
-                    .pop_front()
-                    .expect("state result should exist for each attempt")
-                    .map(TailscaleJoinAttempt::from_dns_name)
+                state_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "hyperlinked.tail.ts.net".to_string(),
+                )))
             },
             |_container, _app| {
                 auth_calls += 1;
@@ -8290,9 +8449,97 @@ devices:
         .unwrap();
 
         assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(state_calls, 1);
         assert_eq!(auth_calls, 0);
         assert_eq!(health_calls, 1);
         assert_eq!(reset_calls, 0);
+        assert_eq!(sleep_calls, 0);
+    }
+
+    #[test]
+    fn acquire_exact_tailscale_hostname_switches_to_auth_when_state_has_no_dns() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
+
+        let name = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(None))
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "hyperlinked.tail.ts.net".to_string(),
+                )))
+            },
+            |_container| Ok(()),
+            |_container| {
+                reset_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 1);
+        assert_eq!(reset_calls, 1);
+        assert_eq!(sleep_calls, 1);
+    }
+
+    #[test]
+    fn acquire_exact_tailscale_hostname_switches_to_auth_when_state_is_unhealthy() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
+        let mut health_calls = 0usize;
+
+        let name = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "hyperlinked.tail.ts.net".to_string(),
+                )))
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "hyperlinked.tail.ts.net".to_string(),
+                )))
+            },
+            |_container| {
+                health_calls += 1;
+                if health_calls == 1 {
+                    Err("state unhealthy".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |_container| {
+                reset_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 1);
+        assert_eq!(health_calls, 2);
+        assert_eq!(reset_calls, 1);
         assert_eq!(sleep_calls, 1);
     }
 
@@ -8339,6 +8586,8 @@ devices:
     fn acquire_exact_tailscale_hostname_stays_on_auth_key_after_state_requires_login() {
         let mut state_calls = 0usize;
         let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
         let mut auth_results = std::collections::VecDeque::from([
             Ok(Some("hyperlinked-1.tail.ts.net".to_string())),
             Ok(Some("hyperlinked.tail.ts.net".to_string())),
@@ -8359,14 +8608,21 @@ devices:
                     .map(TailscaleJoinAttempt::from_dns_name)
             },
             |_container| Ok(()),
-            |_container| Ok(()),
-            |_duration| {},
+            |_container| {
+                reset_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
         )
         .unwrap();
 
         assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
         assert_eq!(state_calls, 1);
         assert_eq!(auth_calls, 2);
+        assert_eq!(reset_calls, 2);
+        assert_eq!(sleep_calls, 2);
     }
 
     #[test]
@@ -8398,6 +8654,70 @@ devices:
         assert!(err.contains("hyperlinked-1.tail.ts.net"));
         assert_eq!(state_calls, 1);
         assert_eq!(auth_calls, 1);
+    }
+
+    #[test]
+    fn acquire_exact_tailscale_hostname_does_not_fail_fast_when_cleanup_permission_denied() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
+        let mut auth_results = std::collections::VecDeque::from([
+            TailscaleJoinAttempt {
+                dns_name: Some("hyperlinked-1.tail.ts.net".to_string()),
+                cleanup_lookup_error: Some(
+                    "failed to list tailscale devices (http 403): calling actor does not have enough permissions"
+                        .to_string(),
+                ),
+            },
+            TailscaleJoinAttempt {
+                dns_name: Some("hyperlinked.tail.ts.net".to_string()),
+                cleanup_lookup_error: Some(
+                    "failed to list tailscale devices (http 403): calling actor does not have enough permissions"
+                        .to_string(),
+                ),
+            },
+        ]);
+
+        let name = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Err("tailscale state is unusable (state: NoState)".to_string())
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(auth_results
+                    .pop_front()
+                    .expect("auth result should exist for each auth attempt"))
+            },
+            |_container| Ok(()),
+            |_container| {
+                reset_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap();
+
+        assert_eq!(name.as_deref(), Some("hyperlinked.tail.ts.net"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 2);
+        assert_eq!(reset_calls, 2);
+        assert_eq!(sleep_calls, 2);
+    }
+
+    #[test]
+    fn tailscale_api_permission_denied_detects_403_responses() {
+        assert!(tailscale_api_permission_denied(
+            "failed to list tailscale devices (http 403): {\"message\":\"calling actor does not have enough permissions to perform this function\"}"
+        ));
+        assert!(!tailscale_api_permission_denied(
+            "failed to list tailscale devices (http 500): upstream unavailable"
+        ));
     }
 
     #[test]
