@@ -3762,6 +3762,41 @@ fn stop_app_process_on_port(app: &str, port: u16) -> Result<(), String> {
     container::exec_cmd(app, &stop_port_listeners_cmd(port))
 }
 
+fn should_tolerate_cutover_stop_failure(
+    was_running_before_stop: bool,
+    running_after_failure: Option<bool>,
+) -> bool {
+    if !was_running_before_stop {
+        return true;
+    }
+    matches!(running_after_failure, Some(false))
+}
+
+fn stop_active_app_process_for_cutover(app: &str, port: u16) -> Result<(), String> {
+    let was_running = container::is_running(app)?;
+    if !was_running {
+        eprintln!(
+            "       Warning: previous active container is already stopped; skipping app process stop"
+        );
+        return Ok(());
+    }
+
+    match stop_app_process_on_port(app, port) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let running_after_failure = container::is_running(app).ok();
+            if should_tolerate_cutover_stop_failure(was_running, running_after_failure) {
+                eprintln!(
+                    "       Warning: previous active container stopped during cutover stop; continuing"
+                );
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 fn app_log_tail(app: &str, lines: u32) -> Option<String> {
     let output = container::exec_output(
         app,
@@ -5615,7 +5650,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     let cutover_result = (|| -> Result<Option<String>, String> {
         check_deploy_interrupt(app, "cutover start")?;
         eprintln!("       Stopping current app process");
-        stop_app_process_on_port(&old_active_app, port)?;
+        stop_active_app_process_for_cutover(&old_active_app, port)?;
 
         eprintln!("       Removing old proxy device");
         container::remove_proxy_in_project(
@@ -9261,6 +9296,26 @@ devices:
         assert!(cmd.contains("kill -TERM -- \"-$pid\""));
         assert!(cmd.contains("kill -KILL -- \"-$pid\""));
         assert!(cmd.contains("listener process(es) on port 3430 did not exit"));
+    }
+
+    #[test]
+    fn cutover_stop_tolerates_container_not_running_before_stop() {
+        assert!(should_tolerate_cutover_stop_failure(false, None));
+    }
+
+    #[test]
+    fn cutover_stop_tolerates_container_stopped_after_failed_stop_command() {
+        assert!(should_tolerate_cutover_stop_failure(true, Some(false)));
+    }
+
+    #[test]
+    fn cutover_stop_does_not_tolerate_when_container_still_running_after_failure() {
+        assert!(!should_tolerate_cutover_stop_failure(true, Some(true)));
+    }
+
+    #[test]
+    fn cutover_stop_does_not_tolerate_when_running_state_after_failure_is_unknown() {
+        assert!(!should_tolerate_cutover_stop_failure(true, None));
     }
 
     #[test]
