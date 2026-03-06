@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::container;
@@ -18,7 +18,7 @@ fn credentials_path() -> PathBuf {
     PathBuf::from(home).join(".config/tailscale-oauth")
 }
 
-fn read_credentials_from(path: &std::path::Path) -> Result<(String, String), String> {
+fn read_credentials_from(path: &Path) -> Result<(String, String), String> {
     let contents = fs::read_to_string(path)
         .map_err(|_| "tailscale OAuth not configured — run `psht bootstrap`".to_string())?;
 
@@ -305,6 +305,11 @@ pub fn auth_key() -> Result<String, String> {
 
 pub fn tailnet_access_token() -> Result<String, String> {
     let (client_id, client_secret) = read_credentials()?;
+    oauth_token(&client_id, &client_secret)
+}
+
+pub fn tailnet_access_token_from_path(path: &Path) -> Result<String, String> {
+    let (client_id, client_secret) = read_credentials_from(path)?;
     oauth_token(&client_id, &client_secret)
 }
 

@@ -96,6 +96,19 @@ fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
 
+fn psht_user_home_dir() -> PathBuf {
+    run_cmd_capture("getent", &["passwd", "psht"])
+        .ok()
+        .and_then(|line| {
+            line.split(':')
+                .nth(5)
+                .map(str::trim)
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/home/psht"))
+}
+
 fn builds_dir() -> PathBuf {
     home_dir().join("builds")
 }
@@ -1063,9 +1076,9 @@ impl TailscaleOauthPermissionCheck {
     }
 }
 
-fn check_tailscale_oauth_permissions() -> TailscaleOauthPermissionCheck {
+fn check_tailscale_oauth_permissions(oauth_config_path: &Path) -> TailscaleOauthPermissionCheck {
     let mut check = TailscaleOauthPermissionCheck::default();
-    let token = match tailscale::tailnet_access_token() {
+    let token = match tailscale::tailnet_access_token_from_path(oauth_config_path) {
         Ok(token) => token,
         Err(err) => {
             check.token_error = Some(format!("failed to acquire tailnet OAuth token: {err}"));
@@ -1079,9 +1092,8 @@ fn check_tailscale_oauth_permissions() -> TailscaleOauthPermissionCheck {
     match tailscale::can_delete_tailnet_devices(&token) {
         Ok(true) => {}
         Ok(false) => {
-            check.devices_write_error = Some(
-                "tailnet OAuth actor does not have permission to delete devices".to_string(),
-            );
+            check.devices_write_error =
+                Some("tailnet OAuth actor does not have permission to delete devices".to_string());
         }
         Err(err) => check.devices_write_error = Some(err),
     }
@@ -1344,7 +1356,9 @@ where
                     );
                 }
                 if let Err(reset_err) = reset_for_retry(container_app) {
-                    eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
+                    eprintln!(
+                        "       Warning: failed to reset tailscale before retry: {reset_err}"
+                    );
                 }
                 sleep(retry_sleep);
             }
@@ -1524,10 +1538,9 @@ fn tailscale_self_status_summary_from_json(app: &str, json: &str) -> Result<Stri
     Ok(lines.join("\n"))
 }
 
-fn tailscale_ssh_enabled() -> Result<bool, String> {
-    let json = run_cmd_capture("tailscale", &["status", "--json"])?;
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| format!("failed to parse tailscale status: {e}"))?;
+fn tailscale_ssh_enabled_from_status_json(json: &str) -> Result<bool, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse tailscale status: {e}"))?;
 
     if value
         .pointer("/Self/SSH")
@@ -1537,7 +1550,41 @@ fn tailscale_ssh_enabled() -> Result<bool, String> {
         return Ok(true);
     }
 
+    let capmap_has_ssh = value
+        .get("Self")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|self_obj| self_obj.get("CapMap"))
+        .and_then(serde_json::Value::as_object)
+        .map(|caps| caps.contains_key("https://tailscale.com/cap/ssh"))
+        .unwrap_or(false);
+    if capmap_has_ssh {
+        return Ok(true);
+    }
+
+    let capabilities_have_ssh = value
+        .get("Self")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|self_obj| self_obj.get("Capabilities"))
+        .and_then(serde_json::Value::as_array)
+        .map(|caps| {
+            caps.iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|cap| {
+                    cap.eq_ignore_ascii_case("https://tailscale.com/cap/ssh")
+                        || cap.eq_ignore_ascii_case("ssh")
+                })
+        })
+        .unwrap_or(false);
+    if capabilities_have_ssh {
+        return Ok(true);
+    }
+
     Ok(json.contains("\"SSH\":true"))
+}
+
+fn tailscale_ssh_enabled() -> Result<bool, String> {
+    let json = run_cmd_capture("tailscale", &["status", "--json"])?;
+    tailscale_ssh_enabled_from_status_json(&json)
 }
 
 fn current_psht_binary() -> Result<PathBuf, String> {
@@ -6811,7 +6858,7 @@ pub fn bootstrap() -> Result<(), String> {
         }
 
         eprintln!("-----> Validating Tailscale OAuth permissions");
-        let oauth_check = check_tailscale_oauth_permissions();
+        let oauth_check = check_tailscale_oauth_permissions(&oauth_config);
         if !oauth_check.all_ok() {
             return Err(format_tailscale_oauth_permission_failure(&oauth_check));
         }
@@ -7171,6 +7218,7 @@ fn doctor_check(label: &str, ok: bool, failed: &mut bool) {
 pub fn doctor() -> Result<(), String> {
     let expected_version = env!("CARGO_PKG_VERSION");
     let mut failed = false;
+    let psht_home = psht_user_home_dir();
 
     println!("Installation:");
     let psht_user_shell = psht_user_shell_path();
@@ -7182,7 +7230,7 @@ pub fn doctor() -> Result<(), String> {
             .unwrap_or(false),
         &mut failed,
     );
-    let psht_cli_path = home_dir().join("bin/psht");
+    let psht_cli_path = psht_home.join("bin/psht");
     doctor_check(
         "$PSHT_HOME/bin/psht executable",
         psht_cli_path.is_file() && path_is_world_executable(&psht_cli_path).unwrap_or(false),
@@ -7266,7 +7314,7 @@ pub fn doctor() -> Result<(), String> {
             tailscale_ssh_enabled().unwrap_or(false),
             &mut failed,
         );
-        let oauth_config = home_dir().join(".config/tailscale-oauth");
+        let oauth_config = psht_home.join(".config/tailscale-oauth");
         let oauth_exists = oauth_config.is_file();
         doctor_check(
             "$PSHT_HOME/.config/tailscale-oauth exists",
@@ -7274,7 +7322,7 @@ pub fn doctor() -> Result<(), String> {
             &mut failed,
         );
         if oauth_exists {
-            let oauth_check = check_tailscale_oauth_permissions();
+            let oauth_check = check_tailscale_oauth_permissions(&oauth_config);
             let token_ok = oauth_check.token_error.is_none();
             doctor_check("tailscale OAuth token fetch", token_ok, &mut failed);
             if let Some(err) = oauth_check.token_error.as_deref() {
@@ -7295,7 +7343,11 @@ pub fn doctor() -> Result<(), String> {
             }
 
             let write_ok = token_ok && oauth_check.devices_write_error.is_none();
-            doctor_check("tailscale device api write permission", write_ok, &mut failed);
+            doctor_check(
+                "tailscale device api write permission",
+                write_ok,
+                &mut failed,
+            );
             if !write_ok {
                 let reason = oauth_check
                     .devices_write_error
@@ -7317,9 +7369,9 @@ pub fn doctor() -> Result<(), String> {
 
     println!();
     println!("Directories & stacks:");
-    let repos = home_dir().join("repos");
-    let builds = home_dir().join("builds");
-    let stacks = home_dir().join("stacks");
+    let repos = psht_home.join("repos");
+    let builds = psht_home.join("builds");
+    let stacks = psht_home.join("stacks");
     doctor_check("$PSHT_HOME/repos exists", repos.is_dir(), &mut failed);
     doctor_check("$PSHT_HOME/builds exists", builds.is_dir(), &mut failed);
     doctor_check("$PSHT_HOME/stacks exists", stacks.is_dir(), &mut failed);
@@ -8392,6 +8444,24 @@ devices:
     }
 
     #[test]
+    fn tailscale_ssh_enabled_from_status_json_accepts_self_ssh_flag() {
+        let json = r#"{"Self":{"SSH":true}}"#;
+        assert!(tailscale_ssh_enabled_from_status_json(json).unwrap());
+    }
+
+    #[test]
+    fn tailscale_ssh_enabled_from_status_json_accepts_capabilities_ssh() {
+        let json = r#"{"Self":{"Capabilities":["https://tailscale.com/cap/ssh"]}}"#;
+        assert!(tailscale_ssh_enabled_from_status_json(json).unwrap());
+    }
+
+    #[test]
+    fn tailscale_ssh_enabled_from_status_json_accepts_capmap_ssh() {
+        let json = r#"{"Self":{"CapMap":{"https://tailscale.com/cap/ssh":null}}}"#;
+        assert!(tailscale_ssh_enabled_from_status_json(json).unwrap());
+    }
+
+    #[test]
     fn tailscale_hostname_is_exact_matches_label_only() {
         assert!(tailscale_hostname_is_exact(
             "hyperlinked.tail.ts.net",
@@ -8544,8 +8614,8 @@ devices:
     }
 
     #[test]
-    fn acquire_exact_tailscale_hostname_falls_back_to_auth_key_immediately_when_state_requires_login(
-    ) {
+    fn acquire_exact_tailscale_hostname_falls_back_to_auth_key_immediately_when_state_requires_login()
+     {
         let mut state_calls = 0usize;
         let mut auth_calls = 0usize;
         let mut reset_calls = 0usize;
