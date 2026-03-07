@@ -60,6 +60,10 @@ enum CliCommand {
     },
     /// Stop an app
     Stop { app: Option<String> },
+    /// Start a stopped app
+    Start { app: Option<String> },
+    /// Restart an app
+    Restart { app: Option<String> },
     /// Stop and remove an app (Caddy routing cleanup is experimental)
     Destroy { app: Option<String> },
     /// Manage environment variables for the project app
@@ -1691,6 +1695,16 @@ fn run() -> Result<(), String> {
             let app = resolve_command_app(&cwd, app.as_deref())?;
             ssh_cmd(&host, &["stop", &app])
         }
+        CliCommand::Start { app } => {
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            let app = resolve_command_app(&cwd, app.as_deref())?;
+            ssh_cmd(&host, &["start", &app])
+        }
+        CliCommand::Restart { app } => {
+            let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
+            let app = resolve_command_app(&cwd, app.as_deref())?;
+            ssh_cmd(&host, &["restart", &app])
+        }
         CliCommand::Destroy { app } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             let app = resolve_command_app(&cwd, app.as_deref())?;
@@ -1905,6 +1919,28 @@ mod tests {
                 assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
             }
             _ => panic!("expected env:unset command"),
+        }
+    }
+
+    #[test]
+    fn start_command_parses_with_optional_app() {
+        let cli = Cli::try_parse_from(["psht", "start"]).unwrap();
+        match cli.command {
+            CliCommand::Start { app } => {
+                assert!(app.is_none());
+            }
+            _ => panic!("expected start command"),
+        }
+    }
+
+    #[test]
+    fn restart_command_parses_with_explicit_app() {
+        let cli = Cli::try_parse_from(["psht", "restart", "demo"]).unwrap();
+        match cli.command {
+            CliCommand::Restart { app } => {
+                assert_eq!(app.as_deref(), Some("demo"));
+            }
+            _ => panic!("expected restart command"),
         }
     }
 

@@ -6,6 +6,7 @@ mod deploy_log;
 mod detect;
 mod git;
 mod sqlite_store;
+mod stats;
 mod tailscale;
 
 #[cfg(all(test, feature = "integration"))]
@@ -48,6 +49,8 @@ enum Command {
     Stop { app: String },
     /// Start a stopped app
     Start { app: String },
+    /// Restart an app
+    Restart { app: String },
     /// Stop and remove an app (Caddy routing cleanup is experimental)
     Destroy { app: String },
     /// Set up this server as a psht host
@@ -201,6 +204,10 @@ fn run() -> Result<(), String> {
         Command::Start { app } => {
             app_name::validate_app_name(&app)?;
             commands::start(&app)
+        }
+        Command::Restart { app } => {
+            app_name::validate_app_name(&app)?;
+            commands::restart(&app)
         }
         Command::Destroy { app } => {
             app_name::validate_app_name(&app)?;
@@ -418,6 +425,17 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Start {
+                app: "myapp".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_restart() {
+        let cli = parse_cli(&["psht-server", "restart", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Restart {
                 app: "myapp".to_string()
             }
         );

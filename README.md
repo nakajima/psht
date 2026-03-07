@@ -74,6 +74,10 @@ See what's running.
 
 See the logs for the current app (or pass `--app` to see a specific app). Passing `-f` will follow the logs as they come in.
 
+#### `psht stop|start|restart`
+
+Control the current app lifecycle from your project directory.
+
 #### `psht tailscale`
 
 Manage tailscale for the app.
@@ -81,8 +85,29 @@ Manage tailscale for the app.
 #### `psht env FOO=123 BAR="abc"`
 
 Set environment variables for the app.
+These vars are also loaded in interactive Tailscale SSH logins to the app container.
 
 - Per-app persistent storage mounted at `/storage` (survives deploys/rebuilds, removed by `destroy`).
+
+### Optional InfluxDB Stats
+
+`psht-server` can report deploy/health stats to InfluxDB (v2 API) when these env vars are set:
+
+- `PSHT_STATS_INFLUX_URL` (example: `https://influx.example.com`)
+- `PSHT_STATS_INFLUX_ORG`
+- `PSHT_STATS_INFLUX_BUCKET`
+- `PSHT_STATS_INFLUX_TOKEN`
+
+Optional:
+
+- `PSHT_STATS_INFLUX_MEASUREMENT` (default: `psht_stats`)
+- `PSHT_STATS_INFLUX_TIMEOUT_SECS` (default: `2`)
+- `PSHT_STATS_INFLUX_DEBUG=1` (prints write failures to stderr)
+
+Measurements written:
+
+- `<measurement>`: deploy/push attempt outcomes
+- `<measurement>_health`: health summary checks
 
 #### `psht update`
 
