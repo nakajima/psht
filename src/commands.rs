@@ -36,6 +36,9 @@ const DEFAULT_FORGE_URL: &str = "https://github.com/nakajima/psht";
 const START_COMMAND_PATH: &str = "/etc/psht-start-command";
 const REQUIRED_ENV_PATH: &str = "/etc/psht-required-env";
 const SSH_LOGIN_ENV_PATH: &str = "/etc/profile.d/psht-env.sh";
+const APP_SERVICE_NAME: &str = "psht-app.service";
+const APP_SERVICE_UNIT_PATH: &str = "/etc/systemd/system/psht-app.service";
+const APP_SERVICE_RUNNER_PATH: &str = "/usr/local/bin/psht-app-runner";
 const APP_PROCESS_PID_PATH: &str = "/var/psht/app.pid";
 const APP_PROCESS_LOG_PATH: &str = "/var/psht/app.log";
 const INSTALL_LOG_PATH: &str = "/var/psht/install.log";
@@ -82,6 +85,11 @@ const BUSY_OP_POLICY_ENV: &str = "PSHT_BUSY_OP_POLICY";
 const BLOCKED_OP_BUDGET_SECS: u64 = 15;
 const DEPLOY_RETRY_INITIAL_SLEEP_SECS: u64 = 1;
 const DEPLOY_RETRY_MAX_SLEEP_SECS: u64 = 15;
+const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
+const SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
+const SUPERVISE_INTERVAL_SECS: u64 = 30;
+const DESIRED_STATE_RUNNING: &str = "running";
+const DESIRED_STATE_STOPPED: &str = "stopped";
 
 macro_rules! eprintln {
     () => {
@@ -3667,21 +3675,100 @@ fn start_exports(port: u16, vars: &BTreeMap<String, String>) -> Result<String, S
     Ok(parts.join(" && "))
 }
 
-fn start_cmd(port: u16, cmd: &str, vars: &BTreeMap<String, String>) -> Result<String, String> {
+fn app_runner_script_content(
+    port: u16,
+    cmd: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<String, String> {
     let escaped = shell_quote(cmd);
     let exports = start_exports(port, vars)?;
     Ok(format!(
-        "mkdir -p /var/psht && cd /app && {exports} && {{ setsid sh -c {escaped} > {APP_PROCESS_LOG_PATH} 2>&1 < /dev/null & echo $! > {APP_PROCESS_PID_PATH}; }}"
+        "#!/bin/sh\nset -eu\nmkdir -p /var/psht\ncd /app\n{exports}\nexec sh -c {escaped}\n"
     ))
 }
 
+fn write_app_runner_cmd(
+    port: u16,
+    cmd: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let script = app_runner_script_content(port, cmd, vars)?;
+    let escaped = shell_quote(&script);
+    Ok(format!(
+        "mkdir -p /usr/local/bin && printf '%s' {escaped} > {APP_SERVICE_RUNNER_PATH} && chmod 755 {APP_SERVICE_RUNNER_PATH}"
+    ))
+}
+
+fn app_service_unit_content() -> String {
+    format!(
+        "[Unit]\nDescription=psht application process\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory=/app\nExecStart={APP_SERVICE_RUNNER_PATH}\nRestart=always\nRestartSec=2\nKillMode=control-group\nStandardOutput=append:{APP_PROCESS_LOG_PATH}\nStandardError=append:{APP_PROCESS_LOG_PATH}\n\n[Install]\nWantedBy=multi-user.target\n"
+    )
+}
+
+fn write_app_service_unit_cmd() -> String {
+    let escaped = shell_quote(&app_service_unit_content());
+    format!(
+        "mkdir -p /etc/systemd/system /var/psht && printf '%s' {escaped} > {APP_SERVICE_UNIT_PATH} && chmod 644 {APP_SERVICE_UNIT_PATH}"
+    )
+}
+
+fn ensure_app_service_installed(
+    app: &str,
+    port: u16,
+    cmd: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    persist_ssh_login_env(app, vars)?;
+    container::exec_cmd(app, &write_app_runner_cmd(port, cmd, vars)?)?;
+    container::exec_cmd(app, &write_app_service_unit_cmd())?;
+    container::exec_cmd(app, "systemctl daemon-reload")?;
+    container::exec_cmd(app, &format!("systemctl enable {APP_SERVICE_NAME}"))?;
+    Ok(())
+}
+
+fn app_service_is_active(app: &str) -> Result<bool, String> {
+    let output = container::exec_output(
+        app,
+        &format!("if systemctl is-active --quiet {APP_SERVICE_NAME}; then echo active; fi; true"),
+    )?;
+    Ok(output.trim() == "active")
+}
+
 fn app_process_probe_cmd() -> String {
-    format!("test -s {APP_PROCESS_PID_PATH} && kill -0 $(cat {APP_PROCESS_PID_PATH}) 2>/dev/null")
+    format!(
+        r#"if [ ! -s {APP_PROCESS_PID_PATH} ]; then exit 0; fi
+pid="$(cat {APP_PROCESS_PID_PATH} 2>/dev/null | tr -d '[:space:]')"
+case "$pid" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+if ! kill -0 "$pid" 2>/dev/null; then
+  exit 0
+fi
+mtime="$(stat -c %Y {APP_PROCESS_PID_PATH} 2>/dev/null || true)"
+uptime="$(cut -d. -f1 /proc/uptime 2>/dev/null || true)"
+now="$(date +%s 2>/dev/null || true)"
+if [ -n "$mtime" ] && [ -n "$uptime" ] && [ -n "$now" ]; then
+  case "$mtime:$uptime:$now" in
+    *[!0-9:]*)
+      ;;
+    *)
+      boot="$((now - uptime))"
+      if [ "$mtime" -lt "$boot" ]; then
+        exit 0
+      fi
+      ;;
+  esac
+fi
+echo alive
+true"#
+    )
 }
 
 fn app_process_is_running(app: &str) -> Result<bool, String> {
-    let probe = app_process_probe_cmd();
-    let output = container::exec_output(app, &format!("if {probe}; then echo alive; fi; true"))?;
+    if app_service_is_active(app)? {
+        return Ok(true);
+    }
+    let output = container::exec_output(app, &app_process_probe_cmd())?;
     Ok(output.trim() == "alive")
 }
 
@@ -3787,6 +3874,10 @@ fn stop_port_listeners_cmd(port: u16) -> String {
 }
 
 fn stop_app_process_on_port(app: &str, port: u16) -> Result<(), String> {
+    container::exec_cmd(
+        app,
+        &format!("systemctl stop {APP_SERVICE_NAME} >/dev/null 2>&1 || true"),
+    )?;
     container::exec_cmd(app, &stop_app_process_cmd())?;
     container::exec_cmd(app, &stop_port_listeners_cmd(port))
 }
@@ -3846,11 +3937,11 @@ fn launch_app_process(
     cmd: &str,
     vars: &BTreeMap<String, String>,
 ) -> Result<(), String> {
-    persist_ssh_login_env(app, vars)?;
-    let launch = start_cmd(port, cmd, vars)?;
-    container::exec_cmd(app, &launch)?;
+    ensure_app_service_installed(app, port, cmd, vars)?;
+    stop_app_process_on_port(app, port)?;
+    container::exec_cmd(app, &format!("systemctl restart {APP_SERVICE_NAME}"))?;
     for _ in 0..APP_PROCESS_START_WAIT_CHECKS {
-        if app_process_is_running(app)? {
+        if app_service_is_active(app)? {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(200));
@@ -4825,6 +4916,39 @@ fn runtime_state_snapshot(app: &str) -> (Option<String>, Option<String>) {
     (active, None)
 }
 
+fn normalized_desired_state(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case(DESIRED_STATE_STOPPED) {
+        DESIRED_STATE_STOPPED
+    } else {
+        DESIRED_STATE_RUNNING
+    }
+}
+
+fn app_desired_state(app: &str) -> Result<&'static str, String> {
+    let desired = sqlite_store::get_app_spec(app)?
+        .map(|spec| spec.desired_state)
+        .unwrap_or_else(|| DESIRED_STATE_RUNNING.to_string());
+    Ok(normalized_desired_state(&desired))
+}
+
+fn set_app_desired_state(app: &str, desired_state: &str) -> Result<(), String> {
+    let desired_state = normalized_desired_state(desired_state).to_string();
+    let row = if let Some(mut existing) = sqlite_store::get_app_spec(app)? {
+        existing.desired_state = desired_state;
+        existing
+    } else {
+        sqlite_store::AppSpecRow {
+            app_id: app.to_string(),
+            generation: 0,
+            desired_state,
+            source_kind: "manual".to_string(),
+            source_payload_json: "{}".to_string(),
+            runtime_payload_json: "{}".to_string(),
+        }
+    };
+    sqlite_store::upsert_app_spec(&row)
+}
+
 fn begin_reconcile_intent(
     app: &str,
     kind: &str,
@@ -4835,7 +4959,7 @@ fn begin_reconcile_intent(
     let spec = sqlite_store::AppSpecRow {
         app_id: app.to_string(),
         generation,
-        desired_state: "running".to_string(),
+        desired_state: DESIRED_STATE_RUNNING.to_string(),
         source_kind: source_kind.to_string(),
         source_payload_json: source_payload_json.to_string(),
         runtime_payload_json: "{}".to_string(),
@@ -6176,7 +6300,6 @@ fn restart_app_process(app: &str, vars: &BTreeMap<String, String>) -> Result<(),
     ensure_required_env_present(&required_env, vars)?;
     let start = read_start_command(&active_app)?;
     let port = allocate_port(app);
-    stop_app_process_on_port(&active_app, port)?;
     launch_app_process(&active_app, port, &start, vars)?;
     if tailscale::dns_name_in_container(&active_app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
@@ -6886,6 +7009,36 @@ fn write_oauth_config(path: &Path, client_id: &str, client_secret: &str) -> Resu
     Ok(())
 }
 
+fn supervise_service_unit_content(psht_bin: &str, psht_home: &Path) -> String {
+    let home = psht_home.to_string_lossy();
+    format!(
+        "[Unit]\nDescription=psht desired-state supervision\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=psht\nGroup=psht\nWorkingDirectory={home}\nEnvironment=HOME={home}\nExecStart={psht_bin} supervise\n"
+    )
+}
+
+fn supervise_timer_unit_content(interval_secs: u64) -> String {
+    format!(
+        "[Unit]\nDescription=Run psht supervision every {interval_secs}s\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec={interval_secs}s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+    )
+}
+
+fn install_supervision_units(psht_bin: &str, psht_home: &Path) -> Result<(), String> {
+    let service = supervise_service_unit_content(psht_bin, psht_home);
+    fs::write(SUPERVISE_SERVICE_PATH, service)
+        .map_err(|e| format!("failed to write {SUPERVISE_SERVICE_PATH}: {e}"))?;
+    let timer = supervise_timer_unit_content(SUPERVISE_INTERVAL_SECS);
+    fs::write(SUPERVISE_TIMER_PATH, timer)
+        .map_err(|e| format!("failed to write {SUPERVISE_TIMER_PATH}: {e}"))?;
+    run_cmd(
+        "chmod",
+        &["644", SUPERVISE_SERVICE_PATH, SUPERVISE_TIMER_PATH],
+    )?;
+    run_cmd("systemctl", &["daemon-reload"])?;
+    run_cmd("systemctl", &["enable", "--now", "psht-supervise.timer"])?;
+    run_cmd("systemctl", &["start", "psht-supervise.service"])?;
+    Ok(())
+}
+
 pub fn bootstrap() -> Result<(), String> {
     if run_cmd_capture("id", &["-u"])? != "0" {
         return Err("Run this command as root: sudo psht-server bootstrap".to_string());
@@ -7120,6 +7273,9 @@ pub fn bootstrap() -> Result<(), String> {
     let stacks_s = stacks.to_string_lossy().to_string();
     init_stacks_in(&stacks)?;
     run_cmd("chown", &["-R", &owner, &repos_s, &builds_s, &stacks_s])?;
+
+    eprintln!("-----> Installing host supervision timer");
+    install_supervision_units(&psht_bin_str, &psht_home)?;
 
     let ts_hostname = if skip_tailscale {
         hostname()
@@ -7698,6 +7854,86 @@ pub fn tailscale_down(app: &str) -> Result<(), String> {
     container::exec_cmd(&active_app, "tailscale down")
 }
 
+fn enforce_supervised_app_running(app: &str) -> Result<(), String> {
+    let active_app = resolve_existing_active_app_ref(app)?;
+    if !container::is_running(&active_app)? {
+        eprintln!("-----> Supervise: starting container for {app}");
+        container::start(&active_app)?;
+    }
+
+    if app_service_is_active(&active_app)? {
+        return Ok(());
+    }
+
+    eprintln!("-----> Supervise: starting app service for {app}");
+    let vars = read_env_vars(app)?;
+    let required_env = read_required_env(&active_app)?;
+    ensure_required_env_present(&required_env, &vars)?;
+    let command = read_start_command(&active_app)?;
+    let port = allocate_port(app);
+    launch_app_process(&active_app, port, &command, &vars)?;
+    if tailscale::dns_name_in_container(&active_app).is_some()
+        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
+    {
+        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+    }
+    eprintln!("=====> Supervise recovered {app}");
+    Ok(())
+}
+
+fn enforce_supervised_app_stopped(app: &str) -> Result<(), String> {
+    let Some(active_app) = resolve_active_app_ref(app)? else {
+        return Ok(());
+    };
+    if !container::is_running(&active_app)? {
+        return Ok(());
+    }
+    eprintln!("-----> Supervise: stopping {app} (desired state is stopped)");
+    let port = allocate_port(app);
+    let _ = stop_app_process_on_port(&active_app, port);
+    container::stop(&active_app)
+}
+
+pub fn supervise() -> Result<(), String> {
+    let states = read_all_app_runtime_states()?;
+    if states.is_empty() {
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for (app, _) in states {
+        match container::has_running_operation(&app) {
+            Ok(true) => {
+                eprintln!("       Supervise: skipping {app} while container operation is active");
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!(
+                    "       Warning: failed to inspect container operations for {app}: {err}"
+                );
+            }
+        }
+
+        let desired = app_desired_state(&app)?;
+        let result = if desired == DESIRED_STATE_STOPPED {
+            enforce_supervised_app_stopped(&app)
+        } else {
+            enforce_supervised_app_running(&app)
+        };
+        if let Err(err) = result {
+            eprintln!("       Warning: supervise reconciliation failed for {app}: {err}");
+            failures.push(format!("{app}: {err}"));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("supervise failures: {}", failures.join("; ")))
+    }
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
@@ -7707,7 +7943,10 @@ fn hostname() -> String {
 pub fn stop(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let active_app = resolve_existing_active_app_ref(app)?;
+    set_app_desired_state(app, DESIRED_STATE_STOPPED)?;
     eprintln!("-----> Stopping {app}");
+    let port = allocate_port(app);
+    let _ = stop_app_process_on_port(&active_app, port);
     container::stop(&active_app)?;
     eprintln!("=====> {app} stopped");
     Ok(())
@@ -7716,11 +7955,12 @@ pub fn stop(app: &str) -> Result<(), String> {
 pub fn start(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let active_app = resolve_existing_active_app_ref(app)?;
+    set_app_desired_state(app, DESIRED_STATE_RUNNING)?;
     eprintln!("-----> Starting {app}");
     if !container::is_running(&active_app)? {
         container::start(&active_app)?;
     }
-    if app_process_is_running(&active_app)? {
+    if app_service_is_active(&active_app)? {
         eprintln!("       {app} is already running; skipping launch");
         eprintln!("=====> {app} started");
         return Ok(());
@@ -7743,6 +7983,7 @@ pub fn start(app: &str) -> Result<(), String> {
 pub fn restart(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let active_app = resolve_existing_active_app_ref(app)?;
+    set_app_desired_state(app, DESIRED_STATE_RUNNING)?;
     eprintln!("-----> Restarting {app}");
     if container::is_running(&active_app)? {
         container::stop(&active_app)?;
@@ -7753,7 +7994,6 @@ pub fn restart(app: &str) -> Result<(), String> {
     ensure_required_env_present(&required_env, &vars)?;
     let command = read_start_command(&active_app)?;
     let port = allocate_port(app);
-    stop_app_process_on_port(&active_app, port)?;
     launch_app_process(&active_app, port, &command, &vars)?;
     if tailscale::dns_name_in_container(&active_app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
@@ -7810,6 +8050,7 @@ pub fn destroy(app: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn allocate_port_is_deterministic() {
@@ -9415,6 +9656,16 @@ devices:
     }
 
     #[test]
+    fn desired_state_round_trip_defaults_to_running() {
+        let app = unique_test_app("desired-state");
+        assert_eq!(app_desired_state(&app).unwrap(), DESIRED_STATE_RUNNING);
+        set_app_desired_state(&app, DESIRED_STATE_STOPPED).unwrap();
+        assert_eq!(app_desired_state(&app).unwrap(), DESIRED_STATE_STOPPED);
+        set_app_desired_state(&app, "weird").unwrap();
+        assert_eq!(app_desired_state(&app).unwrap(), DESIRED_STATE_RUNNING);
+    }
+
+    #[test]
     fn stopped_container_is_unhealthy() {
         let report = check_app_health("hyperlinked", "hyperlinked", "Stopped");
         assert!(!report.healthy);
@@ -9428,20 +9679,23 @@ devices:
     }
 
     #[test]
-    fn start_cmd_backgrounds_with_pid_file() {
-        // The start command must use { } grouping so launch + PID capture are
-        // synchronous, while the app process is detached in a separate session.
-        // and echo writes the pid synchronously before the group exits.
+    fn app_runner_script_contains_exports_and_exec() {
         let mut vars = BTreeMap::new();
         vars.insert("HELLO".to_string(), "world".to_string());
-        let cmd = start_cmd(3737, "bun run index.ts", &vars).unwrap();
-        assert!(cmd.starts_with(
-            "mkdir -p /var/psht && cd /app && export PORT=3737 && export HELLO='world' && {"
-        ));
-        assert!(cmd.contains("export PORT=3737 &&"));
-        assert!(cmd.contains("export HELLO='world' &&"));
-        assert!(cmd.contains("setsid sh -c 'bun run index.ts'"));
-        assert!(cmd.ends_with(&format!("& echo $! > {APP_PROCESS_PID_PATH}; }}")));
+        let script = app_runner_script_content(3737, "bun run index.ts", &vars).unwrap();
+        assert!(script.starts_with("#!/bin/sh"));
+        assert!(script.contains("cd /app"));
+        assert!(script.contains("export PORT=3737"));
+        assert!(script.contains("export HELLO='world'"));
+        assert!(script.contains("exec sh -c 'bun run index.ts'"));
+    }
+
+    #[test]
+    fn app_service_unit_references_runner_and_log_paths() {
+        let unit = app_service_unit_content();
+        assert!(unit.contains(APP_SERVICE_RUNNER_PATH));
+        assert!(unit.contains(APP_PROCESS_LOG_PATH));
+        assert!(unit.contains("Restart=always"));
     }
 
     #[test]
@@ -9449,6 +9703,10 @@ devices:
         let cmd = app_process_probe_cmd();
         assert!(cmd.contains(APP_PROCESS_PID_PATH));
         assert!(cmd.contains("kill -0"));
+        assert!(cmd.contains("stat -c %Y"));
+        assert!(cmd.contains("/proc/uptime"));
+        assert!(cmd.contains("date +%s"));
+        assert!(cmd.contains("echo alive"));
     }
 
     #[test]
@@ -9580,6 +9838,23 @@ devices:
         let content = ssh_login_env_content(&vars).unwrap();
         assert!(content.contains("export A='1'"));
         assert!(content.contains("export B='two words'"));
+    }
+
+    #[test]
+    fn supervise_service_unit_sets_execstart_and_home() {
+        let unit =
+            supervise_service_unit_content("/opt/psht/bin/psht-server", Path::new("/home/psht"));
+        assert!(unit.contains("ExecStart=/opt/psht/bin/psht-server supervise"));
+        assert!(unit.contains("Environment=HOME=/home/psht"));
+        assert!(unit.contains("User=psht"));
+    }
+
+    #[test]
+    fn supervise_timer_unit_uses_expected_interval() {
+        let unit = supervise_timer_unit_content(30);
+        assert!(unit.contains("OnBootSec=30s"));
+        assert!(unit.contains("OnUnitActiveSec=30s"));
+        assert!(unit.contains("Persistent=true"));
     }
 
     #[test]
