@@ -3406,61 +3406,6 @@ fn clear_cleanup_job(app: &str) -> Result<(), String> {
     sqlite_store::delete_cleanup_job(app)
 }
 
-fn spawn_cleanup_previous_worker(app: &str) -> Result<(), String> {
-    let exe = current_psht_binary()?;
-    Command::new(exe)
-        .args(["cleanup", "previous", app])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn background cleanup worker: {e}"))?;
-    Ok(())
-}
-
-fn queue_previous_cleanup(
-    app: &str,
-    active_app_ref: &str,
-    previous_app_ref: &str,
-) -> Result<(), String> {
-    let now = now_unix_secs();
-    let state = CleanupJobState {
-        app: app.to_string(),
-        active_instance_at_schedule: instance_name_from_app_ref(active_app_ref),
-        scheduled_previous_instance: instance_name_from_app_ref(previous_app_ref),
-        attempts: 0,
-        last_error: None,
-        scheduled_at: now,
-        updated_at: now,
-    };
-    write_cleanup_job(app, &state)
-}
-
-fn queue_previous_cleanup_in_background(app: &str, active_app_ref: &str, previous_app_ref: &str) {
-    if let Err(e) = queue_previous_cleanup(app, active_app_ref, previous_app_ref) {
-        eprintln!("       Warning: failed to schedule background cleanup: {e}");
-        return;
-    }
-    eprintln!("       Cleaning previous active container in background");
-    if let Err(e) = spawn_cleanup_previous_worker(app) {
-        eprintln!("       Warning: failed to start background cleanup worker: {e}");
-    }
-}
-
-fn kick_pending_cleanup_worker(app: &str) {
-    match read_cleanup_job(app) {
-        Ok(Some(_)) => {
-            if let Err(e) = spawn_cleanup_previous_worker(app) {
-                eprintln!("       Warning: failed to start pending cleanup worker: {e}");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("       Warning: failed to read pending cleanup state: {e}");
-        }
-    }
-}
-
 fn current_project_name() -> Result<String, String> {
     let uid = run_cmd_capture("id", &["-u"])?;
     Ok(format!("user-{}", uid.trim()))
@@ -4610,6 +4555,57 @@ fn is_instance_in_app_family(app: &str, instance_name: &str) -> bool {
     candidate_app_ref == app || is_transient_deploy_app_for(app, &candidate_app_ref)
 }
 
+fn prune_family_instance(instance_name: &str, project: &str) -> Result<(), String> {
+    let Some(app_ref) = app_ref_from_instance_name(instance_name) else {
+        return Err(format!(
+            "invalid app family instance name '{instance_name}'"
+        ));
+    };
+
+    if container::is_running(&app_ref).unwrap_or(false) {
+        let _ = container::exec_cmd(&app_ref, "tailscale down >/dev/null 2>&1 || true");
+        let _ = container::exec_cmd(
+            &app_ref,
+            "systemctl stop tailscaled >/dev/null 2>&1 || true",
+        );
+    }
+    let _ = container::remove_proxy_in_project(instance_name, project);
+    let _ = container::remove_storage_mount(&app_ref);
+    let _ = container::remove_tailscale_state_mount(&app_ref);
+    cleanup_container_for_rebuild(&app_ref, project)
+}
+
+fn reconcile_family_instances_strict(
+    app: &str,
+    keep_instance_names: &BTreeSet<String>,
+    project: &str,
+) -> Result<(), String> {
+    let containers = container::list()?;
+    let mut failures = Vec::new();
+
+    for container in containers {
+        if !is_instance_in_app_family(app, &container.name) {
+            continue;
+        }
+        if keep_instance_names.contains(&container.name) {
+            continue;
+        }
+
+        if let Err(err) = prune_family_instance(&container.name, project) {
+            failures.push(format!("{}: {err}", container.name));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to reconcile app family instances for '{app}': {}",
+            failures.join(" | ")
+        ))
+    }
+}
+
 fn is_transient_deploy_app_for(app: &str, candidate: &str) -> bool {
     let build_prefix = format!("{app}-build-");
     if let Some(suffix) = candidate.strip_prefix(&build_prefix) {
@@ -5210,7 +5206,6 @@ fn wait_for_forced_pending_deploy_completion(
             };
             eprintln!("-----> Starting forced deploy takeover");
             let _ = take_pending_git_request(app)?;
-            kick_pending_cleanup_worker(app);
             let result = deploy_once(app, Some(target), true);
             let _ = clear_deploy_interrupt(app);
             return result;
@@ -5226,7 +5221,6 @@ fn wait_for_forced_pending_deploy_completion(
             if pending_is_ours {
                 let _ = take_pending_git_request(app)?;
             }
-            kick_pending_cleanup_worker(app);
             let result = deploy_once(app, Some(target), true);
             let _ = clear_deploy_interrupt(app);
             return result;
@@ -5403,7 +5397,6 @@ fn deploy_impl(
             "deploy already in progress for '{app}'; retry after it completes"
         ));
     };
-    kick_pending_cleanup_worker(app);
     if let Err(err) = clear_deploy_interrupt(app) {
         eprintln!("       Warning: failed to clear pending deploy interrupt state: {err}");
     }
@@ -5516,7 +5509,6 @@ fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(),
         ));
     };
     let _reconcile_lease = acquire_reconcile_lease(app, ctx)?;
-    kick_pending_cleanup_worker(app);
 
     let code_dir = home_dir().join(app);
 
@@ -5808,10 +5800,11 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         return Err(err);
     }
 
-    let stale_inactive_app_for_cleanup = old_previous_app
-        .as_ref()
-        .filter(|previous_app| *previous_app != &candidate_app && *previous_app != &old_active_app)
-        .cloned();
+    let mut pre_cutover_keep = BTreeSet::new();
+    pre_cutover_keep.insert(instance_name_from_app_ref(&old_active_app));
+    pre_cutover_keep.insert(instance_name_from_app_ref(&candidate_app));
+    reconcile_family_instances_strict(app, &pre_cutover_keep, &current_project)?;
+
     eprintln!("-----> Switching traffic");
     check_deploy_interrupt(app, "before cutover")?;
     eprintln!("       Traffic remains on current container until cutover is complete");
@@ -6034,9 +6027,11 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
         }
     };
 
-    if let Some(stale_inactive_app) = stale_inactive_app_for_cleanup.as_ref() {
-        queue_previous_cleanup_in_background(app, &candidate_app, stale_inactive_app);
-    }
+    let mut post_cutover_keep = BTreeSet::new();
+    post_cutover_keep.insert(instance_name_from_app_ref(&candidate_app));
+    reconcile_family_instances_strict(app, &post_cutover_keep, &current_project)
+        .map_err(|e| format!("post-cutover family reconciliation failed: {e}"))?;
+    let _ = clear_cleanup_job(app);
 
     let build_number = increment_build_number(app)?;
 
@@ -7854,7 +7849,7 @@ pub fn tailscale_down(app: &str) -> Result<(), String> {
     container::exec_cmd(&active_app, "tailscale down")
 }
 
-fn enforce_supervised_app_running(app: &str) -> Result<(), String> {
+fn enforce_supervised_app_running(app: &str, project: &str) -> Result<(), String> {
     let active_app = resolve_existing_active_app_ref(app)?;
     if !container::is_running(&active_app)? {
         eprintln!("-----> Supervise: starting container for {app}");
@@ -7862,6 +7857,9 @@ fn enforce_supervised_app_running(app: &str) -> Result<(), String> {
     }
 
     if app_service_is_active(&active_app)? {
+        let mut keep = BTreeSet::new();
+        keep.insert(instance_name_from_app_ref(&active_app));
+        reconcile_family_instances_strict(app, &keep, project)?;
         return Ok(());
     }
 
@@ -7877,21 +7875,30 @@ fn enforce_supervised_app_running(app: &str) -> Result<(), String> {
     {
         eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
     }
+    let mut keep = BTreeSet::new();
+    keep.insert(instance_name_from_app_ref(&active_app));
+    reconcile_family_instances_strict(app, &keep, project)?;
     eprintln!("=====> Supervise recovered {app}");
     Ok(())
 }
 
-fn enforce_supervised_app_stopped(app: &str) -> Result<(), String> {
+fn enforce_supervised_app_stopped(app: &str, project: &str) -> Result<(), String> {
     let Some(active_app) = resolve_active_app_ref(app)? else {
         return Ok(());
     };
     if !container::is_running(&active_app)? {
+        let mut keep = BTreeSet::new();
+        keep.insert(instance_name_from_app_ref(&active_app));
+        reconcile_family_instances_strict(app, &keep, project)?;
         return Ok(());
     }
     eprintln!("-----> Supervise: stopping {app} (desired state is stopped)");
     let port = allocate_port(app);
     let _ = stop_app_process_on_port(&active_app, port);
-    container::stop(&active_app)
+    container::stop(&active_app)?;
+    let mut keep = BTreeSet::new();
+    keep.insert(instance_name_from_app_ref(&active_app));
+    reconcile_family_instances_strict(app, &keep, project)
 }
 
 pub fn supervise() -> Result<(), String> {
@@ -7899,6 +7906,7 @@ pub fn supervise() -> Result<(), String> {
     if states.is_empty() {
         return Ok(());
     }
+    let project = current_project_name()?;
 
     let mut failures = Vec::new();
     for (app, _) in states {
@@ -7917,9 +7925,9 @@ pub fn supervise() -> Result<(), String> {
 
         let desired = app_desired_state(&app)?;
         let result = if desired == DESIRED_STATE_STOPPED {
-            enforce_supervised_app_stopped(&app)
+            enforce_supervised_app_stopped(&app, &project)
         } else {
-            enforce_supervised_app_running(&app)
+            enforce_supervised_app_running(&app, &project)
         };
         if let Err(err) = result {
             eprintln!("       Warning: supervise reconciliation failed for {app}: {err}");
