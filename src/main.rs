@@ -104,6 +104,13 @@ enum Command {
         #[command(subcommand)]
         command: CleanupCommand,
     },
+    #[command(name = "debug-resources", hide = true)]
+    DebugResources {
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        candidate: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -221,6 +228,12 @@ fn run() -> Result<(), String> {
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
         Command::Health => commands::health(),
+        Command::DebugResources { app, candidate } => {
+            if let Some(app) = app.as_deref() {
+                app_name::validate_app_name(app)?;
+            }
+            commands::debug_resources(app.as_deref(), candidate.as_deref())
+        }
         Command::Supervise => commands::supervise(),
         Command::Tailscale { command } => match command {
             TailscaleCommand::Status { app } => {
@@ -580,6 +593,26 @@ mod tests {
     fn parse_supervise() {
         let cli = parse_cli(&["psht-server", "supervise"]).unwrap();
         assert_eq!(cli.command, Command::Supervise);
+    }
+
+    #[test]
+    fn parse_debug_resources() {
+        let cli = parse_cli(&[
+            "psht-server",
+            "debug-resources",
+            "--app",
+            "myapp",
+            "--candidate",
+            "psht-myapp-build-123",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::DebugResources {
+                app: Some("myapp".to_string()),
+                candidate: Some("psht-myapp-build-123".to_string()),
+            }
+        );
     }
 
     #[test]

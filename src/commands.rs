@@ -87,6 +87,7 @@ const BUSY_OP_POLICY_ENV: &str = "PSHT_BUSY_OP_POLICY";
 const BLOCKED_OP_BUDGET_SECS: u64 = 15;
 const DEPLOY_RETRY_INITIAL_SLEEP_SECS: u64 = 1;
 const DEPLOY_RETRY_MAX_SLEEP_SECS: u64 = 15;
+const RESOURCE_DIAGNOSTIC_TIMEOUT_SECS: u64 = 8;
 const DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER: &str = "__psht_cached_setup_failure__:";
 const DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER: &str = "__psht_fresh_setup_failure__:";
 const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
@@ -3980,6 +3981,11 @@ exit "$status""#
             message.push_str("\nLast install/build log lines:\n");
             message.push_str(&log_excerpt);
         }
+        if is_resource_pressure_error(&message)
+            && let Ok(project) = current_project_name()
+        {
+            emit_resource_diagnostics(app, app, &project, label);
+        }
         message
     })
 }
@@ -4195,6 +4201,126 @@ fn strip_internal_deploy_error_markers(err: &str) -> &str {
     err.strip_prefix(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
         .or_else(|| err.strip_prefix(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER))
         .unwrap_or(err)
+}
+
+fn is_resource_pressure_error(err: &str) -> bool {
+    let lowered = err.to_ascii_lowercase();
+    [
+        "resource temporarily unavailable",
+        "fork failed",
+        "cannot allocate memory",
+        "out of memory",
+        "pthread_create",
+        "eagain",
+        "enomem",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn run_diagnostic_shell(command: &str, timeout_secs: u64) -> String {
+    match run_cmd_capture_with_timeout("sh", &["-c", command], timeout_secs) {
+        Ok(output) if output.trim().is_empty() => "(no output)".to_string(),
+        Ok(output) => output,
+        Err(err) => format!("(unavailable: {err})"),
+    }
+}
+
+fn append_diagnostic_section(lines: &mut Vec<String>, label: &str, command: &str) {
+    lines.push(format!("## {label}"));
+    lines.push(format!("$ {command}"));
+    lines.push(run_diagnostic_shell(
+        command,
+        RESOURCE_DIAGNOSTIC_TIMEOUT_SECS,
+    ));
+    lines.push(String::new());
+}
+
+fn collect_resource_diagnostics(project: Option<&str>, candidate_app: Option<&str>) -> String {
+    let mut lines = Vec::new();
+    lines.push("# Resource Diagnostics Snapshot".to_string());
+    lines.push(format!(
+        "timestamp_utc: {}",
+        run_diagnostic_shell(
+            "date -u +%Y-%m-%dT%H:%M:%SZ",
+            RESOURCE_DIAGNOSTIC_TIMEOUT_SECS
+        )
+    ));
+    lines.push(String::new());
+
+    append_diagnostic_section(&mut lines, "Host Uptime", "uptime || true");
+    append_diagnostic_section(&mut lines, "Host Memory", "free -m || true");
+    append_diagnostic_section(
+        &mut lines,
+        "Host PID Max",
+        "cat /proc/sys/kernel/pid_max 2>/dev/null || true",
+    );
+    append_diagnostic_section(
+        &mut lines,
+        "Host Task Count",
+        "ps -eLf 2>/dev/null | wc -l || true",
+    );
+    append_diagnostic_section(
+        &mut lines,
+        "Incus Running Build Containers",
+        "incus list --format csv -c ns 2>/dev/null | awk -F, '/^psht-.*-build-[0-9]+,RUNNING$/ {count++} END {print count+0}' || true",
+    );
+    append_diagnostic_section(
+        &mut lines,
+        "Kernel Pressure Signals",
+        "dmesg -T 2>/dev/null | egrep -i 'oom|out of memory|fork|cgroup|pids' | tail -n 50 || true",
+    );
+
+    if let Some(project) = project {
+        let escaped_project = shell_quote(project);
+        append_diagnostic_section(
+            &mut lines,
+            "Project Default Profile",
+            &format!("incus --project {escaped_project} profile show default 2>/dev/null || true"),
+        );
+    }
+
+    if let Some(candidate_app) = candidate_app {
+        let project = project.unwrap_or("default");
+        let instance = instance_name_from_app_ref(candidate_app);
+        let escaped_project = shell_quote(project);
+        let escaped_instance = shell_quote(&instance);
+        append_diagnostic_section(
+            &mut lines,
+            "Candidate Expanded Config",
+            &format!(
+                "incus --project {escaped_project} config show {escaped_instance} --expanded 2>/dev/null || true"
+            ),
+        );
+        append_diagnostic_section(
+            &mut lines,
+            "Candidate Cgroup Limits",
+            &format!(
+                "incus --project {escaped_project} exec {escaped_instance} -- sh -c {} 2>/dev/null || true",
+                shell_quote(
+                    "ulimit -a
+echo '---'
+cat /sys/fs/cgroup/pids.max 2>/dev/null || true
+cat /sys/fs/cgroup/pids.current 2>/dev/null || true
+cat /sys/fs/cgroup/memory.max 2>/dev/null || true
+cat /sys/fs/cgroup/memory.current 2>/dev/null || true
+ps -eLf 2>/dev/null | wc -l || true"
+                )
+            ),
+        );
+    }
+
+    lines.join("\n")
+}
+
+fn emit_resource_diagnostics(app: &str, candidate_app: &str, project: &str, context: &str) {
+    let candidate_instance = instance_name_from_app_ref(candidate_app);
+    eprintln!("-----> Resource diagnostics captured ({context})");
+    eprintln!("       App: {app}");
+    eprintln!("       Candidate: {candidate_instance}");
+    eprintln!("       Project: {project}");
+    let snapshot = collect_resource_diagnostics(Some(project), Some(candidate_app));
+    eprintln!("{snapshot}");
 }
 
 fn wait_for_container_operation_quiet(
@@ -5813,7 +5939,18 @@ fn deploy_from_blue_green(
                     &candidate_app,
                     "chmod +x /tmp/setup.sh && /tmp/setup.sh",
                     5,
-                )?;
+                )
+                .map_err(|e| {
+                    if is_resource_pressure_error(&e) {
+                        emit_resource_diagnostics(
+                            app,
+                            &candidate_app,
+                            &current_project,
+                            "candidate runtime setup",
+                        );
+                    }
+                    e
+                })?;
 
                 eprintln!("-----> Caching stack image");
                 if let Err(e) = container::publish_image_in_project(
@@ -6297,7 +6434,18 @@ fn deploy_from_in_place(
 
             eprintln!("-----> Setting up runtime");
             container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
-            container::exec_cmd_rolling(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh", 5)?;
+            container::exec_cmd_rolling(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh", 5)
+                .map_err(|e| {
+                    if is_resource_pressure_error(&e) {
+                        emit_resource_diagnostics(
+                            app,
+                            app,
+                            &current_project,
+                            "in-place runtime setup",
+                        );
+                    }
+                    e
+                })?;
 
             eprintln!("-----> Caching stack image");
             if let Err(e) =
@@ -6859,6 +7007,52 @@ pub fn health() -> Result<(), String> {
         unhealthy_count,
         unhealthy.join(", ")
     ))
+}
+
+fn normalize_candidate_app_ref(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(app_ref) = app_ref_from_instance_name(trimmed) {
+        return Some(app_ref);
+    }
+    Some(trimmed.trim_start_matches("psht-").to_string())
+}
+
+pub fn debug_resources(app: Option<&str>, candidate: Option<&str>) -> Result<(), String> {
+    if let Some(app) = app {
+        app_name::validate_app_name(app)?;
+    }
+    let project = current_project_name().ok();
+    let mut candidate_app = candidate.and_then(normalize_candidate_app_ref);
+
+    if candidate_app.is_none()
+        && let Some(app) = app
+    {
+        if let Some(status) = sqlite_store::get_app_status(app)? {
+            for instance in [
+                status.candidate_instance,
+                status.active_instance,
+                status.previous_instance,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(app_ref) = normalize_candidate_app_ref(&instance) {
+                    candidate_app = Some(app_ref);
+                    break;
+                }
+            }
+        }
+        if candidate_app.is_none() {
+            candidate_app = resolve_active_app_ref(app)?;
+        }
+    }
+
+    let snapshot = collect_resource_diagnostics(project.as_deref(), candidate_app.as_deref());
+    println!("{snapshot}");
+    Ok(())
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
@@ -10028,5 +10222,31 @@ devices:
         assert!(cmd.contains("apt-get install -y"));
         assert!(cmd.contains("'curl'"));
         assert!(cmd.contains("'libssl-dev'"));
+    }
+
+    #[test]
+    fn resource_pressure_error_detection_matches_fork_failures() {
+        assert!(is_resource_pressure_error(
+            "dpkg: unrecoverable fatal error, aborting: fork failed: Resource temporarily unavailable"
+        ));
+        assert!(is_resource_pressure_error(
+            "cannot allocate memory while forking"
+        ));
+        assert!(!is_resource_pressure_error(
+            "cargo build failed: unresolved import"
+        ));
+    }
+
+    #[test]
+    fn normalize_candidate_app_ref_handles_prefixed_values() {
+        assert_eq!(
+            normalize_candidate_app_ref("psht-hyperlinked-build-123").as_deref(),
+            Some("hyperlinked-build-123")
+        );
+        assert_eq!(
+            normalize_candidate_app_ref("hyperlinked-build-123").as_deref(),
+            Some("hyperlinked-build-123")
+        );
+        assert!(normalize_candidate_app_ref("   ").is_none());
     }
 }
