@@ -611,26 +611,6 @@ pub fn add_proxy_in_project(
         .run()
 }
 
-pub fn remove_proxy(app: &str) -> Result<(), String> {
-    let name = container_name(app);
-    let output = incus()
-        .args(&["config", "device", "remove"])
-        .arg(&name)
-        .arg("port")
-        .build()
-        .output()
-        .map_err(|e| format!("failed to run incus config device remove {name} port: {e}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if is_missing_device_error(&stderr) {
-        return Ok(());
-    }
-    Err(format!(
-        "incus config device remove {name} port failed: {stderr}"
-    ))
-}
 
 pub fn remove_proxy_in_project(instance_name: &str, project: &str) -> Result<(), String> {
     let output = incus()
@@ -780,12 +760,6 @@ fn stack_image_alias(stack: &str, hash: &str) -> String {
     format!("psht-stack-{stack}-{hash}")
 }
 
-fn setup_image_alias(stack: &str, stack_hash: &str, apt_fingerprint: Option<&str>) -> String {
-    match apt_fingerprint {
-        Some(fingerprint) => format!("psht-setup-{stack}-{stack_hash}-{fingerprint}"),
-        None => stack_image_alias(stack, stack_hash),
-    }
-}
 
 #[allow(dead_code)]
 pub fn image_exists(stack: &str, hash: &str) -> bool {
@@ -799,36 +773,7 @@ pub fn image_exists(stack: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn image_exists_in_project(stack: &str, hash: &str, project: &str) -> bool {
-    let alias = stack_image_alias(stack, hash);
-    incus()
-        .arg("--project")
-        .arg(project)
-        .args(&["image", "info"])
-        .arg(alias)
-        .build()
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
-pub fn setup_image_exists_in_project(
-    stack: &str,
-    stack_hash: &str,
-    apt_fingerprint: Option<&str>,
-    project: &str,
-) -> bool {
-    let alias = setup_image_alias(stack, stack_hash, apt_fingerprint);
-    incus()
-        .arg("--project")
-        .arg(project)
-        .args(&["image", "info"])
-        .arg(alias)
-        .build()
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 #[allow(dead_code)]
 pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
@@ -837,28 +782,7 @@ pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), Strin
     launch_with_project(&name, &alias, None)
 }
 
-pub fn create_from_image_in_project(
-    app: &str,
-    stack: &str,
-    hash: &str,
-    project: &str,
-) -> Result<(), String> {
-    let alias = stack_image_alias(stack, hash);
-    let name = container_name(app);
-    launch_with_project(&name, &alias, Some(project))
-}
 
-pub fn create_from_setup_image_in_project(
-    app: &str,
-    stack: &str,
-    stack_hash: &str,
-    apt_fingerprint: Option<&str>,
-    project: &str,
-) -> Result<(), String> {
-    let alias = setup_image_alias(stack, stack_hash, apt_fingerprint);
-    let name = container_name(app);
-    launch_with_project(&name, &alias, Some(project))
-}
 
 #[allow(dead_code)]
 pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
@@ -874,66 +798,7 @@ pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
     incus().arg("start").arg(&name).run()
 }
 
-pub fn publish_image_in_project(
-    app: &str,
-    stack: &str,
-    hash: &str,
-    project: &str,
-) -> Result<(), String> {
-    let alias = stack_image_alias(stack, hash);
-    let name = container_name(app);
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("stop")
-        .arg(&name)
-        .run()?;
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("publish")
-        .arg(&name)
-        .arg("--alias")
-        .arg(alias)
-        .run()?;
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("start")
-        .arg(&name)
-        .run()
-}
 
-pub fn publish_setup_image_in_project(
-    app: &str,
-    stack: &str,
-    stack_hash: &str,
-    apt_fingerprint: Option<&str>,
-    project: &str,
-) -> Result<(), String> {
-    let alias = setup_image_alias(stack, stack_hash, apt_fingerprint);
-    let name = container_name(app);
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("stop")
-        .arg(&name)
-        .run()?;
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("publish")
-        .arg(&name)
-        .arg("--alias")
-        .arg(alias)
-        .run()?;
-    incus()
-        .arg("--project")
-        .arg(project)
-        .arg("start")
-        .arg(&name)
-        .run()
-}
 
 pub fn exists(app: &str) -> bool {
     incus()
@@ -1513,17 +1378,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn setup_image_alias_format() {
-        assert_eq!(
-            setup_image_alias("node", "abc123", None),
-            "psht-stack-node-abc123"
-        );
-        assert_eq!(
-            setup_image_alias("node", "abc123", Some("cafebabe")),
-            "psht-setup-node-abc123-cafebabe"
-        );
-    }
 
     #[test]
     fn image_exists_command_builds_correctly() {
@@ -1542,17 +1396,6 @@ mod tests {
         assert_eq!(args, vec!["launch", "psht-stack-node-abc123", "psht-myapp"]);
     }
 
-    #[test]
-    fn create_from_setup_image_command_builds_correctly() {
-        let alias = setup_image_alias("node", "abc123", Some("cafebabe"));
-        let name = container_name("myapp");
-        let cmd = incus().arg("launch").arg(&alias).arg(&name).build();
-        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
-        assert_eq!(
-            args,
-            vec!["launch", "psht-setup-node-abc123-cafebabe", "psht-myapp"]
-        );
-    }
 
     #[test]
     fn publish_image_stop_command_builds_correctly() {

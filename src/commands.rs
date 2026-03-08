@@ -7,17 +7,24 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::app_name;
-use crate::caddy;
+use crate::app_state;
 use crate::container;
+use crate::control_plane::{AppPhase, AppRuntimeState, DesiredState, ReconcileIntentContext, RuntimeSnapshot};
+use crate::deploy_state::{
+    CleanupJobState, DeployInterruptState, DeployLockMetadata, GitCheckoutTarget, GitDeployState,
+    GitDeployStatus, PendingGitDeployRequest,
+};
 use crate::deploy_log;
 use crate::detect;
+use crate::reconcile_command::{self, ReconcileCommandRequest};
+use crate::reconcile_runtime;
 use crate::sqlite_store;
 use crate::stats;
 use crate::tailscale;
@@ -47,7 +54,6 @@ const APP_PROCESS_POLL_SLEEP: &str = "0.2";
 const APP_PROCESS_STOP_TERM_CHECKS: u32 = 40;
 const APP_PROCESS_STOP_KILL_CHECKS: u32 = 10;
 const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
-const APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS: u64 = 3;
 const APP_LOG_TAIL_LINES: u32 = 40;
 const INSTALL_LOG_TAIL_LINES: u32 = 80;
 const SETUP_LOG_TAIL_LINES: u32 = 120;
@@ -67,8 +73,6 @@ const TAILSCALE_OAUTH_SETTINGS_URL: &str = "https://login.tailscale.com/admin/se
 const TAILSCALE_OAUTH_SCOPE_HINT: &str =
     "Keys: Write (tag:psht), Devices: Core Read, Devices: Core Write";
 const TAILSCALE_CLEANUP_PERMISSION_DENIED_MARKER: &str = "__tailscale_cleanup_permission_denied__";
-const DEPLOY_TCP_READY_TIMEOUT_SECS: u64 = 60;
-const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
 const DEPLOY_INTERRUPT_WAIT_POLL_MS: u64 = 1000;
 const DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS: u64 = 5;
 const DEPLOY_FORCE_TAKEOVER_TIMEOUT_SECS: u64 = 30;
@@ -87,8 +91,6 @@ const TAKEOVER_RETRY_MS: u64 = 1000;
 const TAKEOVER_MAX_CANCEL_PER_CYCLE: usize = 20;
 const BUSY_OP_POLICY_ENV: &str = "PSHT_BUSY_OP_POLICY";
 const BLOCKED_OP_BUDGET_SECS: u64 = 15;
-const DEPLOY_RETRY_INITIAL_SLEEP_SECS: u64 = 1;
-const DEPLOY_RETRY_MAX_SLEEP_SECS: u64 = 15;
 const RESOURCE_DIAGNOSTIC_TIMEOUT_SECS: u64 = 8;
 const DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER: &str = "__psht_cached_setup_failure__:";
 const DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER: &str = "__psht_fresh_setup_failure__:";
@@ -112,6 +114,33 @@ macro_rules! eprintln {
         deploy_log::append("deploy", &rendered);
     }};
 }
+
+mod admin_commands;
+mod deploy_commands;
+mod lifecycle_commands;
+mod observability_commands;
+
+use self::deploy_commands::{
+    check_deploy_interrupt, control_plane_snapshot, is_transient_deploy_app_for,
+};
+
+#[cfg(test)]
+use self::admin_commands::{
+    cli_update_manifest, cli_update_manifest_json, install_binary_atomically,
+    join_tailscale_for_repair_with_fallback, setup_script, supervise_service_unit_content,
+    update_script, write_oauth_config,
+};
+#[cfg(test)]
+use self::deploy_commands::{
+    deploy_interrupted_error, is_deploy_interrupted_error, pending_force_request_is_ours,
+    should_process_pending_request,
+};
+#[cfg(test)]
+use self::observability_commands::{
+    PsContainerState, canonical_app_name_from_container, check_app_health, has_deploy_suffix,
+    is_transient_deploy_app_name, normalize_candidate_app_ref, ps_container_state,
+    ps_status_from_parts, should_delegate_health_to_psht,
+};
 
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
@@ -2533,113 +2562,6 @@ fn resolve_stack(
     resolve_stack_in(app, code_dir, detected_stack, &stacks_dir())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct GitCheckoutTarget {
-    #[serde(rename = "ref")]
-    ref_name: String,
-    sha: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum GitDeployStatus {
-    Pending,
-    Success,
-    Failed,
-    Interrupted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct GitDeployState {
-    #[serde(rename = "ref")]
-    ref_name: String,
-    sha: String,
-    status: GitDeployStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct PendingGitDeployRequest {
-    #[serde(rename = "ref")]
-    ref_name: String,
-    sha: String,
-    #[serde(default)]
-    force: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    interrupt_requested_at: Option<u64>,
-}
-
-impl PendingGitDeployRequest {
-    fn from_target(target: &GitCheckoutTarget, force: bool, request_id: Option<String>) -> Self {
-        Self {
-            ref_name: target.ref_name.clone(),
-            sha: target.sha.clone(),
-            force,
-            interrupt_requested_at: request_id.as_ref().map(|_| now_unix_secs()),
-            request_id,
-        }
-    }
-
-    fn target(&self) -> GitCheckoutTarget {
-        GitCheckoutTarget {
-            ref_name: self.ref_name.clone(),
-            sha: self.sha.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct DeployInterruptState {
-    request_id: String,
-    requested_at: u64,
-    target_sha: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct DeployLockMetadata {
-    pid: Option<u32>,
-    created: Option<u64>,
-    updated: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct AppRuntimeState {
-    active_instance: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    previous_instance: Option<String>,
-    updated_at: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-struct CleanupJobState {
-    app: String,
-    active_instance_at_schedule: String,
-    scheduled_previous_instance: String,
-    attempts: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_error: Option<String>,
-    scheduled_at: u64,
-    updated_at: u64,
-}
-
-#[derive(Debug, Clone)]
-struct ReconcileIntentContext {
-    intent_id: String,
-    generation: i64,
-    plan_hash: String,
-    source_summary: String,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveReconcileLease {
-    owner: String,
-    epoch: i64,
-    intent_id: String,
-    generation: i64,
-    last_heartbeat: Instant,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BusyOpPolicy {
     Auto,
@@ -2647,8 +2569,6 @@ enum BusyOpPolicy {
     Force,
 }
 
-static ACTIVE_RECONCILE_LEASES: OnceLock<Mutex<HashMap<String, ActiveReconcileLease>>> =
-    OnceLock::new();
 static DEPLOY_INTERRUPT_SIGNAL_PENDING: AtomicBool = AtomicBool::new(false);
 static DEPLOY_INTERRUPT_SIGNAL_INSTALLED: OnceLock<()> = OnceLock::new();
 
@@ -2691,24 +2611,11 @@ fn install_deploy_interrupt_signal_handlers() {
 }
 
 fn app_ref_from_instance_name(instance: &str) -> Option<String> {
-    let trimmed = instance.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let app_ref = trimmed.strip_prefix("psht-").unwrap_or(trimmed).trim();
-    if app_ref.is_empty() {
-        return None;
-    }
-    Some(app_ref.to_string())
+    app_state::app_ref_from_instance_name(instance)
 }
 
 fn instance_name_from_app_ref(app_ref: &str) -> String {
-    let app_ref = app_ref.trim();
-    if app_ref.starts_with("psht-") {
-        app_ref.to_string()
-    } else {
-        format!("psht-{app_ref}")
-    }
+    app_state::instance_name_from_app_ref(app_ref)
 }
 
 fn sqlite_i64_to_u64(value: i64, app: &str, field: &str) -> Result<u64, String> {
@@ -2728,20 +2635,8 @@ fn sqlite_u64_to_i64(value: u64, app: &str, field: &str) -> Result<i64, String> 
         .map_err(|_| format!("value for {field} in app '{app}' exceeds sqlite integer range"))
 }
 
-fn app_runtime_state_from_row(
-    row: sqlite_store::AppRuntimeStateRow,
-) -> Result<AppRuntimeState, String> {
-    Ok(AppRuntimeState {
-        active_instance: row.active_instance,
-        previous_instance: row.previous_instance,
-        updated_at: sqlite_i64_to_u64(row.updated_at, &row.app_id, "updated_at")?,
-    })
-}
-
 fn read_app_runtime_state(app: &str) -> Result<Option<AppRuntimeState>, String> {
-    sqlite_store::get_app_runtime_state(app)?
-        .map(app_runtime_state_from_row)
-        .transpose()
+    app_state::read_app_runtime_state(app)
 }
 
 fn write_app_runtime_state(
@@ -2749,62 +2644,23 @@ fn write_app_runtime_state(
     active_app_ref: &str,
     previous_app_ref: Option<&str>,
 ) -> Result<(), String> {
-    sqlite_store::upsert_app_runtime_state(&sqlite_store::AppRuntimeStateRow {
-        app_id: app.to_string(),
-        active_instance: instance_name_from_app_ref(active_app_ref),
-        previous_instance: previous_app_ref.map(instance_name_from_app_ref),
-        updated_at: now_unix_secs() as i64,
-    })
+    app_state::write_app_runtime_state(app, active_app_ref, previous_app_ref)
 }
 
 fn clear_app_runtime_state(app: &str) -> Result<(), String> {
-    sqlite_store::delete_app_runtime_state(app)
+    app_state::clear_app_runtime_state(app)
 }
 
 fn read_all_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
-    let rows = sqlite_store::list_app_runtime_states()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let app = row.app_id.clone();
-        out.push((app, app_runtime_state_from_row(row)?));
-    }
-    Ok(out)
+    app_state::read_all_app_runtime_states()
 }
 
 fn resolve_active_app_ref(app: &str) -> Result<Option<String>, String> {
-    if let Some(state) = read_app_runtime_state(app)? {
-        if let Some(active_app_ref) = app_ref_from_instance_name(&state.active_instance)
-            && container::exists(&active_app_ref)
-        {
-            return Ok(Some(active_app_ref));
-        }
-        if let Some(previous_instance) = state.previous_instance.as_deref()
-            && let Some(previous_app_ref) = app_ref_from_instance_name(previous_instance)
-            && container::exists(&previous_app_ref)
-        {
-            write_app_runtime_state(app, &previous_app_ref, None)?;
-            return Ok(Some(previous_app_ref));
-        }
-        if container::exists(app) {
-            write_app_runtime_state(app, app, None)?;
-            return Ok(Some(app.to_string()));
-        }
-        return Ok(None);
-    }
-
-    if container::exists(app) {
-        write_app_runtime_state(app, app, None)?;
-        return Ok(Some(app.to_string()));
-    }
-
-    Ok(None)
+    app_state::resolve_active_app_ref(app)
 }
 
 fn resolve_existing_active_app_ref(app: &str) -> Result<String, String> {
-    let Some(active_app_ref) = resolve_active_app_ref(app)? else {
-        return Err(format!("app '{app}' not found"));
-    };
-    Ok(active_app_ref)
+    app_state::resolve_existing_active_app_ref(app)
 }
 
 fn deploy_lock_path_in(dir: &Path, app: &str) -> PathBuf {
@@ -2847,13 +2703,6 @@ fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -2901,154 +2750,49 @@ fn blocked_op_budget_secs() -> u64 {
     env_u64("PSHT_BLOCKED_OP_BUDGET_SECS", BLOCKED_OP_BUDGET_SECS).max(1)
 }
 
-fn active_reconcile_leases() -> &'static Mutex<HashMap<String, ActiveReconcileLease>> {
-    ACTIVE_RECONCILE_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_active_reconcile_lease(app: &str, lease: ActiveReconcileLease) {
-    if let Ok(mut map) = active_reconcile_leases().lock() {
-        map.insert(app.to_string(), lease);
-    }
-}
-
-fn active_reconcile_lease_for(app: &str) -> Option<ActiveReconcileLease> {
-    active_reconcile_leases()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(app).cloned())
-}
-
-fn remove_active_reconcile_lease(app: &str) {
-    if let Ok(mut map) = active_reconcile_leases().lock() {
-        map.remove(app);
-    }
-}
-
 fn append_reconcile_attempt_record(
     app: &str,
     step_name: &str,
     result: &str,
     detail_json: serde_json::Value,
 ) {
-    let Some(active) = active_reconcile_lease_for(app) else {
-        return;
-    };
-    let started = now_unix_ms();
-    let row = sqlite_store::ReconcileAttemptRow {
-        app_id: app.to_string(),
-        intent_id: active.intent_id.clone(),
-        generation: active.generation,
-        step_name: step_name.to_string(),
-        started_at_ms: started,
-        finished_at_ms: Some(started),
-        result: result.to_string(),
-        detail_json: detail_json.to_string(),
-    };
-    if let Err(err) = sqlite_store::append_reconcile_attempt(&row) {
-        eprintln!("       Warning: failed to append reconcile attempt: {err}");
-    }
+    reconcile_runtime::append_attempt(app, step_name, result, detail_json);
 }
 
 fn update_reconcile_phase_from_lease(app: &str, phase: &str, last_error: Option<&str>) {
-    let Some(active) = active_reconcile_lease_for(app) else {
-        return;
-    };
-    let (active_instance, previous_instance) = runtime_state_snapshot(app);
-    let active_revision = read_git_deploy_state(app)
-        .ok()
-        .flatten()
-        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
-    let health_json = if phase.eq_ignore_ascii_case("blocked") {
-        "{\"healthy\":false,\"reason\":\"blocked\"}".to_string()
+    let phase = if phase.eq_ignore_ascii_case("blocked") {
+        AppPhase::Blocked
     } else {
-        "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string()
+        AppPhase::Reconciling
     };
-    let last_error_json = last_error.map(|value| serde_json::json!({ "error": value }).to_string());
-    let _ = sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
-        app_id: app.to_string(),
-        observed_generation: active.generation,
-        phase: phase.to_string(),
-        active_instance,
-        candidate_instance: None,
-        previous_instance,
-        active_revision,
-        candidate_revision: None,
-        health_json,
-        last_error_json,
-        recovery_actions_json: "[]".to_string(),
-    });
+    reconcile_runtime::update_phase(
+        app,
+        phase,
+        control_plane_snapshot(app),
+        last_error,
+    );
 }
 
 fn refresh_active_reconcile_lease(app: &str) -> Result<(), String> {
-    let Some(active) = active_reconcile_lease_for(app) else {
-        return Ok(());
-    };
-    if active.last_heartbeat.elapsed().as_secs() < reconcile_lease_heartbeat_secs() {
-        return Ok(());
-    }
-
-    sqlite_store::heartbeat_app_lease(
+    reconcile_runtime::refresh(
         app,
-        &active.owner,
-        active.epoch,
         (reconcile_lease_ttl_secs() * 1000) as i64,
-    )?;
-
-    if let Ok(mut map) = active_reconcile_leases().lock()
-        && let Some(entry) = map.get_mut(app)
-    {
-        entry.last_heartbeat = Instant::now();
-    }
-    Ok(())
-}
-
-struct ReconcileLeaseGuard {
-    app: String,
-    owner: String,
-    epoch: i64,
-}
-
-impl Drop for ReconcileLeaseGuard {
-    fn drop(&mut self) {
-        remove_active_reconcile_lease(&self.app);
-        if let Err(err) = sqlite_store::release_app_lease(&self.app, &self.owner, self.epoch) {
-            std::eprintln!(
-                "warning: failed to release reconcile lease for {}: {}",
-                self.app,
-                err
-            );
-        }
-    }
+        reconcile_lease_heartbeat_secs(),
+    )
 }
 
 fn acquire_reconcile_lease(
     app: &str,
     ctx: &ReconcileIntentContext,
-) -> Result<ReconcileLeaseGuard, String> {
+) -> Result<reconcile_runtime::ReconcileLeaseGuard, String> {
     let owner = format!("{}:{}:{}", hostname(), std::process::id(), ctx.intent_id);
-    let lease = sqlite_store::acquire_app_lease(
+    reconcile_runtime::acquire(
         app,
         &owner,
         &ctx.intent_id,
         ctx.generation,
         (reconcile_lease_ttl_secs() * 1000) as i64,
-    )?;
-
-    register_active_reconcile_lease(
-        app,
-        ActiveReconcileLease {
-            owner: lease.lease_owner.clone(),
-            epoch: lease.lease_epoch,
-            intent_id: lease.intent_id.clone(),
-            generation: lease.generation,
-            last_heartbeat: Instant::now(),
-        },
-    );
-    Ok(ReconcileLeaseGuard {
-        app: app.to_string(),
-        owner: lease.lease_owner,
-        epoch: lease.lease_epoch,
-    })
+    )
 }
 
 fn parse_deploy_lock_metadata(content: &str) -> DeployLockMetadata {
@@ -3559,67 +3303,6 @@ fn allocate_port(app: &str) -> u16 {
     3001 + (hash % 1000) as u16
 }
 
-fn deploy_instance_id() -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
-    format!("{ts}")
-}
-
-fn candidate_app_name(app: &str, deploy_id: &str) -> String {
-    format!("{app}-build-{deploy_id}")
-}
-
-fn wait_for_tcp_listener(
-    app: &str,
-    deploy_app: Option<&str>,
-    port: u16,
-    timeout_secs: u64,
-    label: &str,
-) -> Result<(), String> {
-    let started = Instant::now();
-    let mut next_heartbeat = DEPLOY_PROGRESS_HEARTBEAT_SECS;
-    loop {
-        if let Some(deploy_app) = deploy_app {
-            check_deploy_interrupt(deploy_app, label)?;
-        }
-        let output = container::exec_output(
-            app,
-            &format!(
-                "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
-            ),
-        )?;
-        if output.trim() == "ready" {
-            return Ok(());
-        }
-        let elapsed = started.elapsed().as_secs();
-        if elapsed >= APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS && !app_process_is_running(app)? {
-            let mut message = format!(
-                "{label} failed before TCP :{port} became ready because app process exited"
-            );
-            if let Ok(command) = read_start_command(app) {
-                message.push_str(&format!("\nStart command: {}", command.trim()));
-            }
-            if let Some(log_excerpt) = app_log_tail(app, APP_LOG_TAIL_LINES) {
-                message.push_str("\nLast app log lines:\n");
-                message.push_str(&log_excerpt);
-            }
-            return Err(message);
-        }
-        if elapsed >= timeout_secs {
-            return Err(format!(
-                "{label} timed out after {timeout_secs}s waiting for TCP :{port}"
-            ));
-        }
-        if elapsed >= next_heartbeat {
-            eprintln!("       Still waiting for TCP :{port} ({elapsed}s elapsed)");
-            next_heartbeat += DEPLOY_PROGRESS_HEARTBEAT_SECS;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
 fn start_exports(port: u16, vars: &BTreeMap<String, String>) -> Result<String, String> {
     let mut parts = vec![format!("export PORT={port}")];
     for (name, value) in vars {
@@ -3838,41 +3521,6 @@ fn stop_app_process_on_port(app: &str, port: u16) -> Result<(), String> {
     container::exec_cmd(app, &stop_port_listeners_cmd(port))
 }
 
-fn should_tolerate_cutover_stop_failure(
-    was_running_before_stop: bool,
-    running_after_failure: Option<bool>,
-) -> bool {
-    if !was_running_before_stop {
-        return true;
-    }
-    matches!(running_after_failure, Some(false))
-}
-
-fn stop_active_app_process_for_cutover(app: &str, port: u16) -> Result<(), String> {
-    let was_running = container::is_running(app)?;
-    if !was_running {
-        eprintln!(
-            "       Warning: previous active container is already stopped; skipping app process stop"
-        );
-        return Ok(());
-    }
-
-    match stop_app_process_on_port(app, port) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let running_after_failure = container::is_running(app).ok();
-            if should_tolerate_cutover_stop_failure(was_running, running_after_failure) {
-                eprintln!(
-                    "       Warning: previous active container stopped during cutover stop; continuing"
-                );
-                Ok(())
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
 fn app_log_tail(app: &str, lines: u32) -> Option<String> {
     let output = container::exec_output(
         app,
@@ -3972,15 +3620,29 @@ fn install_log_tail(app: &str, lines: u32) -> Option<String> {
     }
 }
 
-fn run_install_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
-    let wrapped = format!(
-        r#"mkdir -p /var/psht
+fn logged_command_wrapper(command: &str, log_path: &str) -> String {
+    let quoted_log_path = shell_quote(log_path);
+    format!(
+        r#"log_path={quoted_log_path}
+log_dir="$(dirname "$log_path")"
+mkdir -p "$log_dir"
 status_file="$(mktemp)"
-( {command}; echo "$?" > "$status_file" ) 2>&1 | tee {INSTALL_LOG_PATH}
-status="$(cat "$status_file" 2>/dev/null || echo 1)"
+(
+trap 'status=$?; printf "%s\n" "$status" > "$status_file"' EXIT
+{command}
+) 2>&1 | tee "$log_path"
+status="$(tr -d '[:space:]' < "$status_file" 2>/dev/null || true)"
 rm -f "$status_file"
-exit "$status""#
-    );
+case "$status" in
+  ''|*[!0-9]*) status=1 ;;
+esac
+exit "$status""#,
+        quoted_log_path = quoted_log_path
+    )
+}
+
+fn run_install_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
+    let wrapped = logged_command_wrapper(command, INSTALL_LOG_PATH);
     container::exec_cmd_rolling(app, &wrapped, 5).map_err(|e| {
         let mut message = format!("{label} failed: {e}");
         if let Some(log_excerpt) = install_log_tail(app, INSTALL_LOG_TAIL_LINES) {
@@ -4041,14 +3703,7 @@ fn classify_setup_failure(err: &str) -> SetupFailureClass {
 }
 
 fn run_setup_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
-    let wrapped = format!(
-        r#"mkdir -p /var/psht
-status_file="$(mktemp)"
-( {command}; echo "$?" > "$status_file" ) 2>&1 | tee {SETUP_LOG_PATH}
-status="$(cat "$status_file" 2>/dev/null || echo 1)"
-rm -f "$status_file"
-exit "$status""#
-    );
+    let wrapped = logged_command_wrapper(command, SETUP_LOG_PATH);
     container::exec_cmd_rolling(app, &wrapped, 5).map_err(|e| {
         let mut message = format!("{label} failed: {e}");
         if let Some(log_excerpt) = setup_log_tail(app, SETUP_LOG_TAIL_LINES) {
@@ -4091,20 +3746,22 @@ fn apt_install_command(packages: &[String]) -> Option<String> {
     Some(format!(
         r#"export DEBIAN_FRONTEND=noninteractive
 attempt=1
+status=1
 max_attempts={APT_INSTALL_MAX_ATTEMPTS}
 while [ "$attempt" -le "$max_attempts" ]; do
   echo "apt attempt ${{attempt}}/${{max_attempts}}"
   if apt-get update && apt-get install -y {quoted}; then
-    exit 0
+    status=0
+    break
   fi
   status="$?"
   if [ "$attempt" -ge "$max_attempts" ]; then
-    exit "$status"
+    break
   fi
   sleep "$((attempt * {APT_INSTALL_RETRY_SLEEP_SECS}))"
   attempt="$((attempt + 1))"
 done
-exit 1"#
+exit "$status""#
     ))
 }
 
@@ -4247,45 +3904,12 @@ fn blocked_operation_error(
     lines.join("\n")
 }
 
-fn print_deploy_failure_footer(app: &str, attempt: u64, err: &str, retry_sleep_secs: u64) {
-    let err = strip_internal_deploy_error_markers(err);
-    eprintln!("-----> Deploy attempt {attempt} failed for {app}");
-    eprintln!("       Cause: {err}");
-    eprintln!(
-        "       Auto-recovery: retrying in {retry_sleep_secs}s (use `psht logs {app}` or `psht health` to inspect)"
-    );
-}
-
-fn mark_cached_setup_failure(err: String) -> String {
-    format!("{DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER}{err}")
-}
-
-fn mark_fresh_setup_failure(err: String) -> String {
-    format!("{DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER}{err}")
-}
-
 fn mark_setup_transient_failure(err: String) -> String {
     format!("{DEPLOY_ERR_SETUP_TRANSIENT_MARKER}{err}")
 }
 
 fn mark_setup_nonretryable_failure(err: String) -> String {
     format!("{DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER}{err}")
-}
-
-fn is_cached_setup_failure(err: &str) -> bool {
-    err.starts_with(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
-}
-
-fn is_fresh_setup_failure(err: &str) -> bool {
-    err.starts_with(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER)
-}
-
-fn is_setup_transient_failure(err: &str) -> bool {
-    err.starts_with(DEPLOY_ERR_SETUP_TRANSIENT_MARKER)
-}
-
-fn is_setup_nonretryable_failure(err: &str) -> bool {
-    err.starts_with(DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER)
 }
 
 fn strip_internal_deploy_error_markers(err: &str) -> &str {
@@ -4866,3354 +4490,29 @@ fn reconcile_family_instances_strict(
     }
 }
 
-fn is_transient_deploy_app_for(app: &str, candidate: &str) -> bool {
-    let build_prefix = format!("{app}-build-");
-    if let Some(suffix) = candidate.strip_prefix(&build_prefix) {
-        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
-    }
-
-    let prev_prefix = format!("{app}-prev-");
-    if let Some(suffix) = candidate.strip_prefix(&prev_prefix) {
-        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
-    }
-
-    let failed_prefix = format!("{app}-failed-");
-    if let Some(suffix) = candidate.strip_prefix(&failed_prefix) {
-        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
-    }
-
-    false
-}
-
-fn clear_previous_runtime_reference_if_missing(app: &str) -> Result<(), String> {
-    let Some(state) = read_app_runtime_state(app)? else {
-        return Ok(());
-    };
-
-    let Some(previous_instance) = state.previous_instance.as_deref() else {
-        return Ok(());
-    };
-    let Some(previous_app_ref) = app_ref_from_instance_name(previous_instance) else {
-        return Ok(());
-    };
-    if container::exists(&previous_app_ref) {
-        return Ok(());
-    }
-
-    let Some(active_app_ref) = app_ref_from_instance_name(&state.active_instance) else {
-        return Ok(());
-    };
-    write_app_runtime_state(app, &active_app_ref, None)
-}
-
-fn record_cleanup_job_failure(
-    app: &str,
-    mut job: CleanupJobState,
-    error_message: String,
-) -> Result<(), String> {
-    job.attempts = job.attempts.saturating_add(1);
-    job.last_error = Some(error_message.clone());
-    job.updated_at = now_unix_secs();
-    write_cleanup_job(app, &job)?;
-    Err(error_message)
-}
-
-pub fn cleanup_previous(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let Some(_cleanup_lock) = try_acquire_cleanup_lock(app)? else {
-        return Ok(());
-    };
-
-    let Some(job) = read_cleanup_job(app)? else {
-        return Ok(());
-    };
-    if job.app != app {
-        let job_app = job.app.clone();
-        return record_cleanup_job_failure(
-            app,
-            job,
-            format!(
-                "cleanup job app mismatch: expected '{app}', found '{}'",
-                job_app
-            ),
-        );
-    }
-
-    let Some(scheduled_previous_app) = app_ref_from_instance_name(&job.scheduled_previous_instance)
-    else {
-        return record_cleanup_job_failure(
-            app,
-            job,
-            "cleanup job has invalid scheduled previous instance".to_string(),
-        );
-    };
-    if !is_transient_deploy_app_for(app, &scheduled_previous_app) {
-        clear_cleanup_job(app)?;
-        return Ok(());
-    }
-
-    let active_app = resolve_active_app_ref(app)?;
-    if active_app.as_deref() == Some(scheduled_previous_app.as_str()) {
-        eprintln!(
-            "       Skipping background cleanup because previous instance became active again"
-        );
-        clear_cleanup_job(app)?;
-        return Ok(());
-    }
-
-    if !container::exists(&scheduled_previous_app) {
-        clear_previous_runtime_reference_if_missing(app)?;
-        clear_cleanup_job(app)?;
-        return Ok(());
-    }
-
-    let project = current_project_name()?;
-    if env::var_os("PSHT_SKIP_TAILSCALE").is_none() {
-        let _ = container::exec_cmd(
-            &scheduled_previous_app,
-            "tailscale down >/dev/null 2>&1 || true",
-        );
-    }
-
-    if let Err(err) = cleanup_container_for_rebuild(&scheduled_previous_app, &project) {
-        return record_cleanup_job_failure(
-            app,
-            job,
-            format!("failed to clean previous instance '{scheduled_previous_app}': {err}"),
-        );
-    }
-
-    clear_previous_runtime_reference_if_missing(app)?;
-    clear_cleanup_job(app)?;
-    Ok(())
-}
 
 fn cleanup_pending_detail(app: &str) -> Option<String> {
-    let state = read_cleanup_job(app).ok().flatten()?;
-    let mut detail = format!("cleanup pending (attempts: {})", state.attempts);
-    if let Some(last_error) = state.last_error.as_deref() {
-        detail.push_str(&format!(", last error: {last_error}"));
-    }
-    Some(detail)
-}
-
-fn start_deploy_log_session(app: &str) -> Option<deploy_log::DeployLogSession> {
-    match deploy_log::start_for_app(app) {
-        Ok(session) => Some(session),
-        Err(err) => {
-            std::eprintln!("       Warning: failed to initialize deploy logs: {err}");
-            None
-        }
-    }
-}
-
-fn deploy_request_id() -> String {
-    format!("{}-{}", now_unix_secs(), std::process::id())
-}
-
-fn deploy_interrupted_error(phase: &str, state: &DeployInterruptState) -> String {
-    format!(
-        "{DEPLOY_INTERRUPT_ERR_PREFIX} (phase: {phase}, request: {}, requested_at: {})",
-        state.request_id, state.requested_at
-    )
-}
-
-fn is_deploy_interrupted_error(err: &str) -> bool {
-    err.starts_with(DEPLOY_INTERRUPT_ERR_PREFIX)
-}
-
-fn deploy_result_was_interrupted(result: &Result<(), String>) -> bool {
-    matches!(result, Err(err) if is_deploy_interrupted_error(err))
-}
-
-fn deploy_interrupt_state_for_signal(app: &str) -> DeployInterruptState {
-    let now = now_unix_secs();
-    let target_sha = read_git_deploy_state(app)
-        .ok()
-        .flatten()
-        .map(|state| state.sha)
-        .unwrap_or_else(|| "unknown".to_string());
-    DeployInterruptState {
-        request_id: format!("signal-{}-{now}", process::id()),
-        requested_at: now,
-        target_sha,
-    }
-}
-
-fn check_signal_interrupt_without_persist(app: &str, phase: &str) -> Result<(), String> {
-    if !DEPLOY_INTERRUPT_SIGNAL_PENDING.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    let state = deploy_interrupt_state_for_signal(app);
-    Err(deploy_interrupted_error(phase, &state))
-}
-
-fn check_signal_interrupt_with_persist(app: &str, phase: &str) -> Result<(), String> {
-    if !DEPLOY_INTERRUPT_SIGNAL_PENDING.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    if let Some(state) = read_deploy_interrupt(app)? {
-        return Err(deploy_interrupted_error(phase, &state));
-    }
-
-    let state = deploy_interrupt_state_for_signal(app);
-    if let Err(err) = request_deploy_interrupt(app, &state) {
-        eprintln!("       Warning: failed to record signal interrupt state: {err}");
-    }
-    Err(deploy_interrupted_error(phase, &state))
-}
-
-fn check_deploy_interrupt(app: &str, phase: &str) -> Result<(), String> {
-    if let Err(err) = refresh_deploy_lock_heartbeat(app) {
-        eprintln!("       Warning: failed to refresh deploy lock heartbeat: {err}");
-    }
-    refresh_active_reconcile_lease(app)
-        .map_err(|err| format!("reconcile lease check failed during {phase}: {err}"))?;
-    check_signal_interrupt_with_persist(app, phase)?;
-    if let Some(state) = read_deploy_interrupt(app)? {
-        return Err(deploy_interrupted_error(phase, &state));
-    }
-    Ok(())
-}
-
-fn should_process_pending_request(
-    active_target: Option<&GitCheckoutTarget>,
-    pending: &PendingGitDeployRequest,
-) -> bool {
-    if pending.force {
-        return true;
-    }
-    active_target.map(|target| target.sha.as_str()) != Some(pending.sha.as_str())
-}
-
-fn pending_force_request_is_ours(
-    pending_request: Option<&PendingGitDeployRequest>,
-    request_id: &str,
-    target_sha: &str,
-) -> bool {
-    matches!(
-        pending_request,
-        Some(request)
-            if request.request_id.as_deref() == Some(request_id)
-                || (request.request_id.is_none() && request.force && request.sha == target_sha)
-    )
-}
-
-fn deploy_once(
-    app: &str,
-    target: Option<&GitCheckoutTarget>,
-    force: bool,
-    force_fresh_setup_image: bool,
-) -> Result<(), String> {
-    if let Some(target) = target {
-        if !force {
-            match git_target_already_succeeded(app, target) {
-                Ok(true) => {
-                    eprintln!("-----> Current git revision already deployed successfully");
-                    return Ok(());
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    eprintln!("       Warning: failed to read git deploy state: {err}");
-                }
-            }
-        }
-        if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Pending) {
-            eprintln!("       Warning: failed to record pending git deploy state: {err}");
-        }
-    }
-
-    check_deploy_interrupt(app, "before checkout")?;
-    eprintln!("-----> Checking out code");
-    if let Some(target) = target {
-        eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
-    }
-    let result = (|| {
-        let build_dir = checkout_code(app, target)?;
-        check_deploy_interrupt(app, "after checkout")?;
-        deploy_from(app, &build_dir, force_fresh_setup_image)
-    })();
-
-    match result {
-        Ok(()) => {
-            if let Some(target) = target {
-                if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Success) {
-                    eprintln!(
-                        "       Warning: failed to persist successful git deploy state: {err}"
-                    );
-                }
-            } else if let Err(err) = clear_git_deploy_state(app) {
-                eprintln!("       Warning: failed to clear git deploy state: {err}");
-            }
-            Ok(())
-        }
-        Err(err) => {
-            if let Some(target) = target {
-                let status = if is_deploy_interrupted_error(&err) {
-                    GitDeployStatus::Interrupted
-                } else {
-                    GitDeployStatus::Failed
-                };
-                if let Err(write_err) = write_git_deploy_state(app, target, status) {
-                    eprintln!(
-                        "       Warning: failed to record failed git deploy state: {write_err}"
-                    );
-                }
-            }
-            Err(err)
-        }
-    }
-}
-
-fn runtime_state_snapshot(app: &str) -> (Option<String>, Option<String>) {
-    if let Ok(Some(state)) = read_app_runtime_state(app) {
-        return (Some(state.active_instance), state.previous_instance);
-    }
-    let active = resolve_active_app_ref(app)
-        .ok()
-        .flatten()
-        .map(|app_ref| instance_name_from_app_ref(&app_ref));
-    (active, None)
-}
-
-fn normalized_desired_state(value: &str) -> &'static str {
-    if value.eq_ignore_ascii_case(DESIRED_STATE_STOPPED) {
-        DESIRED_STATE_STOPPED
-    } else {
-        DESIRED_STATE_RUNNING
-    }
+    deploy_commands::cleanup_pending_detail(app)
 }
 
 fn app_desired_state(app: &str) -> Result<&'static str, String> {
-    let desired = sqlite_store::get_app_spec(app)?
-        .map(|spec| spec.desired_state)
-        .unwrap_or_else(|| DESIRED_STATE_RUNNING.to_string());
-    Ok(normalized_desired_state(&desired))
+    deploy_commands::app_desired_state(app)
 }
 
 fn set_app_desired_state(app: &str, desired_state: &str) -> Result<(), String> {
-    let desired_state = normalized_desired_state(desired_state).to_string();
-    let row = if let Some(mut existing) = sqlite_store::get_app_spec(app)? {
-        existing.desired_state = desired_state;
-        existing
-    } else {
-        sqlite_store::AppSpecRow {
-            app_id: app.to_string(),
-            generation: 0,
-            desired_state,
-            source_kind: "manual".to_string(),
-            source_payload_json: "{}".to_string(),
-            runtime_payload_json: "{}".to_string(),
-        }
-    };
-    sqlite_store::upsert_app_spec(&row)
-}
-
-fn begin_reconcile_intent(
-    app: &str,
-    kind: &str,
-    source_kind: &str,
-    source_payload_json: &str,
-) -> Result<ReconcileIntentContext, String> {
-    let generation = sqlite_store::next_app_generation(app)?;
-    let spec = sqlite_store::AppSpecRow {
-        app_id: app.to_string(),
-        generation,
-        desired_state: DESIRED_STATE_RUNNING.to_string(),
-        source_kind: source_kind.to_string(),
-        source_payload_json: source_payload_json.to_string(),
-        runtime_payload_json: "{}".to_string(),
-    };
-    sqlite_store::upsert_app_spec(&spec)?;
-
-    let intent_id = format!("{}-{}-{generation}", now_unix_secs(), std::process::id());
-    sqlite_store::insert_deploy_intent(&sqlite_store::DeployIntentRow {
-        intent_id: intent_id.clone(),
-        app_id: app.to_string(),
-        generation,
-        kind: kind.to_string(),
-        payload_json: source_payload_json.to_string(),
-    })?;
-
-    let plan_hash = format!("{app}:{kind}:{generation}");
-    sqlite_store::upsert_reconcile_checkpoint(
-        app,
-        generation,
-        &plan_hash,
-        0,
-        "intent-accepted",
-        Some("{\"ok\":true}"),
-    )?;
-
-    let (active_instance, previous_instance) = runtime_state_snapshot(app);
-    let previous_status = sqlite_store::get_app_status(app).ok().flatten();
-    let active_revision = read_git_deploy_state(app)
-        .ok()
-        .flatten()
-        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
-    sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
-        app_id: app.to_string(),
-        observed_generation: generation,
-        phase: "Reconciling".to_string(),
-        active_instance,
-        candidate_instance: previous_status.and_then(|status| status.candidate_instance),
-        previous_instance,
-        active_revision,
-        candidate_revision: None,
-        health_json: "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string(),
-        last_error_json: None,
-        recovery_actions_json: "[]".to_string(),
-    })?;
-
-    Ok(ReconcileIntentContext {
-        intent_id,
-        generation,
-        plan_hash,
-        source_summary: source_payload_json.to_string(),
-    })
-}
-
-fn reconcile_checkpoint(
-    app: &str,
-    ctx: &ReconcileIntentContext,
-    op_index: i64,
-    op_name: &str,
-    last_result_json: Option<&str>,
-) {
-    if let Err(err) = sqlite_store::upsert_reconcile_checkpoint(
-        app,
-        ctx.generation,
-        &ctx.plan_hash,
-        op_index,
-        op_name,
-        last_result_json,
-    ) {
-        eprintln!("       Warning: failed to persist reconcile checkpoint: {err}");
-    }
-}
-
-fn complete_reconcile_intent(
-    app: &str,
-    ctx: &ReconcileIntentContext,
-    result: &Result<(), String>,
-    revision: Option<&str>,
-) {
-    let (phase, last_error_json, health_json, recovery_actions_json, outcome, summary) =
-        match result {
-            Ok(()) => (
-                "Idle".to_string(),
-                None,
-                "{\"healthy\":true}".to_string(),
-                "[]".to_string(),
-                "success".to_string(),
-                format!("deploy succeeded ({})", ctx.source_summary),
-            ),
-            Err(err) => (
-                "Degraded".to_string(),
-                Some(
-                    serde_json::json!({
-                        "error": err,
-                        "generation": ctx.generation,
-                    })
-                    .to_string(),
-                ),
-                "{\"healthy\":false}".to_string(),
-                serde_json::json!(["inspect deploy logs", "run `psht health`", "retry deploy"])
-                    .to_string(),
-                "failed".to_string(),
-                err.to_string(),
-            ),
-        };
-
-    let (active_instance, previous_instance) = runtime_state_snapshot(app);
-    if let Err(err) = sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
-        app_id: app.to_string(),
-        observed_generation: ctx.generation,
-        phase,
-        active_instance,
-        candidate_instance: None,
-        previous_instance,
-        active_revision: revision.map(|value| value.to_string()),
-        candidate_revision: None,
-        health_json,
-        last_error_json,
-        recovery_actions_json,
-    }) {
-        eprintln!("       Warning: failed to persist app status: {err}");
-    }
-
-    if result.is_ok() {
-        let _ = sqlite_store::clear_reconcile_checkpoint(app);
-    } else {
-        reconcile_checkpoint(
-            app,
-            ctx,
-            999,
-            "failed",
-            Some(
-                &serde_json::json!({
-                    "error": summary,
-                })
-                .to_string(),
-            ),
-        );
-    }
-
-    if let Err(err) =
-        sqlite_store::append_deploy_history(app, ctx.generation, revision, &outcome, &summary)
-    {
-        eprintln!("       Warning: failed to append deploy history: {err}");
-    }
-    if let Err(err) = sqlite_store::mark_deploy_intent_processed(&ctx.intent_id) {
-        eprintln!("       Warning: failed to mark deploy intent processed: {err}");
-    }
-}
-
-fn queue_pending_git_deploy(
-    app: &str,
-    target: &GitCheckoutTarget,
-    force: bool,
-    request_id: Option<String>,
-) -> Result<PendingGitDeployRequest, String> {
-    let request = PendingGitDeployRequest::from_target(target, force, request_id);
-    write_pending_git_request(app, &request)?;
-    if let Err(err) = write_git_deploy_state(app, target, GitDeployStatus::Pending) {
-        eprintln!("       Warning: failed to record pending git deploy state: {err}");
-    }
-    Ok(request)
-}
-
-fn wait_for_forced_pending_deploy_completion(
-    app: &str,
-    target: &GitCheckoutTarget,
-    request_id: &str,
-) -> Result<(), String> {
-    let mut last_status_line = String::new();
-    let started = Instant::now();
-    let mut next_heartbeat = DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS;
-
-    loop {
-        let lock_active = deploy_lock_path(app).exists();
-        let pending_request = read_pending_git_request(app)?;
-        let state = read_git_deploy_state(app)?;
-        let interrupt_state = read_deploy_interrupt(app)?;
-        let elapsed = started.elapsed().as_secs();
-        let interrupt_is_ours = matches!(
-            interrupt_state.as_ref(),
-            Some(DeployInterruptState { request_id: id, .. }) if id == request_id
-        );
-        let pending_is_ours =
-            pending_force_request_is_ours(pending_request.as_ref(), request_id, &target.sha);
-
-        if matches!(
-            state.as_ref(),
-            Some(GitDeployState {
-                sha,
-                status: GitDeployStatus::Success,
-                ..
-            }) if sha == &target.sha
-        ) && !pending_is_ours
-        {
-            eprintln!(
-                "=====> Forced deploy complete for {} ({})",
-                target.ref_name, target.sha
-            );
-            let _ = clear_deploy_interrupt(app);
-            return Ok(());
-        }
-
-        if lock_active
-            && interrupt_is_ours
-            && pending_is_ours
-            && elapsed >= DEPLOY_FORCE_TAKEOVER_TIMEOUT_SECS
-        {
-            eprintln!("-----> Force timeout reached ({elapsed}s); escalating to lock takeover");
-            let lock_path = deploy_lock_path(app);
-            match read_deploy_lock_metadata(app)? {
-                Some(metadata) => {
-                    if let Some(pid) = metadata.pid {
-                        let alive = pid_is_alive(pid);
-                        eprintln!("       Lock holder pid {pid} (alive: {alive})");
-                        if alive {
-                            eprintln!("       Sending SIGKILL to lock holder pid {pid}");
-                            send_kill_signal(pid)?;
-                            let mut exited = false;
-                            for _ in 0..DEPLOY_FORCE_KILL_WAIT_CHECKS {
-                                if !pid_is_alive(pid) {
-                                    exited = true;
-                                    break;
-                                }
-                                thread::sleep(Duration::from_millis(DEPLOY_FORCE_KILL_WAIT_MS));
-                            }
-                            if !exited {
-                                return Err(format!(
-                                    "lock holder pid {pid} did not exit after SIGKILL"
-                                ));
-                            }
-                        }
-                    } else {
-                        eprintln!(
-                            "       Warning: deploy lock metadata missing pid; forcing lock takeover"
-                        );
-                    }
-                }
-                None => {
-                    eprintln!("       Deploy lock disappeared during takeover escalation");
-                }
-            }
-            clear_deploy_lock(app)?;
-            let Some(_lock) = try_acquire_deploy_lock(app)? else {
-                return Err(format!(
-                    "failed to acquire deploy lock after forced takeover at {}; a concurrent deploy may still be running",
-                    lock_path.display()
-                ));
-            };
-            eprintln!("-----> Starting forced deploy takeover");
-            let _ = take_pending_git_request(app)?;
-            let result = deploy_once(app, Some(target), true, false);
-            let _ = clear_deploy_interrupt(app);
-            return result;
-        }
-
-        if !lock_active
-            && interrupt_is_ours
-            && let Some(_lock) = try_acquire_deploy_lock(app)?
-        {
-            eprintln!(
-                "-----> Active deploy did not acknowledge interrupt; taking over forced deploy"
-            );
-            if pending_is_ours {
-                let _ = take_pending_git_request(app)?;
-            }
-            let result = deploy_once(app, Some(target), true, false);
-            let _ = clear_deploy_interrupt(app);
-            return result;
-        }
-
-        if !lock_active
-            && !matches!(pending_request.as_ref(), Some(request) if request.sha == target.sha)
-            && matches!(
-                state.as_ref(),
-                Some(GitDeployState {
-                    sha,
-                    status: GitDeployStatus::Failed | GitDeployStatus::Interrupted,
-                    ..
-                }) if sha == &target.sha
-            )
-        {
-            return Err(format!(
-                "forced deploy did not complete successfully for {} ({})",
-                target.ref_name, target.sha
-            ));
-        }
-
-        let status_line = if let Some(request) = pending_request.as_ref() {
-            let req_id = request.request_id.as_deref().unwrap_or("-");
-            if request.request_id.as_deref() != Some(request_id) {
-                format!(
-                    "forced request superseded by newer pending request {req_id}; waiting for latest"
-                )
-            } else if lock_active {
-                "interrupt requested; waiting for active deploy to stop".to_string()
-            } else {
-                "interrupt requested; waiting for forced deploy to start".to_string()
-            }
-        } else if lock_active {
-            "forced pending picked up; waiting for deploy completion".to_string()
-        } else {
-            match state.as_ref() {
-                Some(GitDeployState { sha, status, .. }) if sha == &target.sha => {
-                    format!("last deploy status for target is {:?}", status).to_lowercase()
-                }
-                _ => "waiting for deploy scheduler state".to_string(),
-            }
-        };
-
-        let status_line = if lock_active
-            && elapsed >= DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS.saturating_mul(3)
-            && status_line == "interrupt requested; waiting for active deploy to stop"
-        {
-            "interrupt requested; waiting for active deploy to stop (it may be in a long-running command)".to_string()
-        } else {
-            status_line
-        };
-        if status_line != last_status_line || elapsed >= next_heartbeat {
-            eprintln!("       {status_line} ({elapsed}s elapsed)");
-            last_status_line = status_line;
-            next_heartbeat = elapsed.saturating_add(DEPLOY_INTERRUPT_WAIT_HEARTBEAT_SECS);
-        }
-
-        thread::sleep(Duration::from_millis(DEPLOY_INTERRUPT_WAIT_POLL_MS));
-    }
-}
-
-pub fn deploy(
-    app: &str,
-    git_ref: Option<&str>,
-    git_sha: Option<&str>,
-    force: bool,
-) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    install_deploy_interrupt_signal_handlers();
-    let source_payload = serde_json::json!({
-        "mode": "git",
-        "ref": git_ref,
-        "sha": git_sha,
-        "force": force,
-    })
-    .to_string();
-    check_signal_interrupt_without_persist(app, "deploy scheduling")?;
-    let attempt_started = Instant::now();
-    let ctx = begin_reconcile_intent(app, "deploy", "git", &source_payload)?;
-    reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
-    let result = deploy_impl(app, git_ref, git_sha, force, false, &ctx);
-    let revision = parse_git_checkout_target(git_ref, git_sha)
-        .ok()
-        .and_then(|target| target.map(|target| target.sha))
-        .or_else(|| {
-            read_git_deploy_state(app)
-                .ok()
-                .flatten()
-                .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha))
-        });
-    stats::report_deploy_attempt(stats::DeployAttempt {
-        app,
-        kind: "deploy",
-        generation: ctx.generation,
-        attempt: 1,
-        force,
-        success: result.is_ok(),
-        duration: attempt_started.elapsed(),
-        error: result.as_ref().err().map(|err| err.as_str()),
-    });
-    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
-
-    result.map_err(|err| {
-        if is_deploy_interrupted_error(&err) {
-            strip_internal_deploy_error_markers(&err).to_string()
-        } else {
-            err
-        }
-    })
-}
-
-fn deploy_impl(
-    app: &str,
-    git_ref: Option<&str>,
-    git_sha: Option<&str>,
-    force: bool,
-    force_fresh_setup_image: bool,
-    ctx: &ReconcileIntentContext,
-) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let _deploy_log_session = start_deploy_log_session(app);
-    eprintln!("-----> Deploying {app}");
-    warn_if_upgrade_available();
-    let mut target = parse_git_checkout_target(git_ref, git_sha)?;
-
-    let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
-        if let Some(target) = target.as_ref() {
-            if force {
-                let request_id = deploy_request_id();
-                let request =
-                    queue_pending_git_deploy(app, target, true, Some(request_id.clone()))?;
-                request_deploy_interrupt(
-                    app,
-                    &DeployInterruptState {
-                        request_id: request_id.clone(),
-                        requested_at: now_unix_secs(),
-                        target_sha: target.sha.clone(),
-                    },
-                )?;
-                eprintln!(
-                    "-----> Deploy already in progress; interrupt requested for forced deploy"
-                );
-                eprintln!("       Ref: {} ({})", request.ref_name, request.sha);
-                return wait_for_forced_pending_deploy_completion(app, target, &request_id);
-            }
-            queue_pending_git_deploy(app, target, false, None)?;
-            eprintln!("-----> Deploy already in progress; replaced pending deploy target");
-            eprintln!("       Ref: {} ({})", target.ref_name, target.sha);
-            return Ok(());
-        }
-        return Err(format!(
-            "deploy already in progress for '{app}'; retry after it completes"
-        ));
-    };
-    if let Err(err) = clear_deploy_interrupt(app) {
-        eprintln!("       Warning: failed to clear pending deploy interrupt state: {err}");
-    }
-    let _reconcile_lease = acquire_reconcile_lease(app, ctx)?;
-
-    let mut active_force = force;
-    loop {
-        let result = deploy_once(app, target.as_ref(), active_force, force_fresh_setup_image);
-        let pending_request = take_pending_git_request(app)?;
-        let interrupted = deploy_result_was_interrupted(&result);
-        let Some(pending_request) = pending_request else {
-            if interrupted {
-                let _ = clear_deploy_interrupt(app);
-            }
-            return result;
-        };
-        if !should_process_pending_request(target.as_ref(), &pending_request) {
-            return result;
-        }
-
-        if interrupted {
-            if let Err(err) = clear_deploy_interrupt(app) {
-                eprintln!("       Warning: failed to clear deploy interrupt state: {err}");
-            }
-            eprintln!("-----> Deploy interrupted; handing off to pending target");
-        }
-
-        eprintln!("-----> Processing pending deploy target");
-        eprintln!(
-            "       Ref: {} ({})",
-            pending_request.ref_name, pending_request.sha
-        );
-        if pending_request.force {
-            eprintln!("       Forced redeploy requested");
-        }
-        target = Some(pending_request.target());
-        active_force = pending_request.force;
-    }
-}
-
-pub fn push(app: &str, force: bool) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    install_deploy_interrupt_signal_handlers();
-    let source_payload = serde_json::json!({
-        "mode": "push",
-        "force": force,
-    })
-    .to_string();
-    check_signal_interrupt_without_persist(app, "push scheduling")?;
-    let attempt_started = Instant::now();
-    let ctx = begin_reconcile_intent(app, "push", "tar-stdin", &source_payload)?;
-    reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
-    let result = push_impl(app, force, &ctx);
-    let revision = read_git_deploy_state(app)
-        .ok()
-        .flatten()
-        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
-    stats::report_deploy_attempt(stats::DeployAttempt {
-        app,
-        kind: "push",
-        generation: ctx.generation,
-        attempt: 1,
-        force,
-        success: result.is_ok(),
-        duration: attempt_started.elapsed(),
-        error: result.as_ref().err().map(|err| err.as_str()),
-    });
-    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
-    result
-}
-
-fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let _deploy_log_session = start_deploy_log_session(app);
-    eprintln!("-----> Deploying {app}");
-    warn_if_upgrade_available();
-    let Some(_deploy_lock) = try_acquire_deploy_lock(app)? else {
-        return Err(format!(
-            "deploy already in progress for '{app}'; retry after it completes"
-        ));
-    };
-    let _reconcile_lease = acquire_reconcile_lease(app, ctx)?;
-
-    let code_dir = home_dir().join(app);
-
-    if code_dir.exists() {
-        fs::remove_dir_all(&code_dir).map_err(|e| format!("failed to clean code dir: {e}"))?;
-    }
-    fs::create_dir_all(&code_dir).map_err(|e| format!("failed to create code dir: {e}"))?;
-
-    eprintln!("-----> Receiving code");
-    let status = Command::new("tar")
-        .args(["xz", "-C"])
-        .arg(&code_dir)
-        .stdin(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to extract tar: {e}"))?;
-    if !status.success() {
-        return Err("tar extraction failed".to_string());
-    }
-
-    let candidate_hash = binary_payload_hash(&code_dir)?;
-    if let Some(hash) = candidate_hash.as_deref() {
-        if resolve_active_app_ref(app)?.is_some() && read_binary_hash(app).as_deref() == Some(hash)
-        {
-            if force {
-                eprintln!("-----> Binary unchanged ({hash}), forcing deploy");
-            } else {
-                eprintln!("-----> Binary unchanged ({hash}), skipping deploy");
-                return Ok(());
-            }
-        }
-    }
-
-    deploy_from(app, &code_dir, false)?;
-    if let Err(err) = clear_git_deploy_state(app) {
-        eprintln!("       Warning: failed to clear git deploy state: {err}");
-    }
-    Ok(())
-}
-
-fn deploy_from(app: &str, code_dir: &Path, force_fresh_setup_image: bool) -> Result<(), String> {
-    deploy_from_in_place(app, code_dir, force_fresh_setup_image)
-}
-
-fn deploy_from_blue_green(
-    app: &str,
-    code_dir: &Path,
-    force_fresh_setup_image: bool,
-) -> Result<(), String> {
-    let deploy_started = Instant::now();
-    let current_uid = run_cmd_capture("id", &["-u"])?;
-    let current_project = format!("user-{}", current_uid.trim());
-    if command_succeeds("incus", &["project", "show", &current_project]) {
-        ensure_project_default_profile(&current_project)?;
-    }
-    init_stacks_in(&stacks_dir())?;
-    check_deploy_interrupt(app, "blue/green preflight")?;
-    let old_active_app = resolve_active_app_ref(app)?
-        .ok_or_else(|| format!("app '{app}' not found for blue/green deploy"))?;
-    let old_previous_app = read_app_runtime_state(app)?
-        .and_then(|state| state.previous_instance)
-        .and_then(|instance| app_ref_from_instance_name(&instance))
-        .filter(|previous_app| previous_app != &old_active_app && container::exists(previous_app));
-
-    eprintln!("-----> Detecting app type");
-    let config = detect::detect(code_dir)?;
-    eprintln!("       Detected: {:?}", config.app_type);
-    let app_env = read_env_vars(app)?;
-    ensure_required_env_present(&config.required_env, &app_env)?;
-    let binary_hash = if matches!(config.app_type, detect::AppType::Binary) {
-        binary_payload_hash(code_dir)?
-    } else {
-        None
-    };
-    check_deploy_interrupt(app, "blue/green detect and env checks")?;
-
-    if code_dir.join("psht-stack.sh").exists() {
-        eprintln!("       Using custom stack");
-    }
-
-    let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
-    let hash = stack_hash(&script_path)?;
-    let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
-    let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
-    let port = allocate_port(app);
-    let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
-    eprintln!("-----> Ensuring app storage volume");
-    let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
-    let tailscale_volume = if skip_tailscale {
-        None
-    } else {
-        eprintln!("-----> Ensuring tailscale state volume");
-        Some(ensure_app_tailscale_volume(app)?)
-    };
-
-    let deploy_id = deploy_instance_id();
-    let mut candidate_app = candidate_app_name(app, &deploy_id);
-    let mut reused_inactive_candidate = false;
-    let pending_cleanup_exists = read_cleanup_job(app)?.is_some();
-
-    if pending_cleanup_exists {
-        eprintln!("       Pending cleanup detected; using fresh candidate container");
-    } else if force_fresh_setup_image {
-        eprintln!("       Fresh-image retry requested; skipping inactive container reuse");
-    } else if let Some(previous_app) = old_previous_app.as_ref() {
-        eprintln!("-----> Evaluating reusable inactive container");
-        eprintln!("       Inactive: {previous_app}");
-        wait_for_container_operation_quiet(previous_app, &current_project, Some(app))?;
-        let previous_setup_hash =
-            container::exec_output(previous_app, "cat /etc/psht-setup-hash 2>/dev/null")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        if previous_setup_hash == setup_hash {
-            candidate_app = previous_app.clone();
-            reused_inactive_candidate = true;
-            eprintln!("       Reusing inactive container: {candidate_app}");
-        } else {
-            eprintln!("       Inactive setup hash mismatch; using fresh candidate");
-        }
-    }
-
-    if !reused_inactive_candidate && container::exists(&candidate_app) {
-        cleanup_container_for_rebuild(&candidate_app, &current_project).map_err(|e| {
-            format!("failed to reset existing candidate '{candidate_app}' before rebuild: {e}")
-        })?;
-    }
-
-    eprintln!("-----> Preparing candidate container");
-    eprintln!("       Candidate: {candidate_app}");
-    eprintln!("       Traffic remains on current container");
-    if let Err(err) =
-        wait_for_container_operation_quiet(&old_active_app, &current_project, Some(app))
-    {
-        if target_is_currently_serving(&old_active_app, Some(app)) {
-            eprintln!("       Active container is blocked; proceeding with cutover-first recovery");
-            eprintln!("       Details: {err}");
-        } else {
-            return Err(err);
-        }
-    }
-    check_deploy_interrupt(app, "candidate preparation")?;
-
-    let mut build_phase_started = false;
-    let mut build_used_cached_setup_image = false;
-    let build_candidate_result = (|| -> Result<(), String> {
-        check_deploy_interrupt(app, "candidate build setup")?;
-        let setup_image_cached = if reused_inactive_candidate {
-            eprintln!("-----> Reusing inactive container as candidate");
-            if !container::is_running(&candidate_app)? {
-                container::start(&candidate_app)?;
-            }
-            let _ = stop_app_process_on_port(&candidate_app, port);
-            let _ = container::remove_proxy(&candidate_app);
-            let _ = container::remove_storage_mount(&candidate_app);
-            let _ = container::remove_tailscale_state_mount(&candidate_app);
-
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup in candidate");
-            } else {
-                eprintln!("-----> Ensuring tailscale setup in reused candidate");
-                tailscale::install_in_container(&candidate_app)?;
-                let _ =
-                    container::exec_cmd(&candidate_app, "tailscale down >/dev/null 2>&1 || true");
-                let _ = container::exec_cmd(
-                    &candidate_app,
-                    "systemctl stop tailscaled >/dev/null 2>&1 || true",
-                );
-            }
-            true
-        } else {
-            let setup_image_cached = if force_fresh_setup_image {
-                eprintln!("-----> Fresh-image retry requested; skipping cached setup image");
-                false
-            } else {
-                container::setup_image_exists_in_project(
-                    &stack,
-                    &hash,
-                    apt_fingerprint.as_deref(),
-                    &current_project,
-                )
-            };
-            if setup_image_cached {
-                build_used_cached_setup_image = true;
-                eprintln!("-----> Creating candidate from cached setup image");
-                container::create_from_setup_image_in_project(
-                    &candidate_app,
-                    &stack,
-                    &hash,
-                    apt_fingerprint.as_deref(),
-                    &current_project,
-                )?;
-                if skip_tailscale {
-                    eprintln!("-----> Skipping tailscale setup in candidate");
-                } else {
-                    eprintln!("-----> Installing tailscale in candidate");
-                    tailscale::install_in_container(&candidate_app)?;
-                }
-            } else if !force_fresh_setup_image
-                && container::image_exists_in_project(&stack, &hash, &current_project)
-            {
-                eprintln!("-----> Creating candidate from cached stack image");
-                container::create_from_image_in_project(
-                    &candidate_app,
-                    &stack,
-                    &hash,
-                    &current_project,
-                )?;
-                if skip_tailscale {
-                    eprintln!("-----> Skipping tailscale setup in candidate");
-                } else {
-                    eprintln!("-----> Installing tailscale in candidate");
-                    tailscale::install_in_container(&candidate_app)?;
-                }
-            } else {
-                if force_fresh_setup_image {
-                    eprintln!("-----> Fresh-image retry requested; skipping cached stack image");
-                }
-                eprintln!("-----> Creating candidate container");
-                eprintln!("       First run may take a while while Ubuntu image downloads");
-                ensure_create_prereqs(&current_project)?;
-                container::create_in_project(&candidate_app, &current_project)?;
-
-                if skip_tailscale {
-                    eprintln!("-----> Skipping tailscale setup in candidate");
-                } else {
-                    eprintln!("-----> Installing tailscale in candidate");
-                    tailscale::install_in_container(&candidate_app)?;
-                }
-
-                eprintln!("-----> Setting up candidate runtime");
-                container::push_file(
-                    &candidate_app,
-                    &script_path.to_string_lossy(),
-                    "/tmp/setup.sh",
-                )?;
-                run_setup_command_with_logging(
-                    &candidate_app,
-                    "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-                    "candidate runtime setup",
-                )?;
-
-                eprintln!("-----> Caching stack image");
-                if let Err(e) = container::publish_image_in_project(
-                    &candidate_app,
-                    &stack,
-                    &hash,
-                    &current_project,
-                ) {
-                    eprintln!("       Warning: failed to cache stack image: {e}");
-                }
-            }
-
-            container::exec_cmd(
-                &candidate_app,
-                &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
-            )?;
-            setup_image_cached
-        };
-
-        build_phase_started = true;
-        eprintln!("-----> Building candidate");
-        check_deploy_interrupt(app, "candidate build")?;
-        container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
-        if !setup_image_cached {
-            install_apt_packages(&candidate_app, &config.apt_packages)?;
-            if apt_fingerprint.is_some() {
-                eprintln!("-----> Caching setup image");
-                if let Err(e) = container::publish_setup_image_in_project(
-                    &candidate_app,
-                    &stack,
-                    &hash,
-                    apt_fingerprint.as_deref(),
-                    &current_project,
-                ) {
-                    eprintln!("       Warning: failed to cache setup image: {e}");
-                }
-            }
-        }
-        persist_start_command(&candidate_app, &config.start_command)?;
-        persist_required_env(&candidate_app, &config.required_env)?;
-        run_hook(
-            &candidate_app,
-            "preinstall",
-            config.preinstall_command.as_deref(),
-        )?;
-
-        if let Some(command) = app_workdir_command(&config.install_command) {
-            eprintln!("-----> Installing candidate dependencies");
-            run_install_command_with_logging(
-                &candidate_app,
-                &command,
-                "candidate dependency install",
-            )?;
-        }
-        run_hook(
-            &candidate_app,
-            "postinstall",
-            config.postinstall_command.as_deref(),
-        )?;
-        Ok(())
-    })();
-
-    if let Err(err) = build_candidate_result {
-        let mut build_err = err;
-        if !reused_inactive_candidate {
-            if let Err(cleanup_err) =
-                cleanup_container_for_rebuild(&candidate_app, &current_project)
-            {
-                build_err = format!("{build_err}; candidate cleanup failed: {cleanup_err}");
-            }
-        }
-        if build_phase_started {
-            if force_fresh_setup_image {
-                return Err(mark_fresh_setup_failure(build_err));
-            }
-            if build_used_cached_setup_image {
-                return Err(mark_cached_setup_failure(build_err));
-            }
-        }
-        return Err(build_err);
-    }
-
-    let mut pre_cutover_keep = BTreeSet::new();
-    pre_cutover_keep.insert(instance_name_from_app_ref(&old_active_app));
-    pre_cutover_keep.insert(instance_name_from_app_ref(&candidate_app));
-    reconcile_family_instances_strict(app, &pre_cutover_keep, &current_project)?;
-
-    eprintln!("-----> Switching traffic");
-    check_deploy_interrupt(app, "before cutover")?;
-    eprintln!("       Traffic remains on current container until cutover is complete");
-    let mut old_proxy_removed = false;
-    let mut old_storage_detached = false;
-    let mut candidate_storage_attached = false;
-    let mut candidate_proxy_attached = false;
-    let mut old_tailnet_disconnected = false;
-    let mut old_tailscale_state_detached = false;
-    let mut candidate_tailscale_state_attached = false;
-
-    let cutover_result = (|| -> Result<Option<String>, String> {
-        check_deploy_interrupt(app, "cutover start")?;
-        eprintln!("       Stopping current app process");
-        stop_active_app_process_for_cutover(&old_active_app, port)?;
-
-        eprintln!("       Removing old proxy device");
-        container::remove_proxy_in_project(
-            &instance_name_from_app_ref(&old_active_app),
-            &current_project,
-        )?;
-        old_proxy_removed = true;
-
-        eprintln!("       Detaching storage from current container");
-        if let Err(e) = container::remove_storage_mount(&old_active_app) {
-            eprintln!("       Warning: failed to detach storage from current container: {e}");
-        }
-        old_storage_detached = true;
-
-        eprintln!("       Attaching storage to candidate container");
-        container::ensure_storage_mount(&candidate_app, &storage_pool, &storage_volume)?;
-        candidate_storage_attached = true;
-
-        eprintln!("       Attaching proxy to new active container");
-        ensure_proxy_attached_with_recovery(&candidate_app, &current_project, port, port)?;
-        candidate_proxy_attached = true;
-
-        eprintln!("       Starting app in new active container");
-        launch_app_process(&candidate_app, port, &config.start_command, &app_env)?;
-
-        eprintln!("-----> Waiting for candidate readiness");
-        check_deploy_interrupt(app, "cutover candidate readiness")?;
-        wait_for_tcp_listener(
-            &candidate_app,
-            Some(app),
-            port,
-            DEPLOY_TCP_READY_TIMEOUT_SECS,
-            "candidate readiness",
-        )?;
-
-        let tailnet_hostname = if skip_tailscale {
-            None
-        } else {
-            check_deploy_interrupt(app, "cutover tailscale switchover")?;
-            let (tailscale_pool, tailscale_state_volume) = tailscale_volume
-                .as_ref()
-                .ok_or_else(|| "tailscale state volume should be available".to_string())?;
-            eprintln!("       Disconnecting previous active container from tailnet");
-            if let Err(e) =
-                container::exec_cmd(&old_active_app, "tailscale down >/dev/null 2>&1 || true")
-            {
-                eprintln!(
-                    "       Warning: failed to bring tailscale down on previous container: {e}"
-                );
-            } else {
-                old_tailnet_disconnected = true;
-            }
-            let _ = container::exec_cmd(
-                &old_active_app,
-                "systemctl stop tailscaled >/dev/null 2>&1 || true",
-            );
-
-            seed_tailscale_state_volume_from_container(
-                &old_active_app,
-                tailscale_pool,
-                tailscale_state_volume,
-            )?;
-
-            if container::has_tailscale_state_mount(
-                &old_active_app,
-                tailscale_pool,
-                tailscale_state_volume,
-            )? {
-                eprintln!("       Detaching tailscale state from current container");
-                container::remove_tailscale_state_mount(&old_active_app)?;
-                old_tailscale_state_detached = true;
-            }
-
-            eprintln!("       Attaching tailscale state to candidate container");
-            container::ensure_tailscale_state_mount(
-                &candidate_app,
-                tailscale_pool,
-                tailscale_state_volume,
-            )?;
-            candidate_tailscale_state_attached = true;
-
-            eprintln!("       Starting tailscaled with persisted identity");
-            let name = acquire_exact_tailscale_hostname_for_deploy(&candidate_app, app)?;
-            if let Err(e) = tailscale::expose_http_in_container(&candidate_app, port) {
-                eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-            }
-            name
-        };
-
-        check_deploy_interrupt(app, "cutover finalize")?;
-        caddy::add(app, port)?;
-        write_app_runtime_state(app, &candidate_app, Some(&old_active_app))?;
-
-        Ok(tailnet_hostname)
-    })();
-
-    let tailnet_hostname = match cutover_result {
-        Ok(name) => name,
-        Err(err) => {
-            eprintln!("-----> Cutover failed; rolling back traffic");
-            let mut rollback_issues = Vec::new();
-
-            if candidate_proxy_attached {
-                if let Err(remove_err) = container::remove_proxy_in_project(
-                    &instance_name_from_app_ref(&candidate_app),
-                    &current_project,
-                ) {
-                    rollback_issues.push(format!(
-                        "failed to detach candidate proxy device: {remove_err}"
-                    ));
-                }
-            }
-            if candidate_storage_attached {
-                let _ = container::remove_storage_mount(&candidate_app);
-            }
-
-            if old_storage_detached {
-                let _ = container::ensure_storage_mount(
-                    &old_active_app,
-                    &storage_pool,
-                    &storage_volume,
-                );
-            }
-            if old_proxy_removed {
-                if let Err(proxy_err) = ensure_proxy_attached_with_recovery(
-                    &old_active_app,
-                    &current_project,
-                    port,
-                    port,
-                ) {
-                    rollback_issues.push(format!(
-                        "failed to restore previous proxy device: {proxy_err}"
-                    ));
-                }
-            }
-
-            if let Ok(restored_start_command) = read_start_command(&old_active_app) {
-                let _ =
-                    launch_app_process(&old_active_app, port, &restored_start_command, &app_env);
-            }
-            if !skip_tailscale {
-                if candidate_tailscale_state_attached {
-                    let _ = container::exec_cmd(
-                        &candidate_app,
-                        "systemctl stop tailscaled >/dev/null 2>&1 || true",
-                    );
-                    let _ = container::remove_tailscale_state_mount(&candidate_app);
-                }
-                if (old_tailscale_state_detached || candidate_tailscale_state_attached)
-                    && let Some((tailscale_pool, tailscale_state_volume)) =
-                        tailscale_volume.as_ref()
-                    && let Err(e) = container::ensure_tailscale_state_mount(
-                        &old_active_app,
-                        tailscale_pool,
-                        tailscale_state_volume,
-                    )
-                {
-                    eprintln!(
-                        "       Warning: failed to reattach tailscale state to previous container: {e}"
-                    );
-                }
-
-                let old_tailnet_hostname = if old_tailnet_disconnected {
-                    eprintln!("       Reconnecting previous active container to tailnet");
-                    match tailscale::join_with_state_in_container(&old_active_app, app) {
-                        Ok(name) => name,
-                        Err(state_err) => {
-                            eprintln!(
-                                "       Warning: state-based reconnect failed, falling back to auth-key join: {state_err}"
-                            );
-                            match tailscale::join_with_auth_key_in_container(&old_active_app, app) {
-                                Ok(name) => name,
-                                Err(e) => {
-                                    eprintln!(
-                                        "       Warning: failed to reconnect previous container to tailnet: {e}"
-                                    );
-                                    tailscale::dns_name_in_container(&old_active_app)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    tailscale::dns_name_in_container(&old_active_app)
-                };
-
-                if old_tailnet_hostname.is_some() {
-                    let _ = tailscale::expose_http_in_container(&old_active_app, port);
-                }
-            }
-            let _ = caddy::add(app, port);
-            if !reused_inactive_candidate
-                && let Err(cleanup_err) =
-                    cleanup_container_for_rebuild(&candidate_app, &current_project)
-            {
-                rollback_issues.push(format!(
-                    "failed to clean failed candidate '{candidate_app}': {cleanup_err}"
-                ));
-            }
-
-            if !rollback_issues.is_empty() {
-                eprintln!(
-                    "       Warning: rollback completed with issues: {}",
-                    rollback_issues.join(" | ")
-                );
-            }
-            return Err(format!(
-                "deploy cutover failed and rollback was applied: {err}; rollback issues: {}",
-                join_or_none(&rollback_issues)
-            ));
-        }
-    };
-
-    let mut post_cutover_keep = BTreeSet::new();
-    post_cutover_keep.insert(instance_name_from_app_ref(&candidate_app));
-    reconcile_family_instances_strict(app, &post_cutover_keep, &current_project)
-        .map_err(|e| format!("post-cutover family reconciliation failed: {e}"))?;
-    let _ = clear_cleanup_job(app);
-
-    let build_number = increment_build_number(app)?;
-
-    if let Some(name) = tailnet_hostname {
-        eprintln!("       Tailnet: http://{name} (also http://{name}:{port})");
-    }
-
-    if let Some(hash) = binary_hash {
-        if let Err(e) = write_binary_hash(app, &hash) {
-            eprintln!("       Warning: failed to persist binary hash: {e}");
-        }
-    } else if let Err(e) = clear_binary_hash(app) {
-        eprintln!("       Warning: failed to clear binary hash: {e}");
-    }
-
-    eprintln!("-----> Verifying live endpoint");
-    wait_for_tcp_listener(
-        &candidate_app,
-        Some(app),
-        port,
-        DEPLOY_TCP_READY_TIMEOUT_SECS,
-        "post-cutover verification",
-    )?;
-
-    eprintln!(
-        "=====> App {app} deployed on port {port} (build {build_number}, {}s)",
-        deploy_started.elapsed().as_secs()
-    );
-    Ok(())
-}
-
-fn deploy_from_in_place(
-    app: &str,
-    code_dir: &Path,
-    force_fresh_setup_image: bool,
-) -> Result<(), String> {
-    let current_uid = run_cmd_capture("id", &["-u"])?;
-    let current_project = format!("user-{}", current_uid.trim());
-    if command_succeeds("incus", &["project", "show", &current_project]) {
-        ensure_project_default_profile(&current_project)?;
-    }
-    init_stacks_in(&stacks_dir())?;
-    check_deploy_interrupt(app, "in-place preflight")?;
-
-    eprintln!("-----> Detecting app type");
-    let config = detect::detect(code_dir)?;
-    eprintln!("       Detected: {:?}", config.app_type);
-    let app_env = read_env_vars(app)?;
-    ensure_required_env_present(&config.required_env, &app_env)?;
-    let binary_hash = if matches!(config.app_type, detect::AppType::Binary) {
-        binary_payload_hash(code_dir)?
-    } else {
-        None
-    };
-    check_deploy_interrupt(app, "in-place detect and env checks")?;
-
-    if code_dir.join("psht-stack.sh").exists() {
-        eprintln!("       Using custom stack");
-    }
-
-    let (_stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
-    let hash = stack_hash(&script_path)?;
-    let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
-    let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
-    let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
-    eprintln!("-----> Ensuring app storage volume");
-    let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
-    let tailscale_volume = if skip_tailscale {
-        None
-    } else {
-        eprintln!("-----> Ensuring tailscale state volume");
-        Some(ensure_app_tailscale_volume(app)?)
-    };
-
-    let port = allocate_port(app);
-    let mut tailnet_hostname = if skip_tailscale {
-        None
-    } else {
-        tailscale::dns_name_in_container(app)
-    };
-    let needs_setup = if container::exists(app) {
-        let remote_hash = container::exec_output(app, "cat /etc/psht-setup-hash 2>/dev/null")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if force_fresh_setup_image {
-            eprintln!("-----> Fresh-image retry requested; rebuilding container");
-            cleanup_container_for_rebuild(app, &current_project)?;
-            true
-        } else if remote_hash == setup_hash {
-            eprintln!("-----> Reusing container");
-            stop_app_process_on_port(app, port)?;
-            false
-        } else {
-            eprintln!("-----> Rebuilding container");
-            cleanup_container_for_rebuild(app, &current_project)?;
-            true
-        }
-    } else {
-        true
-    };
-
-    check_deploy_interrupt(app, "in-place setup evaluation")?;
-    if needs_setup {
-        check_deploy_interrupt(app, "in-place setup start")?;
-        wait_for_container_operation_quiet(app, &current_project, Some(app))?;
-        eprintln!("-----> Creating container");
-        eprintln!("       First run may take a while while Ubuntu image downloads");
-        ensure_create_prereqs(&current_project)?;
-        container::create_in_project(app, &current_project)?;
-
-        if skip_tailscale {
-            eprintln!("-----> Skipping tailscale setup");
-        } else {
-            eprintln!("-----> Installing tailscale");
-            tailscale::install_in_container(app)?;
-        }
-
-        eprintln!("-----> Setting up runtime");
-        container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
-        run_setup_command_with_logging(
-            app,
-            "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-            "in-place runtime setup",
-        )?;
-
-        check_deploy_interrupt(app, "in-place package setup")?;
-        install_apt_packages(app, &config.apt_packages)?;
-
-        container::exec_cmd(
-            app,
-            &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
-        )?;
-
-        if skip_tailscale {
-            eprintln!("-----> Skipping tailnet connection");
-        } else {
-            if let Some((tailscale_pool, tailscale_state_volume)) = tailscale_volume.as_ref() {
-                container::ensure_tailscale_state_mount(
-                    app,
-                    tailscale_pool,
-                    tailscale_state_volume,
-                )?;
-            }
-            eprintln!("-----> Connecting to tailnet");
-            check_deploy_interrupt(app, "in-place tailscale connection")?;
-            tailnet_hostname = acquire_exact_tailscale_hostname_for_deploy(app, app)?;
-        }
-
-        let port = allocate_port(app);
-        eprintln!("-----> Setting up port forwarding on :{port}");
-        ensure_proxy_attached_with_recovery(app, &current_project, port, port)?;
-    }
-
-    check_deploy_interrupt(app, "in-place storage attach")?;
-    container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
-
-    eprintln!("-----> Pushing code to container");
-    check_deploy_interrupt(app, "in-place code push")?;
-    container::push_code(app, &code_dir.to_string_lossy())?;
-    persist_start_command(app, &config.start_command)?;
-    persist_required_env(app, &config.required_env)?;
-    run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
-
-    if let Some(command) = app_workdir_command(&config.install_command) {
-        eprintln!("-----> Installing dependencies");
-        run_install_command_with_logging(app, &command, "dependency install")?;
-    }
-
-    run_hook(app, "postinstall", config.postinstall_command.as_deref())?;
-
-    eprintln!("-----> Starting app");
-    check_deploy_interrupt(app, "in-place app start")?;
-    launch_app_process(app, port, &config.start_command, &app_env)?;
-
-    if !skip_tailscale {
-        tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
-    }
-    if !skip_tailscale && tailnet_hostname.is_some() {
-        if let Err(e) = tailscale::expose_http_in_container(app, port) {
-            eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-        }
-    }
-
-    check_deploy_interrupt(app, "in-place finalize")?;
-    caddy::add(app, port)?;
-    write_app_runtime_state(app, app, None)?;
-
-    let build_number = increment_build_number(app)?;
-
-    if let Some(name) = tailnet_hostname {
-        eprintln!("       Tailnet: http://{name} (also http://{name}:{port})");
-    }
-
-    if let Some(hash) = binary_hash {
-        if let Err(e) = write_binary_hash(app, &hash) {
-            eprintln!("       Warning: failed to persist binary hash: {e}");
-        }
-    } else if let Err(e) = clear_binary_hash(app) {
-        eprintln!("       Warning: failed to clear binary hash: {e}");
-    }
-
-    eprintln!("=====> App {app} deployed on port {port} (build {build_number})");
-    Ok(())
-}
-
-fn app_is_running(app: &str) -> Result<bool, String> {
-    let Some(active_app) = resolve_active_app_ref(app)? else {
-        return Ok(false);
-    };
-    container::is_running(&active_app)
-}
-
-fn restart_app_process(app: &str, vars: &BTreeMap<String, String>) -> Result<(), String> {
-    let active_app = resolve_existing_active_app_ref(app)?;
-    let required_env = read_required_env(&active_app)?;
-    ensure_required_env_present(&required_env, vars)?;
-    let start = read_start_command(&active_app)?;
-    let port = allocate_port(app);
-    launch_app_process(&active_app, port, &start, vars)?;
-    if tailscale::dns_name_in_container(&active_app).is_some()
-        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
-    {
-        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-    }
-    Ok(())
-}
-
-pub fn env_command(app: &str, assignments: &[String]) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let mut vars = read_env_vars(app)?;
-
-    if assignments.is_empty() {
-        if vars.is_empty() {
-            println!("No environment variables configured for {app}.");
-            return Ok(());
-        }
-        for (name, value) in &vars {
-            println!("{name}={value}");
-        }
-        return Ok(());
-    }
-
-    for assignment in assignments {
-        let (name, value) = parse_env_assignment(assignment)?;
-        vars.insert(name, value);
-    }
-
-    let running = app_is_running(app)?;
-    if running {
-        let active_app = resolve_existing_active_app_ref(app)?;
-        let required_env = read_required_env(&active_app)?;
-        ensure_required_env_present(&required_env, &vars)?;
-    }
-
-    write_env_vars(app, &vars)?;
-    eprintln!("-----> Saved {} env var(s) for {app}", assignments.len());
-
-    if running {
-        eprintln!("-----> Restarting {app} to apply environment changes");
-        restart_app_process(app, &vars)?;
-        eprintln!("=====> {app} restarted");
-    } else {
-        eprintln!("       {app} is not running; changes will apply on next start/deploy");
-    }
-
-    Ok(())
-}
-
-pub fn env_unset(app: &str, names: &[String]) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    if names.is_empty() {
-        return Err("env-unset requires at least one NAME".to_string());
-    }
-
-    let mut vars = read_env_vars(app)?;
-    let mut parsed_names = Vec::new();
-    for name in names {
-        let parsed = parse_env_name(name)?;
-        if parsed_names.iter().any(|v| v == &parsed) {
-            continue;
-        }
-        parsed_names.push(parsed);
-    }
-
-    for name in &parsed_names {
-        vars.remove(name);
-    }
-
-    let running = app_is_running(app)?;
-    if running {
-        let active_app = resolve_existing_active_app_ref(app)?;
-        let required_env = read_required_env(&active_app)?;
-        ensure_required_env_present(&required_env, &vars)?;
-    }
-
-    if vars.is_empty() {
-        remove_env_vars(app)?;
-    } else {
-        write_env_vars(app, &vars)?;
-    }
-    eprintln!("-----> Unset {} env var(s) for {app}", parsed_names.len());
-
-    if running {
-        eprintln!("-----> Restarting {app} to apply environment changes");
-        restart_app_process(app, &vars)?;
-        eprintln!("=====> {app} restarted");
-    } else {
-        eprintln!("       {app} is not running; changes will apply on next start/deploy");
-    }
-
-    Ok(())
-}
-
-pub fn ps() -> Result<(), String> {
-    let containers = container::list()?;
-    let apps = app_targets_from_runtime_state(&containers)?;
-    if apps.is_empty() {
-        println!("No apps running.");
-        return Ok(());
-    }
-    println!("{:<20} {:<10}", "APP", "STATUS");
-    for (app, active_app, container_status) in apps {
-        let container_state = ps_container_state(&container_status);
-        let service_ready = match container_state {
-            PsContainerState::Running => match active_app.as_deref() {
-                Some(active_app) => match app_process_is_running(active_app) {
-                    Ok(false) => Some(false),
-                    Ok(true) => {
-                        let port = allocate_port(&app);
-                        match app_port_listening(active_app, port) {
-                            Ok(ready) => Some(ready),
-                            Err(err) => {
-                                eprintln!(
-                                    "       Warning: failed to check app listener for {app}: {err}"
-                                );
-                                Some(false)
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("       Warning: failed to check app process for {app}: {err}");
-                        Some(false)
-                    }
-                },
-                None => None,
-            },
-            PsContainerState::Stopped | PsContainerState::Missing => None,
-        };
-        let status = ps_status_from_parts(container_state, service_ready);
-        println!("{:<20} {:<10}", app, status);
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PsContainerState {
-    Running,
-    Stopped,
-    Missing,
-}
-
-fn ps_container_state(status: &str) -> PsContainerState {
-    if status.eq_ignore_ascii_case("missing") {
-        PsContainerState::Missing
-    } else if status.eq_ignore_ascii_case("running") {
-        PsContainerState::Running
-    } else {
-        PsContainerState::Stopped
-    }
-}
-
-fn ps_status_from_parts(
-    container_state: PsContainerState,
-    process_running: Option<bool>,
-) -> &'static str {
-    match container_state {
-        PsContainerState::Missing => "Missing",
-        PsContainerState::Stopped => "Stopped",
-        PsContainerState::Running => {
-            if process_running == Some(true) {
-                "Running"
-            } else {
-                "Down"
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct AppHealthReport {
-    app: String,
-    healthy: bool,
-    details: Vec<String>,
-}
-
-fn has_deploy_suffix(app: &str, marker: &str) -> bool {
-    let Some((base, suffix)) = app.rsplit_once(marker) else {
-        return false;
-    };
-    !base.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn is_transient_deploy_app_name(app: &str) -> bool {
-    has_deploy_suffix(app, "-build-")
-        || has_deploy_suffix(app, "-prev-")
-        || has_deploy_suffix(app, "-failed-")
-}
-
-fn canonical_app_name_from_container(container_name: &str) -> Option<String> {
-    let app = container_name.strip_prefix("psht-")?;
-    if app.is_empty() || is_transient_deploy_app_name(app) {
-        return None;
-    }
-    Some(app.to_string())
-}
-
-fn app_targets_from_runtime_state(
-    containers: &[container::ContainerInfo],
-) -> Result<Vec<(String, Option<String>, String)>, String> {
-    let mut status_by_name = BTreeMap::new();
-    for container in containers {
-        status_by_name.insert(container.name.clone(), container.status.clone());
-    }
-
-    let mut targets: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
-    for (app, state) in read_all_app_runtime_states()? {
-        let mut active_app_ref = app_ref_from_instance_name(&state.active_instance);
-        if active_app_ref.is_none() {
-            active_app_ref = resolve_active_app_ref(&app)?;
-        }
-
-        if let Some(active_app) = active_app_ref.as_deref() {
-            let active_instance = instance_name_from_app_ref(active_app);
-            if let Some(status) = status_by_name.get(&active_instance) {
-                targets.insert(app, (Some(active_app.to_string()), status.clone()));
-                continue;
-            }
-        }
-
-        if let Some(active_app) = resolve_active_app_ref(&app)? {
-            let active_instance = instance_name_from_app_ref(&active_app);
-            if let Some(status) = status_by_name.get(&active_instance) {
-                targets.insert(app, (Some(active_app), status.clone()));
-                continue;
-            }
-        }
-
-        targets.insert(app, (None, "Missing".to_string()));
-    }
-
-    for container in containers {
-        let Some(app) = canonical_app_name_from_container(&container.name) else {
-            continue;
-        };
-        targets
-            .entry(app.clone())
-            .or_insert((Some(app), container.status.clone()));
-    }
-
-    Ok(targets
-        .into_iter()
-        .map(|(app, (active_app, status))| (app, active_app, status))
-        .collect())
-}
-
-fn app_port_listening(app: &str, port: u16) -> Result<bool, String> {
-    let output = container::exec_output(
-        app,
-        &format!(
-            "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
-        ),
-    )?;
-    Ok(output.trim() == "ready")
-}
-
-fn check_app_health(app: &str, active_app: &str, container_status: &str) -> AppHealthReport {
-    let mut details = Vec::new();
-    let mut healthy = true;
-    let active_instance = instance_name_from_app_ref(active_app);
-    details.push(format!("active instance: {active_instance}"));
-
-    if container_status.eq_ignore_ascii_case("running") {
-        details.push("container running".to_string());
-    } else {
-        details.push(format!("container status is {container_status}"));
-        return AppHealthReport {
-            app: app.to_string(),
-            healthy: false,
-            details,
-        };
-    }
-
-    let app_running = match app_process_is_running(active_app) {
-        Ok(true) => {
-            details.push("app process running".to_string());
-            true
-        }
-        Ok(false) => {
-            healthy = false;
-            details.push("app process not running".to_string());
-            false
-        }
-        Err(err) => {
-            healthy = false;
-            details.push(format!("failed to check app process: {err}"));
-            false
-        }
-    };
-
-    match read_start_command(active_app) {
-        Ok(command) => details.push(format!("start command: {}", command.trim())),
-        Err(err) => {
-            healthy = false;
-            details.push(err);
-        }
-    }
-
-    match read_required_env(active_app) {
-        Ok(required_env) => match read_env_vars(app) {
-            Ok(vars) => {
-                if let Err(err) = ensure_required_env_present(&required_env, &vars) {
-                    healthy = false;
-                    details.push(err);
-                } else if required_env.is_empty() {
-                    details.push("required env: none".to_string());
-                } else {
-                    details.push(format!(
-                        "required env present ({})",
-                        required_env.join(", ")
-                    ));
-                }
-            }
-            Err(err) => {
-                healthy = false;
-                details.push(format!("failed to read env vars: {err}"));
-            }
-        },
-        Err(err) => {
-            healthy = false;
-            details.push(format!("required env metadata error: {err}"));
-        }
-    }
-
-    if app_running {
-        let port = allocate_port(app);
-        match app_port_listening(active_app, port) {
-            Ok(true) => details.push(format!("tcp :{port} listening")),
-            Ok(false) => {
-                healthy = false;
-                details.push(format!("tcp :{port} is not listening"));
-            }
-            Err(err) => {
-                healthy = false;
-                details.push(format!("failed to check tcp :{port}: {err}"));
-            }
-        }
-    }
-
-    if let Some(detail) = cleanup_pending_detail(app) {
-        details.push(detail);
-    }
-
-    AppHealthReport {
-        app: app.to_string(),
-        healthy,
-        details,
-    }
-}
-
-fn should_delegate_health_to_psht(
-    uid: &str,
-    already_delegated: bool,
-    psht_user_exists: bool,
-) -> bool {
-    uid.trim() == "0" && !already_delegated && psht_user_exists
-}
-
-fn delegate_health_to_psht_user() -> Result<(), String> {
-    let exe =
-        env::current_exe().map_err(|e| format!("failed to resolve current executable: {e}"))?;
-    let status = Command::new("sudo")
-        .args(["-u", "psht", "-H"])
-        .arg(exe)
-        .arg("health")
-        .env(HEALTH_DELEGATED_ENV, "1")
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to run delegated health check: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("delegated health check failed".to_string())
-    }
-}
-
-pub fn health() -> Result<(), String> {
-    let health_started = Instant::now();
-    let uid = run_cmd_capture("id", &["-u"]).unwrap_or_else(|_| "?".to_string());
-    if should_delegate_health_to_psht(
-        &uid,
-        env::var_os(HEALTH_DELEGATED_ENV).is_some(),
-        command_succeeds("id", &["psht"]),
-    ) {
-        return delegate_health_to_psht_user();
-    }
-
-    eprintln!("-----> Checking app health");
-    let containers = container::list()?;
-    let apps = app_targets_from_runtime_state(&containers)?;
-    let app_count = apps.len();
-    if apps.is_empty() {
-        println!("No deployed apps found.");
-        stats::report_health_summary(stats::HealthSummary {
-            app_count: 0,
-            unhealthy_count: 0,
-            duration: health_started.elapsed(),
-        });
-        return Ok(());
-    }
-
-    println!("{:<20} {:<10} DETAILS", "APP", "STATUS");
-    let mut unhealthy = Vec::new();
-
-    for (app, active_app, status) in apps {
-        let report = if let Some(active_app) = active_app.as_deref() {
-            check_app_health(&app, active_app, &status)
-        } else {
-            AppHealthReport {
-                app: app.clone(),
-                healthy: false,
-                details: vec!["active container missing".to_string()],
-            }
-        };
-        let health_status = if report.healthy { "ok" } else { "unhealthy" };
-        println!(
-            "{:<20} {:<10} {}",
-            report.app,
-            health_status,
-            report.details.join("; ")
-        );
-        if !report.healthy {
-            unhealthy.push(report.app);
-        }
-    }
-
-    let unhealthy_count = unhealthy.len();
-    stats::report_health_summary(stats::HealthSummary {
-        app_count,
-        unhealthy_count,
-        duration: health_started.elapsed(),
-    });
-    if unhealthy_count == 0 {
-        eprintln!("=====> All app containers are healthy");
-        return Ok(());
-    }
-
-    Err(format!(
-        "{} app(s) unhealthy: {}",
-        unhealthy_count,
-        unhealthy.join(", ")
-    ))
-}
-
-fn normalize_candidate_app_ref(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(app_ref) = app_ref_from_instance_name(trimmed) {
-        return Some(app_ref);
-    }
-    Some(trimmed.trim_start_matches("psht-").to_string())
-}
-
-pub fn debug_resources(app: Option<&str>, candidate: Option<&str>) -> Result<(), String> {
-    if let Some(app) = app {
-        app_name::validate_app_name(app)?;
-    }
-    let project = current_project_name().ok();
-    let mut candidate_app = candidate.and_then(normalize_candidate_app_ref);
-
-    if candidate_app.is_none()
-        && let Some(app) = app
-    {
-        if let Some(status) = sqlite_store::get_app_status(app)? {
-            for instance in [
-                status.candidate_instance,
-                status.active_instance,
-                status.previous_instance,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Some(app_ref) = normalize_candidate_app_ref(&instance) {
-                    candidate_app = Some(app_ref);
-                    break;
-                }
-            }
-        }
-        if candidate_app.is_none() {
-            candidate_app = resolve_active_app_ref(app)?;
-        }
-    }
-
-    let snapshot = collect_resource_diagnostics(project.as_deref(), candidate_app.as_deref());
-    println!("{snapshot}");
-    Ok(())
-}
-
-pub fn logs(app: &str, follow: bool) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let deploy_lines = deploy_log::recent_entries(
-        app,
-        LOGS_DEPLOY_HISTORY_FILES,
-        LOGS_DEPLOY_HISTORY_LINES_PER_FILE,
-    )?;
-    if !deploy_lines.is_empty() {
-        for line in &deploy_lines {
-            println!("{line}");
-        }
-    }
-
-    let active_app = resolve_active_app_ref(app)?;
-    if follow {
-        let Some(active_app) = active_app else {
-            if deploy_lines.is_empty() {
-                return Err(format!("app '{app}' not found"));
-            }
-            return Ok(());
-        };
-        return container::logs(&active_app, true);
-    }
-
-    let Some(active_app) = active_app else {
-        if deploy_lines.is_empty() {
-            return Err(format!("app '{app}' not found"));
-        }
-        return Ok(());
-    };
-
-    let app_log = container::exec_output(
-        &active_app,
-        &format!("if [ -f {APP_PROCESS_LOG_PATH} ]; then cat {APP_PROCESS_LOG_PATH}; fi"),
-    )
-    .map_err(|e| format!("failed to read app log from '{active_app}': {e}"))?;
-    for line in app_log.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        println!("{} [app] {}", deploy_log::timestamp_now(), line);
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CliUpdateManifest {
-    version: String,
-    forge_url: String,
-}
-
-fn cli_update_manifest() -> CliUpdateManifest {
-    CliUpdateManifest {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        forge_url: configured_forge_url(),
-    }
-}
-
-fn cli_update_manifest_json(manifest: &CliUpdateManifest) -> Result<String, String> {
-    serde_json::to_string(manifest).map_err(|e| format!("failed to serialize update manifest: {e}"))
-}
-
-fn setup_script(hostname: &str, manifest: &CliUpdateManifest) -> Result<String, String> {
-    let manifest_json = cli_update_manifest_json(manifest)?;
-    Ok(format!(
-        r#"#!/bin/sh
-set -e
-
-cat >/dev/null <<'__PSHT_UPDATE_MANIFEST__'
-{manifest_json}
-__PSHT_UPDATE_MANIFEST__
-
-VERSION="{version}"
-FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
-FORGE_URL="${{FORGE_URL%/}}"
-SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
-SOURCE_URL="${{SOURCE_URL%/}}"
-
-detect_target() {{
-  os=$(uname -s)
-  arch=$(uname -m)
-  case "$os/$arch" in
-    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
-    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
-    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
-    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
-    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
-  esac
-}}
-
-install_cli() {{
-  install_dir="$1"
-  target=$(detect_target)
-  asset_url="$FORGE_URL/releases/download/v$VERSION/psht-$VERSION-$target.tar.gz"
-  tmpdir=$(mktemp -d)
-  if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
-    tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
-    install -m 755 "$tmpdir/psht" "$install_dir/psht"
-    rm -rf "$tmpdir"
-    return 0
-  fi
-
-  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
-    rm -rf "$tmpdir"
-    exit 1
-  fi
-
-  source_root="$tmpdir/source-root"
-  echo "-----> building psht from source (this can take a few minutes)" >&2
-  cargo install --git "$SOURCE_URL" --tag "v$VERSION" --root "$source_root" --bin psht
-  install -m 755 "$source_root/bin/psht" "$install_dir/psht"
-  rm -rf "$tmpdir"
-}}
-
-# Find or install psht CLI
-if command -v psht >/dev/null 2>&1 && psht __is-cli >/dev/null 2>&1; then
-  PSHT_BIN=$(command -v psht)
-else
-  printf "Install psht CLI to (default: ~/.local/bin): " >&2
-  read -r install_dir < /dev/tty
-  install_dir="${{install_dir:-$HOME/.local/bin}}"
-  mkdir -p "$install_dir"
-  install_cli "$install_dir"
-  PSHT_BIN="$install_dir/psht"
-  case ":$PATH:" in
-    *":$install_dir:"*) ;;
-    *) echo "NOTE: Add $install_dir to your PATH: export PATH=\"$install_dir:\$PATH\"" >&2 ;;
-  esac
-  echo "Installed psht CLI to $PSHT_BIN" >&2
-fi
-
-mkdir -p "$HOME/.psht"
-config="$HOME/.psht/config.toml"
-if [ ! -f "$config" ]; then
-  echo 'host = "{hostname}"' > "$config"
-fi
-
-"$PSHT_BIN" setup"#,
-        version = manifest.version,
-        forge_url = manifest.forge_url,
-    ))
-}
-
-fn update_script(hostname: &str, manifest: &CliUpdateManifest) -> Result<String, String> {
-    let manifest_json = cli_update_manifest_json(manifest)?;
-    Ok(format!(
-        r#"#!/bin/sh
-set -e
-
-cat >/dev/null <<'__PSHT_UPDATE_MANIFEST__'
-{manifest_json}
-__PSHT_UPDATE_MANIFEST__
-
-PSHT_BIN=$(command -v psht) || {{ echo "psht not found. Run: ssh psht@{hostname} setup | sh" >&2; exit 1; }}
-FORGE_URL="${{PSHT_FORGE_URL:-{forge_url}}}"
-FORGE_URL="${{FORGE_URL%/}}"
-SOURCE_URL="${{PSHT_SOURCE_URL:-$FORGE_URL}}"
-SOURCE_URL="${{SOURCE_URL%/}}"
-
-detect_target() {{
-  os=$(uname -s)
-  arch=$(uname -m)
-  case "$os/$arch" in
-    Linux/x86_64|Linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
-    Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
-    Darwin/x86_64|Darwin/amd64) echo "x86_64-apple-darwin" ;;
-    Darwin/aarch64|Darwin/arm64) echo "aarch64-apple-darwin" ;;
-    *) echo "unsupported platform: $os/$arch" >&2; exit 1 ;;
-  esac
-}}
-
-current=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || current=""
-if [ "$current" = "{version}" ]; then
-  echo "psht {version} (up to date)" >&2
-  exit 0
-fi
-
-target=$(detect_target)
-asset_url="$FORGE_URL/releases/download/v{version}/psht-{version}-$target.tar.gz"
-tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
-candidate="$tmpdir/psht"
-if curl -fsSL "$asset_url" -o "$tmpdir/psht.tar.gz" 2>/dev/null; then
-  tar xzf "$tmpdir/psht.tar.gz" -C "$tmpdir"
-else
-  echo "warning: no prebuilt psht release for $target at $asset_url" >&2
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "error: cargo not found; install Rust toolchain or use a forge with prebuilt assets for $target" >&2
-    exit 1
-  fi
-  source_root="$tmpdir/source-root"
-  echo "-----> building psht from source (this can take a few minutes)" >&2
-  cargo install --git "$SOURCE_URL" --tag "v{version}" --root "$source_root" --bin psht
-  candidate="$source_root/bin/psht"
-fi
-if [ ! -x "$candidate" ]; then
-  echo "error: downloaded archive missing executable psht binary" >&2
-  exit 1
-fi
-candidate_version=$("$candidate" --version 2>/dev/null | awk '{{print $2}}') || candidate_version=""
-if [ "$candidate_version" != "{version}" ]; then
-  echo "error: downloaded psht ${{candidate_version:-unknown}}, expected {version}" >&2
-  exit 1
-fi
-staged="$tmpdir/psht.new"
-install -m 755 "$candidate" "$staged"
-mv "$staged" "$PSHT_BIN"
-installed=$("$PSHT_BIN" --version 2>/dev/null | awk '{{print $2}}') || installed=""
-if [ "$installed" != "{version}" ]; then
-  echo "error: installed psht ${{installed:-unknown}}, expected {version}" >&2
-  exit 1
-fi
-echo "psht $installed (updated)" >&2"#,
-        version = manifest.version,
-        forge_url = manifest.forge_url,
-    ))
-}
-
-pub fn setup() -> Result<(), String> {
-    let host = hostname();
-    let manifest = cli_update_manifest();
-    println!("{}", setup_script(&host, &manifest)?);
-    Ok(())
-}
-
-pub fn update() -> Result<(), String> {
-    let host = hostname();
-    let manifest = cli_update_manifest();
-    println!("{}", update_script(&host, &manifest)?);
-    Ok(())
-}
-
-pub fn print_cli() -> Result<(), String> {
-    let cli = ensure_cli_binary()?;
-    let mut file =
-        fs::File::open(&cli).map_err(|e| format!("failed to open {}: {e}", cli.display()))?;
-    let mut stdout = std::io::stdout().lock();
-    std::io::copy(&mut file, &mut stdout)
-        .map_err(|e| format!("failed to stream {}: {e}", cli.display()))?;
-    stdout
-        .flush()
-        .map_err(|e| format!("failed to flush stdout: {e}"))?;
-    Ok(())
+    deploy_commands::set_app_desired_state(app, desired_state)
 }
 
 fn init_stacks_in(dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("failed to create stacks dir: {e}"))?;
-    for (name, content) in STACKS {
-        fs::write(dir.join(format!("{name}.sh")), content)
-            .map_err(|e| format!("failed to write {name}.sh: {e}"))?;
-    }
-    Ok(())
-}
-
-pub fn init_stacks() -> Result<(), String> {
-    init_stacks_in(&stacks_dir())
-}
-
-fn write_oauth_config(path: &Path, client_id: &str, client_secret: &str) -> Result<(), String> {
-    if client_id.is_empty() || client_secret.is_empty() {
-        return Err("OAuth client ID and secret are required".to_string());
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let content =
-        format!("TS_OAUTH_CLIENT_ID={client_id}\nTS_OAUTH_CLIENT_SECRET={client_secret}\n");
-    fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    Ok(())
-}
-
-fn supervise_service_unit_content(psht_bin: &str, psht_home: &Path) -> String {
-    let home = psht_home.to_string_lossy();
-    format!(
-        "[Unit]\nDescription=psht supervision daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=psht\nGroup=psht\nWorkingDirectory={home}\nEnvironment=HOME={home}\nExecStart={psht_bin} daemon\nRestart=always\nRestartSec=2\nKillMode=process\n\n[Install]\nWantedBy=multi-user.target\n"
-    )
-}
-
-fn install_supervision_units(psht_bin: &str, psht_home: &Path) -> Result<(), String> {
-    let service = supervise_service_unit_content(psht_bin, psht_home);
-    fs::write(SUPERVISE_SERVICE_PATH, service)
-        .map_err(|e| format!("failed to write {SUPERVISE_SERVICE_PATH}: {e}"))?;
-    run_cmd("chmod", &["644", SUPERVISE_SERVICE_PATH])?;
-    let _ = fs::remove_file(LEGACY_SUPERVISE_TIMER_PATH);
-    run_cmd("systemctl", &["daemon-reload"])?;
-    let _ = run_cmd("systemctl", &["disable", "--now", "psht-supervise.timer"]);
-    run_cmd("systemctl", &["enable", "--now", "psht-supervise.service"])?;
-    Ok(())
-}
-
-pub fn bootstrap() -> Result<(), String> {
-    if run_cmd_capture("id", &["-u"])? != "0" {
-        return Err("Run this command as root: sudo psht-server bootstrap".to_string());
-    }
-
-    let psht_user = "psht";
-    let psht_home = PathBuf::from(format!("/home/{psht_user}"));
-    let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
-
-    let current_bin = current_psht_binary()?;
-    let psht_bin = prepare_server_binary(&current_bin)?;
-    let psht_bin_str = psht_bin.to_string_lossy().to_string();
-    let psht_dir = current_bin
-        .parent()
-        .ok_or_else(|| "failed to determine psht binary directory".to_string())?;
-
-    if !command_exists("incus") {
-        eprintln!("-----> Installing Incus");
-        if !command_exists("curl") {
-            run_cmd("apt-get", &["update"])?;
-            run_cmd("apt-get", &["install", "-y", "curl"])?;
-        }
-
-        fs::create_dir_all("/etc/apt/keyrings")
-            .map_err(|e| format!("failed to create /etc/apt/keyrings: {e}"))?;
-        run_cmd(
-            "curl",
-            &[
-                "-fsSL",
-                "https://pkgs.zabbly.com/key.asc",
-                "-o",
-                "/etc/apt/keyrings/zabbly.asc",
-            ],
-        )?;
-
-        let codename = os_release_codename()?;
-        let arch = run_cmd_capture("dpkg", &["--print-architecture"])?;
-        let source = format!(
-            "Enabled: yes\nTypes: deb\nURIs: https://pkgs.zabbly.com/incus/stable\nSuites: {codename}\nComponents: main\nArchitectures: {arch}\nSigned-By: /etc/apt/keyrings/zabbly.asc\n"
-        );
-        fs::write(
-            "/etc/apt/sources.list.d/zabbly-incus-stable.sources",
-            source,
-        )
-        .map_err(|e| {
-            format!("failed to write /etc/apt/sources.list.d/zabbly-incus-stable.sources: {e}")
-        })?;
-
-        run_cmd("apt-get", &["update"])?;
-        run_cmd("apt-get", &["install", "-y", "incus"])?;
-    }
-
-    let _ = Command::new("systemctl")
-        .args(["start", "incus.socket", "incus-user.socket"])
-        .status();
-
-    if !command_succeeds("incus", &["profile", "show", "default"]) {
-        eprintln!("-----> Initializing Incus");
-        run_cmd("incus", &["admin", "init", "--minimal"])?;
-    }
-
-    if !skip_tailscale {
-        if !command_exists("tailscale") {
-            return Err(
-                "Tailscale is not installed. Install it first: https://tailscale.com/download/linux"
-                    .to_string(),
-            );
-        }
-        if !command_succeeds("tailscale", &["status"]) {
-            return Err("Tailscale is not connected. Run: sudo tailscale up --ssh".to_string());
-        }
-        if !tailscale_ssh_enabled()? {
-            eprintln!("-----> Enabling Tailscale SSH");
-            run_cmd("tailscale", &["up", "--ssh"])?;
-        }
-        eprintln!("-----> Tailscale SSH is active");
-    }
-
-    let oauth_config = psht_home.join(".config/tailscale-oauth");
-    if !skip_tailscale {
-        if oauth_config.exists() {
-            eprintln!("-----> Tailscale OAuth already configured");
-        } else if let (Some(client_id), Some(client_secret)) = (
-            env::var("TS_OAUTH_CLIENT_ID")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
-            env::var("TS_OAUTH_CLIENT_SECRET")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
-        ) {
-            eprintln!("-----> Setting up Tailscale OAuth from environment");
-            write_oauth_config(&oauth_config, client_id.trim(), client_secret.trim())?;
-        } else {
-            println!();
-            eprintln!("-----> Setting up Tailscale OAuth for container networking");
-            println!();
-            println!("       1. Ensure tag:psht exists in your ACL:");
-            println!("          https://login.tailscale.com/admin/acls/visual/tags/add");
-            println!();
-            println!("       2. Create a credential at:");
-            println!("          {TAILSCALE_OAUTH_SETTINGS_URL}");
-            println!("          Under Scopes, configure:");
-            println!("            - Keys: Write, tag:psht");
-            println!("            - Devices: Core Read");
-            println!("            - Devices: Core Write");
-            println!();
-
-            let confirm = prompt_tty("       Have you completed the steps above? (y/n) ")?;
-            if confirm != "y" && confirm != "Y" {
-                return Err(
-                    "Complete the steps above and re-run: sudo psht-server bootstrap".to_string(),
-                );
-            }
-
-            println!();
-            let client_id = prompt_tty("OAuth client ID: ")?;
-            let client_secret = prompt_tty("OAuth client secret: ")?;
-            write_oauth_config(&oauth_config, client_id.trim(), client_secret.trim())?;
-        }
-
-        eprintln!("-----> Validating Tailscale OAuth permissions");
-        let oauth_check = check_tailscale_oauth_permissions(&oauth_config);
-        if !oauth_check.all_ok() {
-            return Err(format_tailscale_oauth_permission_failure(&oauth_check));
-        }
-    }
-
-    ensure_line_in_file(Path::new("/etc/shells"), &psht_bin_str)?;
-
-    if !command_succeeds("id", &[psht_user]) {
-        eprintln!("-----> Creating user {psht_user}");
-        run_cmd("useradd", &["-m", "-s", &psht_bin_str, psht_user])?;
-    } else {
-        eprintln!("-----> User {psht_user} exists, updating shell");
-        run_cmd("chsh", &["-s", &psht_bin_str, psht_user])?;
-    }
-
-    let owner = format!("{psht_user}:{psht_user}");
-    // Ensure the service user can create runtime config (for example ~/.config/incus).
-    fs::create_dir_all(&psht_home)
-        .map_err(|e| format!("failed to create {}: {e}", psht_home.display()))?;
-    let psht_config_dir = psht_home.join(".config");
-    fs::create_dir_all(&psht_config_dir)
-        .map_err(|e| format!("failed to create {}: {e}", psht_config_dir.display()))?;
-    let psht_home_s = psht_home.to_string_lossy().to_string();
-    let psht_config_dir_s = psht_config_dir.to_string_lossy().to_string();
-    run_cmd("chown", &[&owner, &psht_home_s])?;
-    run_cmd("chown", &["-R", &owner, &psht_config_dir_s])?;
-
-    // Suppress MOTD/noise on SSH login for the psht service user.
-    let hushlogin = psht_home.join(".hushlogin");
-    if !hushlogin.exists() {
-        fs::write(&hushlogin, "")
-            .map_err(|e| format!("failed to write {}: {e}", hushlogin.display()))?;
-    }
-    let hushlogin_s = hushlogin.to_string_lossy().to_string();
-    run_cmd("chown", &[&owner, &hushlogin_s])?;
-    run_cmd("chmod", &["644", &hushlogin_s])?;
-
-    if oauth_config.exists() {
-        let oauth = oauth_config.to_string_lossy().to_string();
-        run_cmd("chown", &[&owner, &oauth])?;
-        run_cmd("chmod", &["600", &oauth])?;
-    }
-
-    let psht_cli_src = psht_dir.join("psht");
-    let psht_bin_dir = psht_home.join("bin");
-    fs::create_dir_all(&psht_bin_dir)
-        .map_err(|e| format!("failed to create {}: {e}", psht_bin_dir.display()))?;
-    if psht_cli_src.exists() {
-        let psht_cli_dst = psht_bin_dir.join("psht");
-        fs::copy(&psht_cli_src, &psht_cli_dst).map_err(|e| {
-            format!(
-                "failed to copy {} to {}: {e}",
-                psht_cli_src.display(),
-                psht_cli_dst.display()
-            )
-        })?;
-        let cli_path = psht_cli_dst.to_string_lossy().to_string();
-        let cli_dir = psht_bin_dir.to_string_lossy().to_string();
-        run_cmd("chmod", &["755", &cli_path])?;
-        run_cmd("chown", &[&owner, &cli_dir, &cli_path])?;
-    }
-
-    eprintln!("-----> Adding {psht_user} to incus group");
-    run_cmd("usermod", &["-aG", "incus", psht_user])?;
-
-    let mut incus_ready = false;
-    for _ in 0..30 {
-        if command_succeeds("incus", &["info"]) {
-            incus_ready = true;
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    if !incus_ready {
-        return Err("incus did not become ready after 30 seconds".to_string());
-    }
-
-    let psht_uid = run_cmd_capture("id", &["-u", psht_user])?;
-    let psht_project = format!("user-{}", psht_uid.trim());
-    if !command_succeeds("incus", &["project", "show", &psht_project]) {
-        run_cmd("incus", &["project", "create", &psht_project])?;
-    }
-    run_cmd(
-        "incus",
-        &["project", "set", &psht_project, "restricted=true"],
-    )?;
-    run_cmd(
-        "incus",
-        &[
-            "project",
-            "set",
-            &psht_project,
-            "restricted.devices.proxy=allow",
-        ],
-    )?;
-    ensure_project_default_profile(&psht_project)?;
-
-    eprintln!("-----> Setting up directories");
-    let repos = psht_home.join("repos");
-    let builds = psht_home.join("builds");
-    let stacks = psht_home.join("stacks");
-    fs::create_dir_all(&repos).map_err(|e| format!("failed to create {}: {e}", repos.display()))?;
-    fs::create_dir_all(&builds)
-        .map_err(|e| format!("failed to create {}: {e}", builds.display()))?;
-    fs::create_dir_all(&stacks)
-        .map_err(|e| format!("failed to create {}: {e}", stacks.display()))?;
-
-    let repos_s = repos.to_string_lossy().to_string();
-    let builds_s = builds.to_string_lossy().to_string();
-    let stacks_s = stacks.to_string_lossy().to_string();
-    init_stacks_in(&stacks)?;
-    run_cmd("chown", &["-R", &owner, &repos_s, &builds_s, &stacks_s])?;
-
-    eprintln!("-----> Installing host supervision daemon");
-    install_supervision_units(&psht_bin_str, &psht_home)?;
-
-    let ts_hostname = if skip_tailscale {
-        hostname()
-    } else {
-        run_cmd_capture("tailscale", &["status", "--json"])
-            .ok()
-            .and_then(|json| parse_tailscale_dns_name(&json))
-            .unwrap_or_else(hostname)
-    };
-
-    println!();
-    println!("=====> psht is ready!");
-    println!("       Containers will join your tailnet as <app>");
-    println!();
-    println!("Usage:");
-    println!();
-    println!("  cd your-app/");
-    println!("  psht deploy");
-    println!();
-    println!("Commands:");
-    println!("  ssh {psht_user}@{ts_hostname} ps");
-    println!("  ssh {psht_user}@{ts_hostname} logs <app>");
-    println!("  ssh {psht_user}@{ts_hostname} stop <app>");
-    println!("  ssh {psht_user}@{ts_hostname} start <app>");
-    println!("  ssh {psht_user}@{ts_hostname} restart <app>");
-    Ok(())
-}
-
-fn server_release_url(forge_url: &str, version: &str, target: &str) -> String {
-    format!("{forge_url}/releases/download/v{version}/psht-server-{version}-{target}.tar.gz")
-}
-
-fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped = Vec::new();
-    for path in paths {
-        let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
-        if deduped.iter().any(|existing: &PathBuf| {
-            fs::canonicalize(existing).unwrap_or(existing.clone()) == canonical
-        }) {
-            continue;
-        }
-        deduped.push(path);
-    }
-    deduped
+    admin_commands::init_stacks_in(dir)
 }
 
 fn psht_user_shell_path() -> Option<PathBuf> {
-    let passwd = run_cmd_capture("getent", &["passwd", "psht"]).ok()?;
-    let shell = passwd.split(':').nth(6)?.trim();
-    if shell.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(shell))
-}
-
-fn collect_server_install_targets(current_bin: &Path) -> Vec<PathBuf> {
-    let mut targets = vec![current_bin.to_path_buf()];
-    if let Ok(which_bin) = run_cmd_capture("which", &["psht-server"]) {
-        let path = PathBuf::from(which_bin.trim());
-        if path.exists() {
-            targets.push(path);
-        }
-    }
-    if let Some(shell_path) = psht_user_shell_path()
-        && shell_path.exists()
-    {
-        targets.push(shell_path);
-    }
-    dedupe_paths(targets)
-}
-
-fn ensure_binary_version(path: &Path, expected: &str, label: &str) -> Result<(), String> {
-    let installed = binary_version(path).unwrap_or_else(|| "unknown".to_string());
-    if installed == expected {
-        return Ok(());
-    }
-    Err(format!(
-        "{label} version mismatch at {}: expected {expected}, got {installed}",
-        path.display()
-    ))
-}
-
-fn install_binary_atomically(
-    source: &Path,
-    destination: &Path,
-    mode: u32,
-    label: &str,
-) -> Result<(), String> {
-    if !source.is_file() {
-        return Err(format!(
-            "failed to install {label}: source {} does not exist",
-            source.display()
-        ));
-    }
-    let parent = destination.parent().ok_or_else(|| {
-        format!(
-            "failed to install {label}: destination has no parent: {}",
-            destination.display()
-        )
-    })?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            format!(
-                "failed to install {label}: invalid destination file name: {}",
-                destination.display()
-            )
-        })?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let staged = parent.join(format!(
-        ".{file_name}.psht-staged-{}-{unique}",
-        std::process::id()
-    ));
-
-    let result = (|| -> Result<(), String> {
-        fs::copy(source, &staged).map_err(|e| {
-            format!(
-                "failed to stage {label} binary {} -> {}: {e}",
-                source.display(),
-                staged.display()
-            )
-        })?;
-        fs::set_permissions(&staged, fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("failed to chmod staged {}: {e}", staged.display()))?;
-        fs::rename(&staged, destination).map_err(|e| {
-            format!(
-                "failed to install {label} binary to {}: {e}",
-                destination.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&staged);
-    }
-    result
-}
-
-pub fn upgrade_server() -> Result<(), String> {
-    if run_cmd_capture("id", &["-u"])? != "0" {
-        return Err("Run this command as root: sudo psht-server upgrade".to_string());
-    }
-
-    let current_bin = current_psht_binary()?;
-    let current_version = binary_version(&current_bin).ok_or_else(|| {
-        format!(
-            "failed to detect current version from {}",
-            current_bin.display()
-        )
-    })?;
-    let latest = latest_release_version()?;
-    let target = detect_release_target()?;
-    let forge_url = configured_forge_url();
-    let install_targets = collect_server_install_targets(&current_bin);
-
-    if !version_is_newer(&latest, &current_version) {
-        let all_targets_match = install_targets
-            .iter()
-            .all(|path| binary_matches_version(path, &latest));
-        if all_targets_match {
-            println!("psht {latest} (up to date)");
-            return Ok(());
-        }
-    }
-
-    eprintln!("-----> Upgrading psht {current_version} -> {latest}");
-    let tmpdir = run_cmd_capture("mktemp", &["-d"])?;
-    let tmpdir_path = PathBuf::from(tmpdir);
-    let tmpdir_s = tmpdir_path.to_string_lossy().to_string();
-    let server_tar = tmpdir_path.join("psht-server.tar.gz");
-    let cli_tar = tmpdir_path.join("psht.tar.gz");
-    let server_tar_s = server_tar.to_string_lossy().to_string();
-    let cli_tar_s = cli_tar.to_string_lossy().to_string();
-
-    let result = (|| {
-        let server_url = server_release_url(&forge_url, &latest, target);
-        let cli_url = cli_release_url(&forge_url, &latest, target);
-
-        eprintln!("-----> Downloading release artifacts");
-        run_cmd_quiet("curl", &["-fsSL", &server_url, "-o", &server_tar_s])
-            .map_err(|e| format!("download failed: {server_url}: {e}"))?;
-        run_cmd_quiet("curl", &["-fsSL", &cli_url, "-o", &cli_tar_s])
-            .map_err(|e| format!("download failed: {cli_url}: {e}"))?;
-
-        run_cmd_quiet("tar", &["xzf", &server_tar_s, "-C", &tmpdir_s])?;
-        run_cmd_quiet("tar", &["xzf", &cli_tar_s, "-C", &tmpdir_s])?;
-
-        let server_candidate = tmpdir_path.join("psht-server");
-        let cli_candidate = tmpdir_path.join("psht");
-        if !server_candidate.is_file() {
-            return Err("release tarball missing psht-server binary".to_string());
-        }
-        if !cli_candidate.is_file() {
-            return Err("release tarball missing psht binary".to_string());
-        }
-        ensure_binary_version(&server_candidate, &latest, "downloaded psht-server")?;
-        ensure_binary_version(&cli_candidate, &latest, "downloaded psht")?;
-
-        eprintln!("-----> Installing server binary");
-        for target_path in &install_targets {
-            install_binary_atomically(&server_candidate, target_path, 0o755, "psht-server")?;
-            ensure_binary_version(target_path, &latest, "installed psht-server")?;
-        }
-
-        eprintln!("-----> Installing CLI binary");
-        let psht_cli_dst = home_dir().join("bin/psht");
-        install_binary_atomically(&cli_candidate, &psht_cli_dst, 0o755, "psht")?;
-        let _ = run_cmd("chown", &["psht:psht", &psht_cli_dst.to_string_lossy()]);
-        ensure_binary_version(&psht_cli_dst, &latest, "installed psht")?;
-
-        eprintln!("-----> Updating incus");
-        run_cmd("apt-get", &["update", "-qq"])?;
-        run_cmd("apt-get", &["install", "-y", "-qq", "incus"])?;
-
-        eprintln!("-----> Refreshing stacks");
-        init_stacks_in(&stacks_dir())?;
-        let _ = run_cmd(
-            "chown",
-            &["-R", "psht:psht", &stacks_dir().to_string_lossy()],
-        );
-        Ok(())
-    })();
-
-    let _ = fs::remove_dir_all(&tmpdir_path);
-    result?;
-    println!("=====> psht upgraded to {latest}");
-    Ok(())
-}
-
-fn doctor_check(label: &str, ok: bool, failed: &mut bool) {
-    if ok {
-        println!("  [ok] {label}");
-    } else {
-        println!("  [FAIL] {label}");
-        *failed = true;
-    }
-}
-
-pub fn doctor() -> Result<(), String> {
-    let expected_version = env!("CARGO_PKG_VERSION");
-    let mut failed = false;
-    let psht_home = psht_user_home_dir();
-
-    println!("Installation:");
-    let psht_user_shell = psht_user_shell_path();
-    doctor_check(
-        "psht user shell path exists",
-        psht_user_shell
-            .as_ref()
-            .map(|path| path.is_file())
-            .unwrap_or(false),
-        &mut failed,
-    );
-    let psht_cli_path = psht_home.join("bin/psht");
-    doctor_check(
-        "$PSHT_HOME/bin/psht executable",
-        psht_cli_path.is_file() && path_is_world_executable(&psht_cli_path).unwrap_or(false),
-        &mut failed,
-    );
-    if let Some(shell) = psht_user_shell.as_ref() {
-        doctor_check(
-            &format!("psht version {expected_version}"),
-            binary_matches_version(shell, expected_version),
-            &mut failed,
-        );
-    } else {
-        doctor_check(
-            &format!("psht version {expected_version}"),
-            false,
-            &mut failed,
-        );
-    }
-
-    println!();
-    println!("System:");
-    doctor_check(
-        "psht user exists",
-        command_succeeds("id", &["psht"]),
-        &mut failed,
-    );
-    if let Some(shell) = psht_user_shell.as_ref() {
-        let shell_s = shell.to_string_lossy().to_string();
-        let shell_ok = run_cmd_capture("getent", &["passwd", "psht"])
-            .ok()
-            .map(|line| line.trim_end().ends_with(&format!(":{shell_s}")))
-            .unwrap_or(false);
-        doctor_check(
-            &format!("psht user shell is {shell_s}"),
-            shell_ok,
-            &mut failed,
-        );
-        let in_etc_shells = fs::read_to_string("/etc/shells")
-            .ok()
-            .map(|contents| contents.lines().any(|line| line.trim() == shell_s))
-            .unwrap_or(false);
-        doctor_check(
-            &format!("{shell_s} listed in /etc/shells"),
-            in_etc_shells,
-            &mut failed,
-        );
-    } else {
-        doctor_check("psht user shell configured", false, &mut failed);
-        doctor_check("psht user shell listed in /etc/shells", false, &mut failed);
-    }
-    let in_incus_group = run_cmd_capture("id", &["-nG", "psht"])
-        .ok()
-        .map(|groups| groups.split_whitespace().any(|group| group == "incus"))
-        .unwrap_or(false);
-    doctor_check("psht user in incus group", in_incus_group, &mut failed);
-
-    println!();
-    println!("Incus:");
-    doctor_check("incus installed", command_exists("incus"), &mut failed);
-    doctor_check(
-        "incus responsive",
-        command_succeeds("incus", &["info"]),
-        &mut failed,
-    );
-
-    if env::var_os("PSHT_SKIP_TAILSCALE").is_none() {
-        println!();
-        println!("Tailscale:");
-        doctor_check(
-            "tailscale installed",
-            command_exists("tailscale"),
-            &mut failed,
-        );
-        doctor_check(
-            "tailscale connected",
-            command_succeeds("tailscale", &["status"]),
-            &mut failed,
-        );
-        doctor_check(
-            "tailscale SSH enabled",
-            tailscale_ssh_enabled().unwrap_or(false),
-            &mut failed,
-        );
-        let oauth_config = psht_home.join(".config/tailscale-oauth");
-        let oauth_exists = oauth_config.is_file();
-        doctor_check(
-            "$PSHT_HOME/.config/tailscale-oauth exists",
-            oauth_exists,
-            &mut failed,
-        );
-        if oauth_exists {
-            let oauth_check = check_tailscale_oauth_permissions(&oauth_config);
-            let token_ok = oauth_check.token_error.is_none();
-            doctor_check("tailscale OAuth token fetch", token_ok, &mut failed);
-            if let Some(err) = oauth_check.token_error.as_deref() {
-                println!("         reason: {err}");
-                println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
-            }
-
-            let read_ok = token_ok && oauth_check.devices_read_error.is_none();
-            doctor_check("tailscale device api read permission", read_ok, &mut failed);
-            if !read_ok {
-                let reason = oauth_check
-                    .devices_read_error
-                    .as_deref()
-                    .or(oauth_check.token_error.as_deref())
-                    .unwrap_or("unknown");
-                println!("         reason: {reason}");
-                println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
-            }
-
-            let write_ok = token_ok && oauth_check.devices_write_error.is_none();
-            doctor_check(
-                "tailscale device api write permission",
-                write_ok,
-                &mut failed,
-            );
-            if !write_ok {
-                let reason = oauth_check
-                    .devices_write_error
-                    .as_deref()
-                    .or(oauth_check.token_error.as_deref())
-                    .unwrap_or("unknown");
-                println!("         reason: {reason}");
-                println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
-            }
-        } else {
-            doctor_check("tailscale OAuth token fetch", false, &mut failed);
-            doctor_check("tailscale device api read permission", false, &mut failed);
-            doctor_check("tailscale device api write permission", false, &mut failed);
-            println!("         reason: tailscale OAuth config is missing");
-            println!("         fix: {TAILSCALE_OAUTH_SCOPE_HINT}");
-            println!("         configure at: {TAILSCALE_OAUTH_SETTINGS_URL}");
-        }
-    }
-
-    println!();
-    println!("Directories & stacks:");
-    let repos = psht_home.join("repos");
-    let builds = psht_home.join("builds");
-    let stacks = psht_home.join("stacks");
-    doctor_check("$PSHT_HOME/repos exists", repos.is_dir(), &mut failed);
-    doctor_check("$PSHT_HOME/builds exists", builds.is_dir(), &mut failed);
-    doctor_check("$PSHT_HOME/stacks exists", stacks.is_dir(), &mut failed);
-    let stacks_populated = stacks
-        .read_dir()
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sh"))
-        })
-        .unwrap_or(false);
-    doctor_check("stacks populated", stacks_populated, &mut failed);
-
-    println!();
-    if failed {
-        println!("Some checks failed.");
-        Err("doctor checks failed".to_string())
-    } else {
-        println!("All checks passed.");
-        Ok(())
-    }
+    admin_commands::psht_user_shell_path()
 }
 
 fn cleanup_all_owned_tailscale_devices(app: &str) -> Result<(), String> {
-    let tracked = sqlite_store::list_active_owned_tailscale_devices(app)?;
-    if tracked.is_empty() {
-        return Ok(());
-    }
-
-    let mut errors = Vec::new();
-    match tailscale::tailnet_access_token() {
-        Ok(token) => match tailscale::list_tailnet_devices(&token) {
-            Ok(devices) => {
-                let mut devices_by_id = BTreeMap::new();
-                for device in devices {
-                    devices_by_id.insert(device.id.clone(), device);
-                }
-
-                for row in &tracked {
-                    let Some(device) = devices_by_id.get(&row.device_id) else {
-                        continue;
-                    };
-                    if !device.tags.iter().any(|tag| tag == "tag:psht") {
-                        continue;
-                    }
-                    if let Err(err) = tailscale::delete_tailnet_device(&token, &row.device_id) {
-                        errors.push(format!("{}: {err}", row.device_id));
-                    }
-                }
-            }
-            Err(err) => errors.push(format!("failed to list tailnet devices: {err}")),
-        },
-        Err(err) => errors.push(format!("failed to acquire tailnet token: {err}")),
-    }
-
-    if let Err(err) = sqlite_store::retire_all_owned_tailscale_devices(app) {
-        errors.push(format!("failed to retire owned device rows: {err}"));
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join(" | "))
-    }
-}
-
-fn resolve_active_app_for_tailscale(app: &str) -> Result<String, String> {
-    resolve_existing_active_app_ref(app)
-}
-
-fn ensure_container_running_for_tailscale(app: &str) -> Result<String, String> {
-    let active_app = resolve_active_app_for_tailscale(app)?;
-    if container::is_running(&active_app)? {
-        Ok(active_app)
-    } else {
-        Err(format!("app '{app}' is not running"))
-    }
-}
-
-pub fn tailscale_status(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = ensure_container_running_for_tailscale(app)?;
-    let status = container::exec_output(&active_app, "tailscale status --json")?;
-    let summary = tailscale_self_status_summary_from_json(app, &status)?;
-    println!("{summary}");
-    Ok(())
-}
-
-fn join_tailscale_for_repair_with_fallback<FStateJoin, FAuthJoin>(
-    mut join_with_state: FStateJoin,
-    mut join_with_auth_key: FAuthJoin,
-) -> Result<(Option<String>, &'static str), String>
-where
-    FStateJoin: FnMut() -> Result<Option<String>, String>,
-    FAuthJoin: FnMut() -> Result<Option<String>, String>,
-{
-    match join_with_state() {
-        Ok(Some(name)) => Ok((Some(name), "state")),
-        Ok(None) => {
-            eprintln!(
-                "       State-based tailscale recovery produced no DNS name; falling back to auth-key tailscale join"
-            );
-            Ok((join_with_auth_key()?, "auth_key"))
-        }
-        Err(state_err) => {
-            eprintln!("       State-based tailscale join failed: {state_err}");
-            eprintln!("       Falling back to auth-key tailscale join");
-            Ok((join_with_auth_key()?, "auth_key"))
-        }
-    }
-}
-
-pub fn tailscale_up(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = resolve_active_app_for_tailscale(app)?;
-    if !container::is_running(&active_app)? {
-        eprintln!("-----> Starting container");
-        container::start(&active_app)?;
-    }
-
-    eprintln!("-----> Repairing tailscale in container");
-    let (tailscale_pool, tailscale_state_volume) = ensure_app_tailscale_volume(app)?;
-    tailscale::install_in_container(&active_app)?;
-    let _ = container::exec_cmd(&active_app, "tailscale down >/dev/null 2>&1 || true");
-    let _ = container::exec_cmd(
-        &active_app,
-        "systemctl stop tailscaled >/dev/null 2>&1 || true",
-    );
-    seed_tailscale_state_volume_from_container(
-        &active_app,
-        &tailscale_pool,
-        &tailscale_state_volume,
-    )?;
-    container::ensure_tailscale_state_mount(&active_app, &tailscale_pool, &tailscale_state_volume)?;
-    let (tailnet_hostname, created_via) = join_tailscale_for_repair_with_fallback(
-        || tailscale::join_with_state_in_container(&active_app, app),
-        || tailscale::join_with_auth_key_in_container(&active_app, app),
-    )?;
-    if let Err(track_err) = track_owned_tailscale_device(app, &active_app, created_via) {
-        eprintln!("       Warning: failed to track tailscale device ownership: {track_err}");
-    }
-    let (_, _, health) =
-        wait_for_tailscale_online(&active_app, Duration::from_secs(TAILSCALE_ONLINE_WAIT_SECS))?;
-    if !health.is_empty() {
-        eprintln!("       Warning: {}", health.join(" | "));
-    }
-    let _ = container::exec_cmd(&active_app, "tailscale serve reset >/dev/null 2>&1 || true");
-    let port = allocate_port(app);
-    if let Err(e) = tailscale::expose_http_in_container(&active_app, port) {
-        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-    }
-    if let Some(ref name) = tailnet_hostname
-        && !tailscale_hostname_is_exact(name, app)
-    {
-        eprintln!(
-            "       Warning: tailscale hostname '{name}' does not match requested app label '{app}'"
-        );
-    }
-    if let Some(name) = tailnet_hostname {
-        eprintln!("=====> Tailscale ready: http://{name} (also http://{name}:{port})");
-    } else {
-        eprintln!("=====> Tailscale repaired for {app}");
-    }
-    Ok(())
-}
-
-pub fn tailscale_down(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = ensure_container_running_for_tailscale(app)?;
-    eprintln!("-----> Bringing tailscale down in container");
-    container::exec_cmd(&active_app, "tailscale down")
-}
-
-fn enforce_supervised_app_running(app: &str, project: &str) -> Result<(), String> {
-    let active_app = resolve_existing_active_app_ref(app)?;
-    if !container::is_running(&active_app)? {
-        eprintln!("-----> Supervise: starting container for {app}");
-        container::start(&active_app)?;
-    }
-
-    if app_service_is_active(&active_app)? {
-        let mut keep = BTreeSet::new();
-        keep.insert(instance_name_from_app_ref(&active_app));
-        reconcile_family_instances_strict(app, &keep, project)?;
-        return Ok(());
-    }
-
-    eprintln!("-----> Supervise: starting app service for {app}");
-    let vars = read_env_vars(app)?;
-    let required_env = read_required_env(&active_app)?;
-    ensure_required_env_present(&required_env, &vars)?;
-    let command = read_start_command(&active_app)?;
-    let port = allocate_port(app);
-    launch_app_process(&active_app, port, &command, &vars)?;
-    if tailscale::dns_name_in_container(&active_app).is_some()
-        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
-    {
-        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-    }
-    let mut keep = BTreeSet::new();
-    keep.insert(instance_name_from_app_ref(&active_app));
-    reconcile_family_instances_strict(app, &keep, project)?;
-    eprintln!("=====> Supervise recovered {app}");
-    Ok(())
-}
-
-fn enforce_supervised_app_stopped(app: &str, project: &str) -> Result<(), String> {
-    let Some(active_app) = resolve_active_app_ref(app)? else {
-        return Ok(());
-    };
-    if !container::is_running(&active_app)? {
-        let mut keep = BTreeSet::new();
-        keep.insert(instance_name_from_app_ref(&active_app));
-        reconcile_family_instances_strict(app, &keep, project)?;
-        return Ok(());
-    }
-    eprintln!("-----> Supervise: stopping {app} (desired state is stopped)");
-    let port = allocate_port(app);
-    let _ = stop_app_process_on_port(&active_app, port);
-    container::stop(&active_app)?;
-    let mut keep = BTreeSet::new();
-    keep.insert(instance_name_from_app_ref(&active_app));
-    reconcile_family_instances_strict(app, &keep, project)
-}
-
-pub fn daemon() -> Result<(), String> {
-    let lock_path = deploy_lock_path(SUPERVISE_DAEMON_LOCK_APP);
-    let Some(_guard) = try_acquire_deploy_lock_at(&lock_path)? else {
-        return Err("psht supervision daemon is already running".to_string());
-    };
-
-    eprintln!("-----> Starting psht supervision daemon");
-    loop {
-        if let Err(err) = refresh_deploy_lock_heartbeat_at(&lock_path, std::process::id()) {
-            eprintln!("       Warning: failed to refresh daemon lock heartbeat: {err}");
-        }
-        match supervise() {
-            Ok(()) => thread::sleep(Duration::from_secs(SUPERVISE_DAEMON_INTERVAL_SECS)),
-            Err(err) => {
-                eprintln!("       Warning: supervision pass failed: {err}");
-                thread::sleep(Duration::from_secs(SUPERVISE_DAEMON_ERROR_BACKOFF_SECS));
-            }
-        }
-    }
-}
-
-pub fn supervise() -> Result<(), String> {
-    let states = read_all_app_runtime_states()?;
-    if states.is_empty() {
-        return Ok(());
-    }
-    let project = current_project_name()?;
-
-    let mut failures = Vec::new();
-    for (app, _) in states {
-        match container::has_running_operation(&app) {
-            Ok(true) => {
-                eprintln!("       Supervise: skipping {app} while container operation is active");
-                continue;
-            }
-            Ok(false) => {}
-            Err(err) => {
-                eprintln!(
-                    "       Warning: failed to inspect container operations for {app}: {err}"
-                );
-            }
-        }
-
-        let desired = app_desired_state(&app)?;
-        let result = if desired == DESIRED_STATE_STOPPED {
-            enforce_supervised_app_stopped(&app, &project)
-        } else {
-            enforce_supervised_app_running(&app, &project)
-        };
-        if let Err(err) = result {
-            eprintln!("       Warning: supervise reconciliation failed for {app}: {err}");
-            failures.push(format!("{app}: {err}"));
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("supervise failures: {}", failures.join("; ")))
-    }
+    admin_commands::cleanup_all_owned_tailscale_devices(app)
 }
 
 fn hostname() -> String {
@@ -8222,110 +4521,109 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "localhost".to_string())
 }
 
+pub fn cleanup_previous(app: &str) -> Result<(), String> {
+    deploy_commands::cleanup_previous(app)
+}
+
+pub fn deploy(
+    app: &str,
+    git_ref: Option<&str>,
+    git_sha: Option<&str>,
+    force: bool,
+) -> Result<(), String> {
+    deploy_commands::deploy(app, git_ref, git_sha, force)
+}
+
+pub fn push(app: &str, force: bool) -> Result<(), String> {
+    deploy_commands::push(app, force)
+}
+
+pub fn env_command(app: &str, assignments: &[String]) -> Result<(), String> {
+    lifecycle_commands::env_command(app, assignments)
+}
+
+pub fn env_unset(app: &str, names: &[String]) -> Result<(), String> {
+    lifecycle_commands::env_unset(app, names)
+}
+
+pub fn ps() -> Result<(), String> {
+    observability_commands::ps()
+}
+
+pub fn health() -> Result<(), String> {
+    observability_commands::health()
+}
+
+pub fn logs(app: &str, follow: bool) -> Result<(), String> {
+    observability_commands::logs(app, follow)
+}
+
+pub fn debug_resources(app: Option<&str>, candidate: Option<&str>) -> Result<(), String> {
+    observability_commands::debug_resources(app, candidate)
+}
+
+pub fn setup() -> Result<(), String> {
+    admin_commands::setup()
+}
+
+pub fn update() -> Result<(), String> {
+    admin_commands::update()
+}
+
+pub fn print_cli() -> Result<(), String> {
+    admin_commands::print_cli()
+}
+
+pub fn init_stacks() -> Result<(), String> {
+    admin_commands::init_stacks()
+}
+
+pub fn bootstrap() -> Result<(), String> {
+    admin_commands::bootstrap()
+}
+
+pub fn upgrade_server() -> Result<(), String> {
+    admin_commands::upgrade_server()
+}
+
+pub fn doctor() -> Result<(), String> {
+    observability_commands::doctor()
+}
+
+pub fn tailscale_status(app: &str) -> Result<(), String> {
+    admin_commands::tailscale_status(app)
+}
+
+pub fn tailscale_up(app: &str) -> Result<(), String> {
+    admin_commands::tailscale_up(app)
+}
+
+pub fn tailscale_down(app: &str) -> Result<(), String> {
+    admin_commands::tailscale_down(app)
+}
+
+pub fn daemon() -> Result<(), String> {
+    admin_commands::daemon()
+}
+
+pub fn supervise() -> Result<(), String> {
+    admin_commands::supervise()
+}
+
 pub fn stop(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = resolve_existing_active_app_ref(app)?;
-    set_app_desired_state(app, DESIRED_STATE_STOPPED)?;
-    eprintln!("-----> Stopping {app}");
-    let port = allocate_port(app);
-    let _ = stop_app_process_on_port(&active_app, port);
-    container::stop(&active_app)?;
-    eprintln!("=====> {app} stopped");
-    Ok(())
+    lifecycle_commands::stop(app)
 }
 
 pub fn start(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = resolve_existing_active_app_ref(app)?;
-    set_app_desired_state(app, DESIRED_STATE_RUNNING)?;
-    eprintln!("-----> Starting {app}");
-    if !container::is_running(&active_app)? {
-        container::start(&active_app)?;
-    }
-    if app_service_is_active(&active_app)? {
-        eprintln!("       {app} is already running; skipping launch");
-        eprintln!("=====> {app} started");
-        return Ok(());
-    }
-    let vars = read_env_vars(app)?;
-    let required_env = read_required_env(&active_app)?;
-    ensure_required_env_present(&required_env, &vars)?;
-    let command = read_start_command(&active_app)?;
-    let port = allocate_port(app);
-    launch_app_process(&active_app, port, &command, &vars)?;
-    if tailscale::dns_name_in_container(&active_app).is_some()
-        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
-    {
-        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-    }
-    eprintln!("=====> {app} started");
-    Ok(())
+    lifecycle_commands::start(app)
 }
 
 pub fn restart(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = resolve_existing_active_app_ref(app)?;
-    set_app_desired_state(app, DESIRED_STATE_RUNNING)?;
-    eprintln!("-----> Restarting {app}");
-    if container::is_running(&active_app)? {
-        container::stop(&active_app)?;
-    }
-    container::start(&active_app)?;
-    let vars = read_env_vars(app)?;
-    let required_env = read_required_env(&active_app)?;
-    ensure_required_env_present(&required_env, &vars)?;
-    let command = read_start_command(&active_app)?;
-    let port = allocate_port(app);
-    launch_app_process(&active_app, port, &command, &vars)?;
-    if tailscale::dns_name_in_container(&active_app).is_some()
-        && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
-    {
-        eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
-    }
-    eprintln!("=====> {app} restarted");
-    Ok(())
+    lifecycle_commands::restart(app)
 }
 
 pub fn destroy(app: &str) -> Result<(), String> {
-    app_name::validate_app_name(app)?;
-    let active_app = resolve_existing_active_app_ref(app)?;
-    let runtime_state = read_app_runtime_state(app)?;
-    eprintln!("-----> Destroying {app}");
-    caddy::remove(app)?;
-    if let Err(e) = container::remove_storage_mount(&active_app) {
-        eprintln!("       Warning: failed to remove /storage mount before destroy: {e}");
-    }
-    if let Err(e) = container::remove_tailscale_state_mount(&active_app) {
-        eprintln!("       Warning: failed to remove tailscale state mount before destroy: {e}");
-    }
-    container::stop(&active_app)?;
-    container::delete(&active_app)?;
-
-    if let Some(state) = runtime_state
-        && let Some(previous_instance) = state.previous_instance
-        && let Some(previous_app) = app_ref_from_instance_name(&previous_instance)
-        && previous_app != active_app
-        && container::exists(&previous_app)
-    {
-        let _ = container::stop(&previous_app);
-        let _ = container::delete(&previous_app);
-    }
-
-    delete_app_storage_volume(app)?;
-    if let Err(e) = delete_app_tailscale_volume(app) {
-        eprintln!("       Warning: failed to remove tailscale state volume: {e}");
-    }
-    if let Err(e) = cleanup_all_owned_tailscale_devices(app) {
-        eprintln!("       Warning: failed to clean up tracked tailscale devices: {e}");
-    }
-    if let Err(e) = remove_env_vars(app) {
-        eprintln!("       Warning: failed to remove env vars: {e}");
-    }
-    if let Err(e) = clear_app_runtime_state(app) {
-        eprintln!("       Warning: failed to clear app runtime state: {e}");
-    }
-    eprintln!("=====> {app} destroyed");
-    Ok(())
+    lifecycle_commands::destroy(app)
 }
 
 #[cfg(test)]
@@ -8572,7 +4870,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sha: "deadbeef".to_string(),
         };
-        let request = PendingGitDeployRequest::from_target(&target, false, None);
+        let request = PendingGitDeployRequest::from_target(&target, false, None, None);
         write_pending_git_request(&app, &request).unwrap();
         let loaded = read_pending_git_request(&app).unwrap().unwrap().target();
         assert_eq!(loaded, target);
@@ -10013,25 +6311,9 @@ devices:
         assert!(cmd.contains("listener process(es) on port 3430 did not exit"));
     }
 
-    #[test]
-    fn cutover_stop_tolerates_container_not_running_before_stop() {
-        assert!(should_tolerate_cutover_stop_failure(false, None));
-    }
 
-    #[test]
-    fn cutover_stop_tolerates_container_stopped_after_failed_stop_command() {
-        assert!(should_tolerate_cutover_stop_failure(true, Some(false)));
-    }
 
-    #[test]
-    fn cutover_stop_does_not_tolerate_when_container_still_running_after_failure() {
-        assert!(!should_tolerate_cutover_stop_failure(true, Some(true)));
-    }
 
-    #[test]
-    fn cutover_stop_does_not_tolerate_when_running_state_after_failure_is_unknown() {
-        assert!(!should_tolerate_cutover_stop_failure(true, None));
-    }
 
     #[test]
     fn parse_env_assignment_accepts_empty_value() {
@@ -10160,11 +6442,45 @@ devices:
         let cmd = apt_install_command(&["curl".to_string(), "libssl-dev".to_string()]).unwrap();
         assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
         assert!(cmd.contains("max_attempts="));
+        assert!(cmd.contains("status=1"));
         assert!(cmd.contains("apt-get update"));
         assert!(cmd.contains("apt-get install -y"));
         assert!(cmd.contains("'curl'"));
         assert!(cmd.contains("'libssl-dev'"));
     }
+
+    #[test]
+    fn logged_command_wrapper_preserves_explicit_exit_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("install.log");
+        let wrapped =
+            logged_command_wrapper("printf 'hello\\n'; exit 7", &log_path.to_string_lossy());
+        let status = Command::new("sh")
+            .args(["-c", &wrapped])
+            .status()
+            .expect("failed to execute wrapped shell");
+        assert_eq!(status.code(), Some(7));
+        let log = fs::read_to_string(&log_path).expect("failed to read log");
+        assert!(log.contains("hello"));
+    }
+
+    #[test]
+    fn logged_command_wrapper_preserves_successful_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("setup.log");
+        let wrapped = logged_command_wrapper("printf 'ok\\n'; exit 0", &log_path.to_string_lossy());
+        let status = Command::new("sh")
+            .args(["-c", &wrapped])
+            .status()
+            .expect("failed to execute wrapped shell");
+        assert_eq!(status.code(), Some(0));
+        let log = fs::read_to_string(&log_path).expect("failed to read log");
+        assert!(log.contains("ok"));
+    }
+
+
+
+
 
     #[test]
     fn resource_pressure_error_detection_matches_fork_failures() {

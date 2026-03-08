@@ -3,10 +3,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, Error as SqliteError, ErrorCode, OptionalExtension, params};
 
 const DB_REL_PATH: &str = ".psht/state.db";
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+const LEASE_BUSY_RETRY_ATTEMPTS: u32 = 8;
+const LEASE_BUSY_RETRY_SLEEP_MS: u64 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppSpecRow {
@@ -336,6 +338,14 @@ fn open_connection() -> Result<Connection, String> {
             })
         }
     }
+}
+
+fn sqlite_error_is_busy(err: &SqliteError) -> bool {
+    matches!(
+        err,
+        SqliteError::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 pub fn next_app_generation(app_id: &str) -> Result<i64, String> {
@@ -724,43 +734,86 @@ pub fn get_pending_git_request(app_id: &str) -> Result<Option<PendingGitRequestR
 }
 
 pub fn take_pending_git_request(app_id: &str) -> Result<Option<PendingGitRequestRow>, String> {
-    let mut conn = open_connection()?;
-    let tx = conn
-        .transaction()
-        .map_err(|e| format!("failed to begin sqlite transaction for {app_id}: {e}"))?;
+    for attempt in 0..LEASE_BUSY_RETRY_ATTEMPTS {
+        let mut conn = open_connection()?;
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => {
+                return Err(format!("failed to begin sqlite transaction for {app_id}: {err}"));
+            }
+        };
 
-    let request = tx
-        .query_row(
-            "SELECT app_id, ref_name, sha, force, request_id, interrupt_requested_at
-             FROM pending_git_requests WHERE app_id = ?1",
-            params![app_id],
-            |row| {
-                let force_raw: i64 = row.get(3)?;
-                Ok(PendingGitRequestRow {
-                    app_id: row.get(0)?,
-                    ref_name: row.get(1)?,
-                    sha: row.get(2)?,
-                    force: force_raw != 0,
-                    request_id: row.get(4)?,
-                    interrupt_requested_at: row.get(5)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|e| format!("failed to read pending git request for {app_id}: {e}"))?;
+        let request = match tx
+            .query_row(
+                "SELECT app_id, ref_name, sha, force, request_id, interrupt_requested_at
+                 FROM pending_git_requests WHERE app_id = ?1",
+                params![app_id],
+                |row| {
+                    let force_raw: i64 = row.get(3)?;
+                    Ok(PendingGitRequestRow {
+                        app_id: row.get(0)?,
+                        ref_name: row.get(1)?,
+                        sha: row.get(2)?,
+                        force: force_raw != 0,
+                        request_id: row.get(4)?,
+                        interrupt_requested_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+        {
+            Ok(request) => request,
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => {
+                return Err(format!("failed to read pending git request for {app_id}: {err}"));
+            }
+        };
 
-    if request.is_some() {
-        tx.execute(
-            "DELETE FROM pending_git_requests WHERE app_id = ?1",
-            params![app_id],
-        )
-        .map_err(|e| format!("failed to delete pending git request for {app_id}: {e}"))?;
+        if request.is_some() {
+            match tx.execute(
+                "DELETE FROM pending_git_requests WHERE app_id = ?1",
+                params![app_id],
+            ) {
+                Ok(_) => {}
+                Err(err)
+                    if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS =>
+                {
+                    std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                    continue;
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed to delete pending git request for {app_id}: {err}"
+                    ));
+                }
+            }
+        }
+
+        match tx.commit() {
+            Ok(()) => return Ok(request),
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to commit sqlite transaction for {app_id}: {err}"
+                ));
+            }
+        }
     }
 
-    tx.commit()
-        .map_err(|e| format!("failed to commit sqlite transaction for {app_id}: {e}"))?;
-
-    Ok(request)
+    Err(format!(
+        "failed to take pending git request for {app_id}: database remained busy after {} attempts",
+        LEASE_BUSY_RETRY_ATTEMPTS
+    ))
 }
 
 pub fn upsert_deploy_interrupt(row: &DeployInterruptRow) -> Result<(), String> {
@@ -1006,83 +1059,121 @@ pub fn acquire_app_lease(
     generation: i64,
     ttl_ms: i64,
 ) -> Result<AppLeaseRow, String> {
-    let mut conn = open_connection()?;
-    let tx = conn
-        .transaction()
-        .map_err(|e| format!("failed to begin sqlite transaction for lease {app_id}: {e}"))?;
+    for attempt in 0..LEASE_BUSY_RETRY_ATTEMPTS {
+        let mut conn = open_connection()?;
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to begin sqlite transaction for lease {app_id}: {err}"
+                ));
+            }
+        };
 
-    let existing = tx
-        .query_row(
-            "SELECT app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
-             FROM app_leases WHERE app_id = ?1",
-            params![app_id],
-            |row| {
-                Ok(AppLeaseRow {
-                    app_id: row.get(0)?,
-                    lease_owner: row.get(1)?,
-                    lease_epoch: row.get(2)?,
-                    heartbeat_at_ms: row.get(3)?,
-                    expires_at_ms: row.get(4)?,
-                    intent_id: row.get(5)?,
-                    generation: row.get(6)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|e| format!("failed to read existing app lease for {app_id}: {e}"))?;
+        let existing = match tx
+            .query_row(
+                "SELECT app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
+                 FROM app_leases WHERE app_id = ?1",
+                params![app_id],
+                |row| {
+                    Ok(AppLeaseRow {
+                        app_id: row.get(0)?,
+                        lease_owner: row.get(1)?,
+                        lease_epoch: row.get(2)?,
+                        heartbeat_at_ms: row.get(3)?,
+                        expires_at_ms: row.get(4)?,
+                        intent_id: row.get(5)?,
+                        generation: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+        {
+            Ok(existing) => existing,
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => {
+                return Err(format!("failed to read existing app lease for {app_id}: {err}"));
+            }
+        };
 
-    let now_ms = now_unix_ms();
-    if let Some(existing) = existing.as_ref()
-        && existing.expires_at_ms > now_ms
-        && existing.lease_owner != lease_owner
-    {
-        return Err(format!(
-            "reconcile lease for '{app_id}' is held by '{}' until {}",
-            existing.lease_owner, existing.expires_at_ms
-        ));
+        let now_ms = now_unix_ms();
+        if let Some(existing) = existing.as_ref()
+            && existing.expires_at_ms > now_ms
+            && existing.lease_owner != lease_owner
+        {
+            return Err(format!(
+                "reconcile lease for '{app_id}' is held by '{}' until {}",
+                existing.lease_owner, existing.expires_at_ms
+            ));
+        }
+
+        let lease_epoch = existing
+            .as_ref()
+            .map(|lease| lease.lease_epoch.saturating_add(1))
+            .unwrap_or(1);
+        let effective_ttl_ms = ttl_ms.max(1_000);
+        let expires_at_ms = now_ms.saturating_add(effective_ttl_ms);
+
+        match tx.execute(
+            "INSERT INTO app_leases(
+                app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(app_id) DO UPDATE SET
+                lease_owner = excluded.lease_owner,
+                lease_epoch = excluded.lease_epoch,
+                heartbeat_at_ms = excluded.heartbeat_at_ms,
+                expires_at_ms = excluded.expires_at_ms,
+                intent_id = excluded.intent_id,
+                generation = excluded.generation",
+            params![
+                app_id,
+                lease_owner,
+                lease_epoch,
+                now_ms,
+                expires_at_ms,
+                intent_id,
+                generation
+            ],
+        ) {
+            Ok(_) => {}
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => return Err(format!("failed to acquire app lease for {app_id}: {err}")),
+        }
+
+        match tx.commit() {
+            Ok(()) => {
+                return Ok(AppLeaseRow {
+                    app_id: app_id.to_string(),
+                    lease_owner: lease_owner.to_string(),
+                    lease_epoch,
+                    heartbeat_at_ms: now_ms,
+                    expires_at_ms,
+                    intent_id: intent_id.to_string(),
+                    generation,
+                });
+            }
+            Err(err) if sqlite_error_is_busy(&err) && attempt + 1 < LEASE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(LEASE_BUSY_RETRY_SLEEP_MS));
+                continue;
+            }
+            Err(err) => return Err(format!("failed to commit app lease for {app_id}: {err}")),
+        }
     }
 
-    let lease_epoch = existing
-        .as_ref()
-        .map(|lease| lease.lease_epoch.saturating_add(1))
-        .unwrap_or(1);
-    let effective_ttl_ms = ttl_ms.max(1_000);
-    let expires_at_ms = now_ms.saturating_add(effective_ttl_ms);
-    tx.execute(
-        "INSERT INTO app_leases(
-            app_id, lease_owner, lease_epoch, heartbeat_at_ms, expires_at_ms, intent_id, generation
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(app_id) DO UPDATE SET
-            lease_owner = excluded.lease_owner,
-            lease_epoch = excluded.lease_epoch,
-            heartbeat_at_ms = excluded.heartbeat_at_ms,
-            expires_at_ms = excluded.expires_at_ms,
-            intent_id = excluded.intent_id,
-            generation = excluded.generation",
-        params![
-            app_id,
-            lease_owner,
-            lease_epoch,
-            now_ms,
-            expires_at_ms,
-            intent_id,
-            generation
-        ],
-    )
-    .map_err(|e| format!("failed to acquire app lease for {app_id}: {e}"))?;
-
-    tx.commit()
-        .map_err(|e| format!("failed to commit app lease for {app_id}: {e}"))?;
-
-    Ok(AppLeaseRow {
-        app_id: app_id.to_string(),
-        lease_owner: lease_owner.to_string(),
-        lease_epoch,
-        heartbeat_at_ms: now_ms,
-        expires_at_ms,
-        intent_id: intent_id.to_string(),
-        generation,
-    })
+    Err(format!(
+        "failed to acquire app lease for {app_id}: database remained busy after {} attempts",
+        LEASE_BUSY_RETRY_ATTEMPTS
+    ))
 }
 
 pub fn heartbeat_app_lease(

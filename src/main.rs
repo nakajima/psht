@@ -1,10 +1,14 @@
 mod app_name;
-mod caddy;
+mod app_state;
 mod commands;
 mod container;
+mod control_plane;
+mod deploy_state;
 mod deploy_log;
 mod detect;
 mod git;
+mod reconcile_runtime;
+mod reconcile_command;
 mod sqlite_store;
 mod stats;
 mod tailscale;
@@ -51,7 +55,7 @@ enum Command {
     Start { app: String },
     /// Restart an app
     Restart { app: String },
-    /// Stop and remove an app (Caddy routing cleanup is experimental)
+    /// Stop and remove an app
     Destroy { app: String },
     /// Set up this server as a psht host
     Bootstrap,
