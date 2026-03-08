@@ -49,6 +49,8 @@ const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
 const APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS: u64 = 3;
 const APP_LOG_TAIL_LINES: u32 = 40;
 const INSTALL_LOG_TAIL_LINES: u32 = 80;
+const APT_INSTALL_MAX_ATTEMPTS: u32 = 3;
+const APT_INSTALL_RETRY_SLEEP_SECS: u32 = 2;
 const CONTAINER_OP_INITIAL_WAIT_CHECKS: u32 = 6;
 const CONTAINER_OP_RECHECK_WAIT_CHECKS: u32 = 6;
 const CONTAINER_OP_WAIT_SLEEP_MS: u64 = 500;
@@ -4006,7 +4008,22 @@ fn apt_install_command(packages: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        "export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y -qq {quoted}"
+        r#"export DEBIAN_FRONTEND=noninteractive
+attempt=1
+max_attempts={APT_INSTALL_MAX_ATTEMPTS}
+while [ "$attempt" -le "$max_attempts" ]; do
+  echo "apt attempt ${{attempt}}/${{max_attempts}}"
+  if apt-get update && apt-get install -y {quoted}; then
+    exit 0
+  fi
+  status="$?"
+  if [ "$attempt" -ge "$max_attempts" ]; then
+    exit "$status"
+  fi
+  sleep "$((attempt * {APT_INSTALL_RETRY_SLEEP_SECS}))"
+  attempt="$((attempt + 1))"
+done
+exit 1"#
     ))
 }
 
@@ -4015,8 +4032,7 @@ fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
         return Ok(());
     };
     eprintln!("-----> Installing apt packages");
-    container::exec_cmd_rolling(app, &command, 5)
-        .map_err(|e| format!("apt package install failed: {e}"))
+    run_install_command_with_logging(app, &command, "apt package install")
 }
 
 fn blocking_op_age_secs(seen_at: &HashMap<String, Instant>, op_id: &str) -> u64 {
@@ -5386,9 +5402,8 @@ pub fn deploy(
                 }
                 if force_fresh_setup_image && is_fresh_setup_failure(&err) {
                     eprintln!(
-                        "-----> Fresh-image candidate build/install failed; stopping retries"
+                        "-----> Fresh-image candidate build/install failed; continuing retries on fresh-image path"
                     );
-                    return Err(strip_internal_deploy_error_markers(&err).to_string());
                 }
                 print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
                 check_signal_interrupt_without_persist(app, "deploy retry backoff")?;
@@ -5756,7 +5771,9 @@ fn deploy_from_blue_green(
                     eprintln!("-----> Installing tailscale in candidate");
                     tailscale::install_in_container(&candidate_app)?;
                 }
-            } else if container::image_exists_in_project(&stack, &hash, &current_project) {
+            } else if !force_fresh_setup_image
+                && container::image_exists_in_project(&stack, &hash, &current_project)
+            {
                 eprintln!("-----> Creating candidate from cached stack image");
                 container::create_from_image_in_project(
                     &candidate_app,
@@ -5771,6 +5788,9 @@ fn deploy_from_blue_green(
                     tailscale::install_in_container(&candidate_app)?;
                 }
             } else {
+                if force_fresh_setup_image {
+                    eprintln!("-----> Fresh-image retry requested; skipping cached stack image");
+                }
                 eprintln!("-----> Creating candidate container");
                 eprintln!("       First run may take a while while Ubuntu image downloads");
                 ensure_create_prereqs(&current_project)?;
@@ -6247,7 +6267,9 @@ fn deploy_from_in_place(
                 eprintln!("-----> Installing tailscale");
                 tailscale::install_in_container(app)?;
             }
-        } else if container::image_exists_in_project(&stack, &hash, &current_project) {
+        } else if !force_fresh_setup_image
+            && container::image_exists_in_project(&stack, &hash, &current_project)
+        {
             eprintln!("-----> Creating container from cached stack image");
             container::create_from_image_in_project(app, &stack, &hash, &current_project)?;
 
@@ -6258,6 +6280,9 @@ fn deploy_from_in_place(
                 tailscale::install_in_container(app)?;
             }
         } else {
+            if force_fresh_setup_image {
+                eprintln!("-----> Fresh-image retry requested; skipping cached stack image");
+            }
             eprintln!("-----> Creating container");
             eprintln!("       First run may take a while while Ubuntu image downloads");
             ensure_create_prereqs(&current_project)?;
@@ -6494,20 +6519,32 @@ pub fn ps() -> Result<(), String> {
     println!("{:<20} {:<10}", "APP", "STATUS");
     for (app, active_app, container_status) in apps {
         let container_state = ps_container_state(&container_status);
-        let process_running = match container_state {
+        let service_ready = match container_state {
             PsContainerState::Running => match active_app.as_deref() {
                 Some(active_app) => match app_process_is_running(active_app) {
-                    Ok(running) => Some(running),
+                    Ok(false) => Some(false),
+                    Ok(true) => {
+                        let port = allocate_port(&app);
+                        match app_port_listening(active_app, port) {
+                            Ok(ready) => Some(ready),
+                            Err(err) => {
+                                eprintln!(
+                                    "       Warning: failed to check app listener for {app}: {err}"
+                                );
+                                Some(false)
+                            }
+                        }
+                    }
                     Err(err) => {
                         eprintln!("       Warning: failed to check app process for {app}: {err}");
-                        None
+                        Some(false)
                     }
                 },
                 None => None,
             },
             PsContainerState::Stopped | PsContainerState::Missing => None,
         };
-        let status = ps_status_from_parts(container_state, process_running);
+        let status = ps_status_from_parts(container_state, service_ready);
         println!("{:<20} {:<10}", app, status);
     }
     Ok(())
@@ -9986,8 +10023,9 @@ devices:
     fn apt_install_command_builds_noninteractive_install() {
         let cmd = apt_install_command(&["curl".to_string(), "libssl-dev".to_string()]).unwrap();
         assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
-        assert!(cmd.contains("apt-get update -qq"));
-        assert!(cmd.contains("apt-get install -y -qq"));
+        assert!(cmd.contains("max_attempts="));
+        assert!(cmd.contains("apt-get update"));
+        assert!(cmd.contains("apt-get install -y"));
         assert!(cmd.contains("'curl'"));
         assert!(cmd.contains("'libssl-dev'"));
     }
