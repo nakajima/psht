@@ -42,6 +42,7 @@ const APP_SERVICE_RUNNER_PATH: &str = "/usr/local/bin/psht-app-runner";
 const APP_PROCESS_PID_PATH: &str = "/var/psht/app.pid";
 const APP_PROCESS_LOG_PATH: &str = "/var/psht/app.log";
 const INSTALL_LOG_PATH: &str = "/var/psht/install.log";
+const SETUP_LOG_PATH: &str = "/var/psht/setup.log";
 const APP_PROCESS_POLL_SLEEP: &str = "0.2";
 const APP_PROCESS_STOP_TERM_CHECKS: u32 = 40;
 const APP_PROCESS_STOP_KILL_CHECKS: u32 = 10;
@@ -49,6 +50,7 @@ const APP_PROCESS_START_WAIT_CHECKS: u32 = 25;
 const APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS: u64 = 3;
 const APP_LOG_TAIL_LINES: u32 = 40;
 const INSTALL_LOG_TAIL_LINES: u32 = 80;
+const SETUP_LOG_TAIL_LINES: u32 = 120;
 const APT_INSTALL_MAX_ATTEMPTS: u32 = 3;
 const APT_INSTALL_RETRY_SLEEP_SECS: u32 = 2;
 const CONTAINER_OP_INITIAL_WAIT_CHECKS: u32 = 6;
@@ -90,6 +92,8 @@ const DEPLOY_RETRY_MAX_SLEEP_SECS: u64 = 15;
 const RESOURCE_DIAGNOSTIC_TIMEOUT_SECS: u64 = 8;
 const DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER: &str = "__psht_cached_setup_failure__:";
 const DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER: &str = "__psht_fresh_setup_failure__:";
+const DEPLOY_ERR_SETUP_TRANSIENT_MARKER: &str = "__psht_setup_transient_failure__:";
+const DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER: &str = "__psht_setup_nonretryable_failure__:";
 const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
 const SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
 const SUPERVISE_INTERVAL_SECS: u64 = 30;
@@ -3990,6 +3994,75 @@ exit "$status""#
     })
 }
 
+fn setup_log_tail(app: &str, lines: u32) -> Option<String> {
+    let output = container::exec_output(
+        app,
+        &format!(
+            "if [ -f {SETUP_LOG_PATH} ]; then tail -n {lines} {SETUP_LOG_PATH} 2>/dev/null || true; fi"
+        ),
+    )
+    .ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupFailureClass {
+    Transient,
+    NonRetryable,
+}
+
+fn classify_setup_failure(err: &str) -> SetupFailureClass {
+    let lowered = err.to_ascii_lowercase();
+    if is_resource_pressure_error(&lowered)
+        || [
+            "temporary failure resolving",
+            "failed to fetch",
+            "could not connect",
+            "connection timed out",
+            "connection reset by peer",
+            "dpkg frontend lock",
+            "could not get lock",
+            "hash sum mismatch",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+    {
+        SetupFailureClass::Transient
+    } else {
+        SetupFailureClass::NonRetryable
+    }
+}
+
+fn run_setup_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
+    let wrapped = format!(
+        r#"mkdir -p /var/psht
+status_file="$(mktemp)"
+( {command}; echo "$?" > "$status_file" ) 2>&1 | tee {SETUP_LOG_PATH}
+status="$(cat "$status_file" 2>/dev/null || echo 1)"
+rm -f "$status_file"
+exit "$status""#
+    );
+    container::exec_cmd_rolling(app, &wrapped, 5).map_err(|e| {
+        let mut message = format!("{label} failed: {e}");
+        if let Some(log_excerpt) = setup_log_tail(app, SETUP_LOG_TAIL_LINES) {
+            message.push_str("\nLast setup log lines:\n");
+            message.push_str(&log_excerpt);
+        }
+        if let Ok(project) = current_project_name() {
+            emit_resource_diagnostics(app, app, &project, label);
+        }
+        match classify_setup_failure(&message) {
+            SetupFailureClass::Transient => mark_setup_transient_failure(message),
+            SetupFailureClass::NonRetryable => mark_setup_nonretryable_failure(message),
+        }
+    })
+}
+
 fn run_hook(app: &str, phase: &str, command: Option<&str>) -> Result<(), String> {
     let Some(command) = command.and_then(app_workdir_command) else {
         return Ok(());
@@ -4189,6 +4262,14 @@ fn mark_fresh_setup_failure(err: String) -> String {
     format!("{DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER}{err}")
 }
 
+fn mark_setup_transient_failure(err: String) -> String {
+    format!("{DEPLOY_ERR_SETUP_TRANSIENT_MARKER}{err}")
+}
+
+fn mark_setup_nonretryable_failure(err: String) -> String {
+    format!("{DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER}{err}")
+}
+
 fn is_cached_setup_failure(err: &str) -> bool {
     err.starts_with(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
 }
@@ -4197,9 +4278,19 @@ fn is_fresh_setup_failure(err: &str) -> bool {
     err.starts_with(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER)
 }
 
+fn is_setup_transient_failure(err: &str) -> bool {
+    err.starts_with(DEPLOY_ERR_SETUP_TRANSIENT_MARKER)
+}
+
+fn is_setup_nonretryable_failure(err: &str) -> bool {
+    err.starts_with(DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER)
+}
+
 fn strip_internal_deploy_error_markers(err: &str) -> &str {
     err.strip_prefix(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
         .or_else(|| err.strip_prefix(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER))
+        .or_else(|| err.strip_prefix(DEPLOY_ERR_SETUP_TRANSIENT_MARKER))
+        .or_else(|| err.strip_prefix(DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER))
         .unwrap_or(err)
 }
 
@@ -5526,6 +5617,13 @@ pub fn deploy(
                     retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
                     continue;
                 }
+                if is_setup_nonretryable_failure(&err) {
+                    eprintln!("-----> Non-retryable candidate setup failure; stopping retries");
+                    return Err(strip_internal_deploy_error_markers(&err).to_string());
+                }
+                if is_setup_transient_failure(&err) {
+                    eprintln!("-----> Transient candidate setup failure; retrying");
+                }
                 if force_fresh_setup_image && is_fresh_setup_failure(&err) {
                     eprintln!(
                         "-----> Fresh-image candidate build/install failed; continuing retries on fresh-image path"
@@ -5935,22 +6033,11 @@ fn deploy_from_blue_green(
                     &script_path.to_string_lossy(),
                     "/tmp/setup.sh",
                 )?;
-                container::exec_cmd_rolling(
+                run_setup_command_with_logging(
                     &candidate_app,
                     "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-                    5,
-                )
-                .map_err(|e| {
-                    if is_resource_pressure_error(&e) {
-                        emit_resource_diagnostics(
-                            app,
-                            &candidate_app,
-                            &current_project,
-                            "candidate runtime setup",
-                        );
-                    }
-                    e
-                })?;
+                    "candidate runtime setup",
+                )?;
 
                 eprintln!("-----> Caching stack image");
                 if let Err(e) = container::publish_image_in_project(
@@ -6434,18 +6521,11 @@ fn deploy_from_in_place(
 
             eprintln!("-----> Setting up runtime");
             container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
-            container::exec_cmd_rolling(app, "chmod +x /tmp/setup.sh && /tmp/setup.sh", 5)
-                .map_err(|e| {
-                    if is_resource_pressure_error(&e) {
-                        emit_resource_diagnostics(
-                            app,
-                            app,
-                            &current_project,
-                            "in-place runtime setup",
-                        );
-                    }
-                    e
-                })?;
+            run_setup_command_with_logging(
+                app,
+                "chmod +x /tmp/setup.sh && /tmp/setup.sh",
+                "in-place runtime setup",
+            )?;
 
             eprintln!("-----> Caching stack image");
             if let Err(e) =
@@ -10248,5 +10328,38 @@ devices:
             Some("hyperlinked-build-123")
         );
         assert!(normalize_candidate_app_ref("   ").is_none());
+    }
+
+    #[test]
+    fn setup_failure_classifier_distinguishes_transient_and_nonretryable() {
+        assert_eq!(
+            classify_setup_failure("dpkg: fork failed: Resource temporarily unavailable"),
+            SetupFailureClass::Transient
+        );
+        assert_eq!(
+            classify_setup_failure("apt-get update failed to fetch index"),
+            SetupFailureClass::Transient
+        );
+        assert_eq!(
+            classify_setup_failure(
+                "setup script failed: package foo has no installation candidate"
+            ),
+            SetupFailureClass::NonRetryable
+        );
+    }
+
+    #[test]
+    fn strip_internal_deploy_error_markers_handles_setup_markers() {
+        let transient_marked = mark_setup_transient_failure("transient setup".to_string());
+        assert_eq!(
+            strip_internal_deploy_error_markers(&transient_marked),
+            "transient setup"
+        );
+
+        let nonretryable_marked = mark_setup_nonretryable_failure("nonretryable setup".to_string());
+        assert_eq!(
+            strip_internal_deploy_error_markers(&nonretryable_marked),
+            "nonretryable setup"
+        );
     }
 }
