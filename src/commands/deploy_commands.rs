@@ -806,6 +806,7 @@ fn deploy_from_in_place(
     let container_exists = container::exists(app);
     let mut remote_hash = String::new();
     if container_exists {
+        write_app_runtime_state_in_project(app, app, None, &current_project)?;
         check_deploy_interrupt(app, "in-place setup inspection")?;
         wait_for_container_operation_quiet(app, &current_project, Some(app))?;
         if !force_fresh_setup_image {
@@ -853,6 +854,7 @@ fn deploy_from_in_place(
             eprintln!("       First run may take a while while Ubuntu image downloads");
             ensure_create_prereqs(&current_project)?;
             container::create_in_project(app, &current_project)?;
+            write_app_runtime_state_in_project(app, app, None, &current_project)?;
 
             if skip_tailscale {
                 eprintln!("-----> Skipping tailscale setup");

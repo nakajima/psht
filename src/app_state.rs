@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::container;
 use crate::control_plane::{self, AppRuntimeState, DesiredState, RuntimeSnapshot};
+use crate::runtime_graph;
 
 fn now_unix_secs() -> u64 {
     SystemTime::now()
@@ -11,24 +12,11 @@ fn now_unix_secs() -> u64 {
 }
 
 pub fn app_ref_from_instance_name(instance: &str) -> Option<String> {
-    let trimmed = instance.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let app_ref = trimmed.strip_prefix("psht-").unwrap_or(trimmed).trim();
-    if app_ref.is_empty() {
-        return None;
-    }
-    Some(app_ref.to_string())
+    runtime_graph::app_ref_from_instance_name(instance)
 }
 
 pub fn instance_name_from_app_ref(app_ref: &str) -> String {
-    let app_ref = app_ref.trim();
-    if app_ref.starts_with("psht-") {
-        app_ref.to_string()
-    } else {
-        format!("psht-{app_ref}")
-    }
+    runtime_graph::instance_name_from_app_ref(app_ref)
 }
 
 pub fn read_app_runtime_state(app: &str) -> Result<Option<AppRuntimeState>, String> {
@@ -40,11 +28,22 @@ pub fn write_app_runtime_state(
     active_app_ref: &str,
     previous_app_ref: Option<&str>,
 ) -> Result<(), String> {
+    let project = runtime_graph::RuntimeProject::current()?;
+    write_app_runtime_state_in_project(app, active_app_ref, previous_app_ref, &project.name)
+}
+
+pub fn write_app_runtime_state_in_project(
+    app: &str,
+    active_app_ref: &str,
+    previous_app_ref: Option<&str>,
+    project_name: &str,
+) -> Result<(), String> {
     control_plane::write_app_runtime_state(
         app,
         &AppRuntimeState {
             active_instance: instance_name_from_app_ref(active_app_ref),
             previous_instance: previous_app_ref.map(instance_name_from_app_ref),
+            runtime_project: Some(project_name.to_string()),
             updated_at: now_unix_secs(),
         },
     )

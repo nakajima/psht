@@ -9,6 +9,7 @@ mod detect;
 mod git;
 mod reconcile_runtime;
 mod reconcile_command;
+mod runtime_graph;
 mod sqlite_store;
 mod stats;
 mod tailscale;

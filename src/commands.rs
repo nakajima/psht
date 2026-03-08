@@ -25,6 +25,7 @@ use crate::deploy_log;
 use crate::detect;
 use crate::reconcile_command::{self, ReconcileCommandRequest};
 use crate::reconcile_runtime;
+use crate::runtime_graph;
 use crate::sqlite_store;
 use crate::stats;
 use crate::tailscale;
@@ -2647,6 +2648,20 @@ fn write_app_runtime_state(
     app_state::write_app_runtime_state(app, active_app_ref, previous_app_ref)
 }
 
+fn write_app_runtime_state_in_project(
+    app: &str,
+    active_app_ref: &str,
+    previous_app_ref: Option<&str>,
+    project_name: &str,
+) -> Result<(), String> {
+    app_state::write_app_runtime_state_in_project(
+        app,
+        active_app_ref,
+        previous_app_ref,
+        project_name,
+    )
+}
+
 fn clear_app_runtime_state(app: &str) -> Result<(), String> {
     app_state::clear_app_runtime_state(app)
 }
@@ -3162,8 +3177,7 @@ fn clear_cleanup_job(app: &str) -> Result<(), String> {
 }
 
 fn current_project_name() -> Result<String, String> {
-    let uid = run_cmd_capture("id", &["-u"])?;
-    Ok(format!("user-{}", uid.trim()))
+    Ok(runtime_graph::RuntimeProject::current()?.name)
 }
 
 fn git_target_already_succeeded_with_state(
@@ -6231,6 +6245,7 @@ devices:
         let loaded = read_app_runtime_state(&app).unwrap().unwrap();
         assert_eq!(loaded.active_instance, "psht-myapp-build-123");
         assert_eq!(loaded.previous_instance.as_deref(), Some("psht-myapp"));
+        assert!(loaded.runtime_project.as_deref().is_some());
         assert!(loaded.updated_at > 0);
         clear_app_runtime_state(&app).unwrap();
     }

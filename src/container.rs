@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::deploy_log;
+use crate::runtime_graph;
 
 const CONTAINER_CREATE_TIMEOUT_SECS: u64 = 300;
 const CONTAINER_CREATE_PROGRESS_SECS: u64 = 30;
@@ -29,6 +30,23 @@ macro_rules! eprintln {
 
 fn container_name(app: &str) -> String {
     format!("psht-{app}")
+}
+
+fn resolved_target(app: &str) -> Option<runtime_graph::InstanceRef> {
+    runtime_graph::resolve_instance(app).ok()
+}
+
+fn resolved_instance_name(app: &str) -> String {
+    resolved_target(app)
+        .map(|target| target.instance_name)
+        .unwrap_or_else(|| container_name(app))
+}
+
+fn scoped_incus_for_app(app: &str) -> IncusCommand {
+    if let Some(target) = resolved_target(app) {
+        return incus().arg("--project").arg(target.project.name);
+    }
+    incus()
 }
 
 #[derive(Debug, PartialEq)]
@@ -256,8 +274,8 @@ fn is_missing_device_error(stderr: &str) -> bool {
 }
 
 fn device_value(app: &str, device: &str, key: &str) -> Result<Option<String>, String> {
-    let name = container_name(app);
-    let output = incus()
+    let name = resolved_instance_name(app);
+    let output = scoped_incus_for_app(app)
         .args(&["config", "device", "get"])
         .arg(&name)
         .arg(device)
@@ -323,7 +341,7 @@ fn ensure_disk_mount(
     }
 
     let name = container_name(app);
-    incus()
+    scoped_incus_for_app(app)
         .args(&["config", "device", "add"])
         .arg(&name)
         .arg(device_name)
@@ -344,8 +362,8 @@ fn ensure_disk_mount(
 }
 
 fn remove_disk_mount(app: &str, device_name: &str, label: &str) -> Result<(), String> {
-    let name = container_name(app);
-    let output = incus()
+    let name = resolved_instance_name(app);
+    let output = scoped_incus_for_app(app)
         .args(&["config", "device", "remove"])
         .arg(&name)
         .arg(device_name)
@@ -535,6 +553,11 @@ pub fn create_in_project(app: &str, project: &str) -> Result<(), String> {
 
 pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
     exec_cmd(app, "rm -rf /app && mkdir -p /app")?;
+    let name = resolved_instance_name(app);
+    let mut push_command = Command::new("incus");
+    if let Some(target) = resolved_target(app) {
+        push_command.arg("--project").arg(target.project.name);
+    }
     let mut tar = Command::new("tar")
         .args(["-C", source_dir, "-cf", "-", "."])
         .stdout(Stdio::piped())
@@ -544,9 +567,9 @@ pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
         .stdout
         .take()
         .ok_or_else(|| "failed to capture tar stdout".to_string())?;
-    let status = Command::new("incus")
+    let status = push_command
         .arg("exec")
-        .arg(container_name(app))
+        .arg(&name)
         .args(["--", "tar", "xf", "-", "-C", "/app"])
         .stdin(stdin)
         .status()
@@ -562,34 +585,38 @@ pub fn push_code(app: &str, source_dir: &str) -> Result<(), String> {
 }
 
 pub fn exec_cmd(app: &str, cmd: &str) -> Result<(), String> {
-    incus()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app)
         .arg("exec")
-        .arg(container_name(app))
+        .arg(&name)
         .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
         .run()
 }
 
 pub fn exec_cmd_rolling(app: &str, cmd: &str, window: usize) -> Result<(), String> {
-    incus()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app)
         .arg("exec")
-        .arg(container_name(app))
+        .arg(&name)
         .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
         .run_rolling(window)
 }
 
 pub fn exec_output(app: &str, cmd: &str) -> Result<String, String> {
-    incus()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app)
         .arg("exec")
-        .arg(container_name(app))
+        .arg(&name)
         .args(&["--force-noninteractive", "--", "sh", "-c", cmd])
         .output()
 }
 
 pub fn push_file(app: &str, local_path: &str, remote_path: &str) -> Result<(), String> {
-    incus()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app)
         .args(&["file", "push"])
         .arg(local_path)
-        .arg(format!("{}{}", container_name(app), remote_path))
+        .arg(format!("{}{}", name, remote_path))
         .run()
 }
 
@@ -712,15 +739,18 @@ pub fn rename_app(old_app: &str, new_app: &str) -> Result<(), String> {
 }
 
 pub fn stop(app: &str) -> Result<(), String> {
-    incus().arg("stop").arg(container_name(app)).run()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app).arg("stop").arg(&name).run()
 }
 
 pub fn start(app: &str) -> Result<(), String> {
-    incus().arg("start").arg(container_name(app)).run()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app).arg("start").arg(&name).run()
 }
 
 pub fn delete(app: &str) -> Result<(), String> {
-    incus().arg("delete").arg(container_name(app)).run()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app).arg("delete").arg(&name).run()
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
@@ -729,15 +759,20 @@ pub fn logs(app: &str, follow: bool) -> Result<(), String> {
     } else {
         "cat /var/psht/app.log"
     };
-    incus()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app)
         .arg("exec")
-        .arg(container_name(app))
+        .arg(&name)
         .args(&["--", "sh", "-c", cmd])
         .run()
 }
 
 pub fn list() -> Result<Vec<ContainerInfo>, String> {
-    let output = incus().args(&["list", "--format=json"]).output()?;
+    let output = runtime_graph::RuntimeProject::current()
+        .map(|project| incus().arg("--project").arg(project.name))
+        .unwrap_or_else(|_| incus())
+        .args(&["list", "--format=json"])
+        .output()?;
     let all: Vec<ContainerInfo> =
         serde_json::from_str(&output).map_err(|e| format!("failed to parse incus list: {e}"))?;
     Ok(all
@@ -801,9 +836,10 @@ pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
 
 
 pub fn exists(app: &str) -> bool {
-    incus()
+    let name = resolved_instance_name(app);
+    scoped_incus_for_app(app)
         .arg("info")
-        .arg(container_name(app))
+        .arg(&name)
         .build()
         .output()
         .map(|o| o.status.success())
@@ -997,6 +1033,11 @@ pub fn cancel_operation_in_project(project: &str, operation_id: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::{self, AppRuntimeState};
+
+    fn unique_app(prefix: &str) -> String {
+        format!("{prefix}-{}-{}", std::process::id(), crate::sqlite_store::next_app_generation(prefix).unwrap_or(1))
+    }
 
     #[test]
     fn container_name_format() {
@@ -1073,6 +1114,43 @@ mod tests {
             args,
             vec!["exec", "psht-myapp", "--", "sh", "-c", "npm install"]
         );
+    }
+
+    #[test]
+    fn scoped_instance_commands_include_runtime_project_from_model() {
+        let app = unique_app("container-runtime-project");
+        control_plane::write_app_runtime_state(
+            &app,
+            &AppRuntimeState {
+                active_instance: "psht-demo".to_string(),
+                previous_instance: None,
+                runtime_project: Some("user-4242".to_string()),
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+
+        let cmd = scoped_incus_for_app("demo")
+            .arg("exec")
+            .arg(resolved_instance_name("demo"))
+            .args(&["--", "sh", "-c", "true"])
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "--project",
+                "user-4242",
+                "exec",
+                "psht-demo",
+                "--",
+                "sh",
+                "-c",
+                "true"
+            ]
+        );
+
+        control_plane::clear_app_runtime_state(&app).unwrap();
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub struct AppRuntimeStateRow {
     pub app_id: String,
     pub active_instance: String,
     pub previous_instance: Option<String>,
+    pub runtime_project: Option<String>,
     pub updated_at: i64,
 }
 
@@ -211,6 +212,7 @@ CREATE TABLE IF NOT EXISTS app_runtime_state (
     app_id TEXT PRIMARY KEY,
     active_instance TEXT NOT NULL,
     previous_instance TEXT,
+    runtime_project TEXT,
     updated_at INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
@@ -302,6 +304,46 @@ CREATE TABLE IF NOT EXISTS reconcile_attempts (
     )
     .map_err(|e| format!("failed to record sqlite schema migration: {e}"))?;
 
+    ensure_app_runtime_state_runtime_project_column(conn)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(2, ?1)",
+        params![now_unix_ms()],
+    )
+    .map_err(|e| format!("failed to record sqlite schema migration: {e}"))?;
+
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|e| format!("failed to prepare sqlite table info query for {table}: {e}"))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("failed to query sqlite table info for {table}: {e}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("failed to read sqlite table info row for {table}: {e}"))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|e| format!("failed to read sqlite column name for {table}: {e}"))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_app_runtime_state_runtime_project_column(conn: &Connection) -> Result<(), String> {
+    if table_has_column(conn, "app_runtime_state", "runtime_project")? {
+        return Ok(());
+    }
+    conn.execute("ALTER TABLE app_runtime_state ADD COLUMN runtime_project TEXT", [])
+        .map_err(|e| {
+            format!("failed to add runtime_project column to app_runtime_state table: {e}")
+        })?;
     Ok(())
 }
 
@@ -558,17 +600,19 @@ pub fn append_deploy_history(
 pub fn upsert_app_runtime_state(row: &AppRuntimeStateRow) -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute(
-        "INSERT INTO app_runtime_state(app_id, active_instance, previous_instance, updated_at, updated_at_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO app_runtime_state(app_id, active_instance, previous_instance, runtime_project, updated_at, updated_at_ms)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(app_id) DO UPDATE SET
             active_instance = excluded.active_instance,
             previous_instance = excluded.previous_instance,
+            runtime_project = excluded.runtime_project,
             updated_at = excluded.updated_at,
             updated_at_ms = excluded.updated_at_ms",
         params![
             row.app_id,
             row.active_instance,
             row.previous_instance,
+            row.runtime_project,
             row.updated_at,
             now_unix_ms(),
         ],
@@ -580,7 +624,7 @@ pub fn upsert_app_runtime_state(row: &AppRuntimeStateRow) -> Result<(), String> 
 pub fn get_app_runtime_state(app_id: &str) -> Result<Option<AppRuntimeStateRow>, String> {
     let conn = open_connection()?;
     conn.query_row(
-        "SELECT app_id, active_instance, previous_instance, updated_at
+        "SELECT app_id, active_instance, previous_instance, runtime_project, updated_at
          FROM app_runtime_state WHERE app_id = ?1",
         params![app_id],
         |row| {
@@ -588,7 +632,8 @@ pub fn get_app_runtime_state(app_id: &str) -> Result<Option<AppRuntimeStateRow>,
                 app_id: row.get(0)?,
                 active_instance: row.get(1)?,
                 previous_instance: row.get(2)?,
-                updated_at: row.get(3)?,
+                runtime_project: row.get(3)?,
+                updated_at: row.get(4)?,
             })
         },
     )
@@ -600,7 +645,7 @@ pub fn list_app_runtime_states() -> Result<Vec<AppRuntimeStateRow>, String> {
     let conn = open_connection()?;
     let mut stmt = conn
         .prepare(
-            "SELECT app_id, active_instance, previous_instance, updated_at
+            "SELECT app_id, active_instance, previous_instance, runtime_project, updated_at
              FROM app_runtime_state
              ORDER BY app_id",
         )
@@ -612,7 +657,8 @@ pub fn list_app_runtime_states() -> Result<Vec<AppRuntimeStateRow>, String> {
                 app_id: row.get(0)?,
                 active_instance: row.get(1)?,
                 previous_instance: row.get(2)?,
-                updated_at: row.get(3)?,
+                runtime_project: row.get(3)?,
+                updated_at: row.get(4)?,
             })
         })
         .map_err(|e| format!("failed to query runtime state list: {e}"))?;
@@ -1292,6 +1338,7 @@ mod tests {
             app_id: app.clone(),
             active_instance: "psht-demo-build-1".to_string(),
             previous_instance: Some("psht-demo".to_string()),
+            runtime_project: Some("user-4242".to_string()),
             updated_at: 123,
         })
         .unwrap();
@@ -1299,6 +1346,7 @@ mod tests {
         let got = get_app_runtime_state(&app).unwrap().unwrap();
         assert_eq!(got.active_instance, "psht-demo-build-1");
         assert_eq!(got.previous_instance.as_deref(), Some("psht-demo"));
+        assert_eq!(got.runtime_project.as_deref(), Some("user-4242"));
 
         let listed = list_app_runtime_states().unwrap();
         assert!(listed.iter().any(|entry| entry.app_id == app));

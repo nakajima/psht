@@ -55,6 +55,8 @@ pub struct AppRuntimeState {
     pub active_instance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_project: Option<String>,
     pub updated_at: u64,
 }
 
@@ -178,6 +180,7 @@ fn app_runtime_state_from_row(
     Ok(AppRuntimeState {
         active_instance: row.active_instance,
         previous_instance: row.previous_instance,
+        runtime_project: row.runtime_project,
         updated_at: sqlite_i64_to_u64(row.updated_at, &row.app_id, "updated_at")?,
     })
 }
@@ -213,6 +216,7 @@ pub fn write_app_runtime_state(app: &str, state: &AppRuntimeState) -> Result<(),
         app_id: app.to_string(),
         active_instance: state.active_instance.clone(),
         previous_instance: state.previous_instance.clone(),
+        runtime_project: state.runtime_project.clone(),
         updated_at: sqlite_u64_to_i64(state.updated_at, app, "updated_at")?,
     })
 }
