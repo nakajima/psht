@@ -85,6 +85,8 @@ const BUSY_OP_POLICY_ENV: &str = "PSHT_BUSY_OP_POLICY";
 const BLOCKED_OP_BUDGET_SECS: u64 = 15;
 const DEPLOY_RETRY_INITIAL_SLEEP_SECS: u64 = 1;
 const DEPLOY_RETRY_MAX_SLEEP_SECS: u64 = 15;
+const DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER: &str = "__psht_cached_setup_failure__:";
+const DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER: &str = "__psht_fresh_setup_failure__:";
 const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
 const SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
 const SUPERVISE_INTERVAL_SECS: u64 = 30;
@@ -4149,11 +4151,34 @@ fn blocked_operation_error(
 }
 
 fn print_deploy_failure_footer(app: &str, attempt: u64, err: &str, retry_sleep_secs: u64) {
+    let err = strip_internal_deploy_error_markers(err);
     eprintln!("-----> Deploy attempt {attempt} failed for {app}");
     eprintln!("       Cause: {err}");
     eprintln!(
         "       Auto-recovery: retrying in {retry_sleep_secs}s (use `psht logs {app}` or `psht health` to inspect)"
     );
+}
+
+fn mark_cached_setup_failure(err: String) -> String {
+    format!("{DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER}{err}")
+}
+
+fn mark_fresh_setup_failure(err: String) -> String {
+    format!("{DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER}{err}")
+}
+
+fn is_cached_setup_failure(err: &str) -> bool {
+    err.starts_with(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
+}
+
+fn is_fresh_setup_failure(err: &str) -> bool {
+    err.starts_with(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER)
+}
+
+fn strip_internal_deploy_error_markers(err: &str) -> &str {
+    err.strip_prefix(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
+        .or_else(|| err.strip_prefix(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER))
+        .unwrap_or(err)
 }
 
 fn wait_for_container_operation_quiet(
@@ -4840,7 +4865,12 @@ fn pending_force_request_is_ours(
     )
 }
 
-fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Result<(), String> {
+fn deploy_once(
+    app: &str,
+    target: Option<&GitCheckoutTarget>,
+    force: bool,
+    force_fresh_setup_image: bool,
+) -> Result<(), String> {
     if let Some(target) = target {
         if !force {
             match git_target_already_succeeded(app, target) {
@@ -4867,7 +4897,7 @@ fn deploy_once(app: &str, target: Option<&GitCheckoutTarget>, force: bool) -> Re
     let result = (|| {
         let build_dir = checkout_code(app, target)?;
         check_deploy_interrupt(app, "after checkout")?;
-        deploy_from(app, &build_dir)
+        deploy_from(app, &build_dir, force_fresh_setup_image)
     })();
 
     match result {
@@ -5206,7 +5236,7 @@ fn wait_for_forced_pending_deploy_completion(
             };
             eprintln!("-----> Starting forced deploy takeover");
             let _ = take_pending_git_request(app)?;
-            let result = deploy_once(app, Some(target), true);
+            let result = deploy_once(app, Some(target), true, false);
             let _ = clear_deploy_interrupt(app);
             return result;
         }
@@ -5221,7 +5251,7 @@ fn wait_for_forced_pending_deploy_completion(
             if pending_is_ours {
                 let _ = take_pending_git_request(app)?;
             }
-            let result = deploy_once(app, Some(target), true);
+            let result = deploy_once(app, Some(target), true, false);
             let _ = clear_deploy_interrupt(app);
             return result;
         }
@@ -5300,6 +5330,7 @@ pub fn deploy(
     .to_string();
     let mut attempt: u64 = 0;
     let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
+    let mut force_fresh_setup_image = false;
     loop {
         check_signal_interrupt_without_persist(app, "deploy retry scheduling")?;
         attempt = attempt.saturating_add(1);
@@ -5319,7 +5350,7 @@ pub fn deploy(
             }
         };
         reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
-        let result = deploy_impl(app, git_ref, git_sha, force, &ctx);
+        let result = deploy_impl(app, git_ref, git_sha, force, force_fresh_setup_image, &ctx);
         let revision = parse_git_checkout_target(git_ref, git_sha)
             .ok()
             .and_then(|target| target.map(|target| target.sha))
@@ -5343,7 +5374,21 @@ pub fn deploy(
             Ok(()) => return Ok(()),
             Err(err) => {
                 if is_deploy_interrupted_error(&err) {
-                    return Err(err);
+                    return Err(strip_internal_deploy_error_markers(&err).to_string());
+                }
+                if is_cached_setup_failure(&err) && !force_fresh_setup_image {
+                    eprintln!(
+                        "-----> Cached setup image failed during candidate build/install; retrying with fresh image path"
+                    );
+                    force_fresh_setup_image = true;
+                    retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
+                    continue;
+                }
+                if force_fresh_setup_image && is_fresh_setup_failure(&err) {
+                    eprintln!(
+                        "-----> Fresh-image candidate build/install failed; stopping retries"
+                    );
+                    return Err(strip_internal_deploy_error_markers(&err).to_string());
                 }
                 print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
                 check_signal_interrupt_without_persist(app, "deploy retry backoff")?;
@@ -5360,6 +5405,7 @@ fn deploy_impl(
     git_ref: Option<&str>,
     git_sha: Option<&str>,
     force: bool,
+    force_fresh_setup_image: bool,
     ctx: &ReconcileIntentContext,
 ) -> Result<(), String> {
     app_name::validate_app_name(app)?;
@@ -5404,7 +5450,7 @@ fn deploy_impl(
 
     let mut active_force = force;
     loop {
-        let result = deploy_once(app, target.as_ref(), active_force);
+        let result = deploy_once(app, target.as_ref(), active_force, force_fresh_setup_image);
         let pending_request = take_pending_git_request(app)?;
         let interrupted = deploy_result_was_interrupted(&result);
         let Some(pending_request) = pending_request else {
@@ -5541,22 +5587,26 @@ fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(),
         }
     }
 
-    deploy_from(app, &code_dir)?;
+    deploy_from(app, &code_dir, false)?;
     if let Err(err) = clear_git_deploy_state(app) {
         eprintln!("       Warning: failed to clear git deploy state: {err}");
     }
     Ok(())
 }
 
-fn deploy_from(app: &str, code_dir: &Path) -> Result<(), String> {
+fn deploy_from(app: &str, code_dir: &Path, force_fresh_setup_image: bool) -> Result<(), String> {
     if resolve_active_app_ref(app)?.is_some() {
-        deploy_from_blue_green(app, code_dir)
+        deploy_from_blue_green(app, code_dir, force_fresh_setup_image)
     } else {
-        deploy_from_in_place(app, code_dir)
+        deploy_from_in_place(app, code_dir, force_fresh_setup_image)
     }
 }
 
-fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
+fn deploy_from_blue_green(
+    app: &str,
+    code_dir: &Path,
+    force_fresh_setup_image: bool,
+) -> Result<(), String> {
     let deploy_started = Instant::now();
     let current_uid = run_cmd_capture("id", &["-u"])?;
     let current_project = format!("user-{}", current_uid.trim());
@@ -5610,6 +5660,8 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
 
     if pending_cleanup_exists {
         eprintln!("       Pending cleanup detected; using fresh candidate container");
+    } else if force_fresh_setup_image {
+        eprintln!("       Fresh-image retry requested; skipping inactive container reuse");
     } else if let Some(previous_app) = old_previous_app.as_ref() {
         eprintln!("-----> Evaluating reusable inactive container");
         eprintln!("       Inactive: {previous_app}");
@@ -5629,7 +5681,9 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     }
 
     if !reused_inactive_candidate && container::exists(&candidate_app) {
-        let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+        cleanup_container_for_rebuild(&candidate_app, &current_project).map_err(|e| {
+            format!("failed to reset existing candidate '{candidate_app}' before rebuild: {e}")
+        })?;
     }
 
     eprintln!("-----> Preparing candidate container");
@@ -5647,6 +5701,8 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     }
     check_deploy_interrupt(app, "candidate preparation")?;
 
+    let mut build_phase_started = false;
+    let mut build_used_cached_setup_image = false;
     let build_candidate_result = (|| -> Result<(), String> {
         check_deploy_interrupt(app, "candidate build setup")?;
         let setup_image_cached = if reused_inactive_candidate {
@@ -5673,13 +5729,19 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             }
             true
         } else {
-            let setup_image_cached = container::setup_image_exists_in_project(
-                &stack,
-                &hash,
-                apt_fingerprint.as_deref(),
-                &current_project,
-            );
+            let setup_image_cached = if force_fresh_setup_image {
+                eprintln!("-----> Fresh-image retry requested; skipping cached setup image");
+                false
+            } else {
+                container::setup_image_exists_in_project(
+                    &stack,
+                    &hash,
+                    apt_fingerprint.as_deref(),
+                    &current_project,
+                )
+            };
             if setup_image_cached {
+                build_used_cached_setup_image = true;
                 eprintln!("-----> Creating candidate from cached setup image");
                 container::create_from_setup_image_in_project(
                     &candidate_app,
@@ -5751,6 +5813,7 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
             setup_image_cached
         };
 
+        build_phase_started = true;
         eprintln!("-----> Building candidate");
         check_deploy_interrupt(app, "candidate build")?;
         container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
@@ -5794,10 +5857,23 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     })();
 
     if let Err(err) = build_candidate_result {
+        let mut build_err = err;
         if !reused_inactive_candidate {
-            let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+            if let Err(cleanup_err) =
+                cleanup_container_for_rebuild(&candidate_app, &current_project)
+            {
+                build_err = format!("{build_err}; candidate cleanup failed: {cleanup_err}");
+            }
         }
-        return Err(err);
+        if build_phase_started {
+            if force_fresh_setup_image {
+                return Err(mark_fresh_setup_failure(build_err));
+            }
+            if build_used_cached_setup_image {
+                return Err(mark_cached_setup_failure(build_err));
+            }
+        }
+        return Err(build_err);
     }
 
     let mut pre_cutover_keep = BTreeSet::new();
@@ -6010,8 +6086,13 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
                 }
             }
             let _ = caddy::add(app, port);
-            if !reused_inactive_candidate {
-                let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+            if !reused_inactive_candidate
+                && let Err(cleanup_err) =
+                    cleanup_container_for_rebuild(&candidate_app, &current_project)
+            {
+                rollback_issues.push(format!(
+                    "failed to clean failed candidate '{candidate_app}': {cleanup_err}"
+                ));
             }
 
             if !rollback_issues.is_empty() {
@@ -6063,7 +6144,11 @@ fn deploy_from_blue_green(app: &str, code_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
+fn deploy_from_in_place(
+    app: &str,
+    code_dir: &Path,
+    force_fresh_setup_image: bool,
+) -> Result<(), String> {
     let current_uid = run_cmd_capture("id", &["-u"])?;
     let current_project = format!("user-{}", current_uid.trim());
     if command_succeeds("incus", &["project", "show", &current_project]) {
@@ -6113,7 +6198,11 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if remote_hash == setup_hash {
+        if force_fresh_setup_image {
+            eprintln!("-----> Fresh-image retry requested; rebuilding container");
+            cleanup_container_for_rebuild(app, &current_project)?;
+            true
+        } else if remote_hash == setup_hash {
             eprintln!("-----> Reusing container");
             stop_app_process_on_port(app, port)?;
             false
@@ -6131,12 +6220,17 @@ fn deploy_from_in_place(app: &str, code_dir: &Path) -> Result<(), String> {
         check_deploy_interrupt(app, "in-place setup start")?;
         wait_for_container_operation_quiet(app, &current_project, Some(app))?;
 
-        let setup_image_cached = container::setup_image_exists_in_project(
-            &stack,
-            &hash,
-            apt_fingerprint.as_deref(),
-            &current_project,
-        );
+        let setup_image_cached = if force_fresh_setup_image {
+            eprintln!("-----> Fresh-image retry requested; skipping cached setup image");
+            false
+        } else {
+            container::setup_image_exists_in_project(
+                &stack,
+                &hash,
+                apt_fingerprint.as_deref(),
+                &current_project,
+            )
+        };
         if setup_image_cached {
             eprintln!("-----> Creating container from cached setup image");
             container::create_from_setup_image_in_project(
