@@ -95,8 +95,10 @@ const DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER: &str = "__psht_fresh_setup_failure_
 const DEPLOY_ERR_SETUP_TRANSIENT_MARKER: &str = "__psht_setup_transient_failure__:";
 const DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER: &str = "__psht_setup_nonretryable_failure__:";
 const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
-const SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
-const SUPERVISE_INTERVAL_SECS: u64 = 30;
+const LEGACY_SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
+const SUPERVISE_DAEMON_LOCK_APP: &str = "__supervise-daemon__";
+const SUPERVISE_DAEMON_INTERVAL_SECS: u64 = 30;
+const SUPERVISE_DAEMON_ERROR_BACKOFF_SECS: u64 = 5;
 const DESIRED_STATE_RUNNING: &str = "running";
 const DESIRED_STATE_STOPPED: &str = "stopped";
 
@@ -5561,82 +5563,39 @@ pub fn deploy(
         "force": force,
     })
     .to_string();
-    let mut attempt: u64 = 0;
-    let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
-    let mut force_fresh_setup_image = false;
-    loop {
-        check_signal_interrupt_without_persist(app, "deploy retry scheduling")?;
-        attempt = attempt.saturating_add(1);
-        let attempt_started = Instant::now();
-        if attempt > 1 {
-            eprintln!("-----> Retrying deploy attempt {attempt}");
-        }
-        let ctx = match begin_reconcile_intent(app, "deploy", "git", &source_payload) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
-                check_signal_interrupt_without_persist(app, "deploy retry backoff")?;
-                thread::sleep(Duration::from_secs(retry_sleep_secs));
-                retry_sleep_secs =
-                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
-                continue;
-            }
-        };
-        reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
-        let result = deploy_impl(app, git_ref, git_sha, force, force_fresh_setup_image, &ctx);
-        let revision = parse_git_checkout_target(git_ref, git_sha)
-            .ok()
-            .and_then(|target| target.map(|target| target.sha))
-            .or_else(|| {
-                read_git_deploy_state(app).ok().flatten().and_then(|state| {
-                    (state.status == GitDeployStatus::Success).then_some(state.sha)
-                })
-            });
-        stats::report_deploy_attempt(stats::DeployAttempt {
-            app,
-            kind: "deploy",
-            generation: ctx.generation,
-            attempt,
-            force,
-            success: result.is_ok(),
-            duration: attempt_started.elapsed(),
-            error: result.as_ref().err().map(|err| err.as_str()),
+    check_signal_interrupt_without_persist(app, "deploy scheduling")?;
+    let attempt_started = Instant::now();
+    let ctx = begin_reconcile_intent(app, "deploy", "git", &source_payload)?;
+    reconcile_checkpoint(app, &ctx, 1, "deploy-start", Some("{\"ok\":true}"));
+    let result = deploy_impl(app, git_ref, git_sha, force, false, &ctx);
+    let revision = parse_git_checkout_target(git_ref, git_sha)
+        .ok()
+        .and_then(|target| target.map(|target| target.sha))
+        .or_else(|| {
+            read_git_deploy_state(app)
+                .ok()
+                .flatten()
+                .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha))
         });
-        complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
-        match result {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if is_deploy_interrupted_error(&err) {
-                    return Err(strip_internal_deploy_error_markers(&err).to_string());
-                }
-                if is_cached_setup_failure(&err) && !force_fresh_setup_image {
-                    eprintln!(
-                        "-----> Cached setup image failed during candidate build/install; retrying with fresh image path"
-                    );
-                    force_fresh_setup_image = true;
-                    retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
-                    continue;
-                }
-                if is_setup_nonretryable_failure(&err) {
-                    eprintln!("-----> Non-retryable candidate setup failure; stopping retries");
-                    return Err(strip_internal_deploy_error_markers(&err).to_string());
-                }
-                if is_setup_transient_failure(&err) {
-                    eprintln!("-----> Transient candidate setup failure; retrying");
-                }
-                if force_fresh_setup_image && is_fresh_setup_failure(&err) {
-                    eprintln!(
-                        "-----> Fresh-image candidate build/install failed; continuing retries on fresh-image path"
-                    );
-                }
-                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
-                check_signal_interrupt_without_persist(app, "deploy retry backoff")?;
-                thread::sleep(Duration::from_secs(retry_sleep_secs));
-                retry_sleep_secs =
-                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
-            }
+    stats::report_deploy_attempt(stats::DeployAttempt {
+        app,
+        kind: "deploy",
+        generation: ctx.generation,
+        attempt: 1,
+        force,
+        success: result.is_ok(),
+        duration: attempt_started.elapsed(),
+        error: result.as_ref().err().map(|err| err.as_str()),
+    });
+    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
+
+    result.map_err(|err| {
+        if is_deploy_interrupted_error(&err) {
+            strip_internal_deploy_error_markers(&err).to_string()
+        } else {
+            err
         }
-    }
+    })
 }
 
 fn deploy_impl(
@@ -5730,57 +5689,27 @@ pub fn push(app: &str, force: bool) -> Result<(), String> {
         "force": force,
     })
     .to_string();
-    let mut attempt: u64 = 0;
-    let mut retry_sleep_secs = DEPLOY_RETRY_INITIAL_SLEEP_SECS;
-    loop {
-        check_signal_interrupt_without_persist(app, "push retry scheduling")?;
-        attempt = attempt.saturating_add(1);
-        let attempt_started = Instant::now();
-        if attempt > 1 {
-            eprintln!("-----> Retrying deploy attempt {attempt}");
-        }
-        let ctx = match begin_reconcile_intent(app, "push", "tar-stdin", &source_payload) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
-                check_signal_interrupt_without_persist(app, "push retry backoff")?;
-                thread::sleep(Duration::from_secs(retry_sleep_secs));
-                retry_sleep_secs =
-                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
-                continue;
-            }
-        };
-        reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
-        let result = push_impl(app, force, &ctx);
-        let revision = read_git_deploy_state(app)
-            .ok()
-            .flatten()
-            .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
-        stats::report_deploy_attempt(stats::DeployAttempt {
-            app,
-            kind: "push",
-            generation: ctx.generation,
-            attempt,
-            force,
-            success: result.is_ok(),
-            duration: attempt_started.elapsed(),
-            error: result.as_ref().err().map(|err| err.as_str()),
-        });
-        complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
-        match result {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if is_deploy_interrupted_error(&err) {
-                    return Err(err);
-                }
-                print_deploy_failure_footer(app, attempt, &err, retry_sleep_secs);
-                check_signal_interrupt_without_persist(app, "push retry backoff")?;
-                thread::sleep(Duration::from_secs(retry_sleep_secs));
-                retry_sleep_secs =
-                    (retry_sleep_secs.saturating_mul(2)).min(DEPLOY_RETRY_MAX_SLEEP_SECS);
-            }
-        }
-    }
+    check_signal_interrupt_without_persist(app, "push scheduling")?;
+    let attempt_started = Instant::now();
+    let ctx = begin_reconcile_intent(app, "push", "tar-stdin", &source_payload)?;
+    reconcile_checkpoint(app, &ctx, 1, "push-start", Some("{\"ok\":true}"));
+    let result = push_impl(app, force, &ctx);
+    let revision = read_git_deploy_state(app)
+        .ok()
+        .flatten()
+        .and_then(|state| (state.status == GitDeployStatus::Success).then_some(state.sha));
+    stats::report_deploy_attempt(stats::DeployAttempt {
+        app,
+        kind: "push",
+        generation: ctx.generation,
+        attempt: 1,
+        force,
+        success: result.is_ok(),
+        duration: attempt_started.elapsed(),
+        error: result.as_ref().err().map(|err| err.as_str()),
+    });
+    complete_reconcile_intent(app, &ctx, &result, revision.as_deref());
+    result
 }
 
 fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(), String> {
@@ -5834,11 +5763,7 @@ fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(),
 }
 
 fn deploy_from(app: &str, code_dir: &Path, force_fresh_setup_image: bool) -> Result<(), String> {
-    if resolve_active_app_ref(app)?.is_some() {
-        deploy_from_blue_green(app, code_dir, force_fresh_setup_image)
-    } else {
-        deploy_from_in_place(app, code_dir, force_fresh_setup_image)
-    }
+    deploy_from_in_place(app, code_dir, force_fresh_setup_image)
 }
 
 fn deploy_from_blue_green(
@@ -6417,7 +6342,7 @@ fn deploy_from_in_place(
         eprintln!("       Using custom stack");
     }
 
-    let (stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
+    let (_stack, script_path) = resolve_stack(app, code_dir, config.stack())?;
     let hash = stack_hash(&script_path)?;
     let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
     let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
@@ -6463,94 +6388,28 @@ fn deploy_from_in_place(
     if needs_setup {
         check_deploy_interrupt(app, "in-place setup start")?;
         wait_for_container_operation_quiet(app, &current_project, Some(app))?;
+        eprintln!("-----> Creating container");
+        eprintln!("       First run may take a while while Ubuntu image downloads");
+        ensure_create_prereqs(&current_project)?;
+        container::create_in_project(app, &current_project)?;
 
-        let setup_image_cached = if force_fresh_setup_image {
-            eprintln!("-----> Fresh-image retry requested; skipping cached setup image");
-            false
+        if skip_tailscale {
+            eprintln!("-----> Skipping tailscale setup");
         } else {
-            container::setup_image_exists_in_project(
-                &stack,
-                &hash,
-                apt_fingerprint.as_deref(),
-                &current_project,
-            )
-        };
-        if setup_image_cached {
-            eprintln!("-----> Creating container from cached setup image");
-            container::create_from_setup_image_in_project(
-                app,
-                &stack,
-                &hash,
-                apt_fingerprint.as_deref(),
-                &current_project,
-            )?;
-
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup");
-            } else {
-                eprintln!("-----> Installing tailscale");
-                tailscale::install_in_container(app)?;
-            }
-        } else if !force_fresh_setup_image
-            && container::image_exists_in_project(&stack, &hash, &current_project)
-        {
-            eprintln!("-----> Creating container from cached stack image");
-            container::create_from_image_in_project(app, &stack, &hash, &current_project)?;
-
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup");
-            } else {
-                eprintln!("-----> Installing tailscale");
-                tailscale::install_in_container(app)?;
-            }
-        } else {
-            if force_fresh_setup_image {
-                eprintln!("-----> Fresh-image retry requested; skipping cached stack image");
-            }
-            eprintln!("-----> Creating container");
-            eprintln!("       First run may take a while while Ubuntu image downloads");
-            ensure_create_prereqs(&current_project)?;
-            container::create_in_project(app, &current_project)?;
-
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup");
-            } else {
-                eprintln!("-----> Installing tailscale");
-                tailscale::install_in_container(app)?;
-            }
-
-            eprintln!("-----> Setting up runtime");
-            container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
-            run_setup_command_with_logging(
-                app,
-                "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-                "in-place runtime setup",
-            )?;
-
-            eprintln!("-----> Caching stack image");
-            if let Err(e) =
-                container::publish_image_in_project(app, &stack, &hash, &current_project)
-            {
-                eprintln!("       Warning: failed to cache stack image: {e}");
-            }
+            eprintln!("-----> Installing tailscale");
+            tailscale::install_in_container(app)?;
         }
 
-        if !setup_image_cached {
-            check_deploy_interrupt(app, "in-place package setup")?;
-            install_apt_packages(app, &config.apt_packages)?;
-            if apt_fingerprint.is_some() {
-                eprintln!("-----> Caching setup image");
-                if let Err(e) = container::publish_setup_image_in_project(
-                    app,
-                    &stack,
-                    &hash,
-                    apt_fingerprint.as_deref(),
-                    &current_project,
-                ) {
-                    eprintln!("       Warning: failed to cache setup image: {e}");
-                }
-            }
-        }
+        eprintln!("-----> Setting up runtime");
+        container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
+        run_setup_command_with_logging(
+            app,
+            "chmod +x /tmp/setup.sh && /tmp/setup.sh",
+            "in-place runtime setup",
+        )?;
+
+        check_deploy_interrupt(app, "in-place package setup")?;
+        install_apt_packages(app, &config.apt_packages)?;
 
         container::exec_cmd(
             app,
@@ -7412,13 +7271,7 @@ fn write_oauth_config(path: &Path, client_id: &str, client_secret: &str) -> Resu
 fn supervise_service_unit_content(psht_bin: &str, psht_home: &Path) -> String {
     let home = psht_home.to_string_lossy();
     format!(
-        "[Unit]\nDescription=psht desired-state supervision\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=psht\nGroup=psht\nWorkingDirectory={home}\nEnvironment=HOME={home}\nExecStart={psht_bin} supervise\n"
-    )
-}
-
-fn supervise_timer_unit_content(interval_secs: u64) -> String {
-    format!(
-        "[Unit]\nDescription=Run psht supervision every {interval_secs}s\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec={interval_secs}s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+        "[Unit]\nDescription=psht supervision daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=psht\nGroup=psht\nWorkingDirectory={home}\nEnvironment=HOME={home}\nExecStart={psht_bin} daemon\nRestart=always\nRestartSec=2\nKillMode=process\n\n[Install]\nWantedBy=multi-user.target\n"
     )
 }
 
@@ -7426,16 +7279,11 @@ fn install_supervision_units(psht_bin: &str, psht_home: &Path) -> Result<(), Str
     let service = supervise_service_unit_content(psht_bin, psht_home);
     fs::write(SUPERVISE_SERVICE_PATH, service)
         .map_err(|e| format!("failed to write {SUPERVISE_SERVICE_PATH}: {e}"))?;
-    let timer = supervise_timer_unit_content(SUPERVISE_INTERVAL_SECS);
-    fs::write(SUPERVISE_TIMER_PATH, timer)
-        .map_err(|e| format!("failed to write {SUPERVISE_TIMER_PATH}: {e}"))?;
-    run_cmd(
-        "chmod",
-        &["644", SUPERVISE_SERVICE_PATH, SUPERVISE_TIMER_PATH],
-    )?;
+    run_cmd("chmod", &["644", SUPERVISE_SERVICE_PATH])?;
+    let _ = fs::remove_file(LEGACY_SUPERVISE_TIMER_PATH);
     run_cmd("systemctl", &["daemon-reload"])?;
-    run_cmd("systemctl", &["enable", "--now", "psht-supervise.timer"])?;
-    run_cmd("systemctl", &["start", "psht-supervise.service"])?;
+    let _ = run_cmd("systemctl", &["disable", "--now", "psht-supervise.timer"]);
+    run_cmd("systemctl", &["enable", "--now", "psht-supervise.service"])?;
     Ok(())
 }
 
@@ -7674,7 +7522,7 @@ pub fn bootstrap() -> Result<(), String> {
     init_stacks_in(&stacks)?;
     run_cmd("chown", &["-R", &owner, &repos_s, &builds_s, &stacks_s])?;
 
-    eprintln!("-----> Installing host supervision timer");
+    eprintln!("-----> Installing host supervision daemon");
     install_supervision_units(&psht_bin_str, &psht_home)?;
 
     let ts_hostname = if skip_tailscale {
@@ -8304,6 +8152,27 @@ fn enforce_supervised_app_stopped(app: &str, project: &str) -> Result<(), String
     let mut keep = BTreeSet::new();
     keep.insert(instance_name_from_app_ref(&active_app));
     reconcile_family_instances_strict(app, &keep, project)
+}
+
+pub fn daemon() -> Result<(), String> {
+    let lock_path = deploy_lock_path(SUPERVISE_DAEMON_LOCK_APP);
+    let Some(_guard) = try_acquire_deploy_lock_at(&lock_path)? else {
+        return Err("psht supervision daemon is already running".to_string());
+    };
+
+    eprintln!("-----> Starting psht supervision daemon");
+    loop {
+        if let Err(err) = refresh_deploy_lock_heartbeat_at(&lock_path, std::process::id()) {
+            eprintln!("       Warning: failed to refresh daemon lock heartbeat: {err}");
+        }
+        match supervise() {
+            Ok(()) => thread::sleep(Duration::from_secs(SUPERVISE_DAEMON_INTERVAL_SECS)),
+            Err(err) => {
+                eprintln!("       Warning: supervision pass failed: {err}");
+                thread::sleep(Duration::from_secs(SUPERVISE_DAEMON_ERROR_BACKOFF_SECS));
+            }
+        }
+    }
 }
 
 pub fn supervise() -> Result<(), String> {
@@ -10257,17 +10126,10 @@ devices:
     fn supervise_service_unit_sets_execstart_and_home() {
         let unit =
             supervise_service_unit_content("/opt/psht/bin/psht-server", Path::new("/home/psht"));
-        assert!(unit.contains("ExecStart=/opt/psht/bin/psht-server supervise"));
+        assert!(unit.contains("ExecStart=/opt/psht/bin/psht-server daemon"));
         assert!(unit.contains("Environment=HOME=/home/psht"));
         assert!(unit.contains("User=psht"));
-    }
-
-    #[test]
-    fn supervise_timer_unit_uses_expected_interval() {
-        let unit = supervise_timer_unit_content(30);
-        assert!(unit.contains("OnBootSec=30s"));
-        assert!(unit.contains("OnUnitActiveSec=30s"));
-        assert!(unit.contains("Persistent=true"));
+        assert!(unit.contains("Restart=always"));
     }
 
     #[test]

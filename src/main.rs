@@ -62,6 +62,8 @@ enum Command {
     /// Check deployed app health
     Health,
     #[command(hide = true)]
+    Daemon,
+    #[command(hide = true)]
     Supervise,
     /// Manage host tailscale
     Tailscale {
@@ -228,6 +230,7 @@ fn run() -> Result<(), String> {
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
         Command::Health => commands::health(),
+        Command::Daemon => commands::daemon(),
         Command::DebugResources { app, candidate } => {
             if let Some(app) = app.as_deref() {
                 app_name::validate_app_name(app)?;
@@ -587,6 +590,12 @@ mod tests {
     fn parse_health() {
         let cli = parse_cli(&["psht-server", "health"]).unwrap();
         assert_eq!(cli.command, Command::Health);
+    }
+
+    #[test]
+    fn parse_daemon() {
+        let cli = parse_cli(&["psht-server", "daemon"]).unwrap();
+        assert_eq!(cli.command, Command::Daemon);
     }
 
     #[test]
