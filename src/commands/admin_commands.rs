@@ -100,7 +100,10 @@ fi
     ))
 }
 
-pub(super) fn update_script(hostname: &str, manifest: &CliUpdateManifest) -> Result<String, String> {
+pub(super) fn update_script(
+    hostname: &str,
+    manifest: &CliUpdateManifest,
+) -> Result<String, String> {
     let manifest_json = cli_update_manifest_json(manifest)?;
     Ok(format!(
         r#"#!/bin/sh

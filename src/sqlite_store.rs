@@ -340,10 +340,11 @@ fn ensure_app_runtime_state_runtime_project_column(conn: &Connection) -> Result<
     if table_has_column(conn, "app_runtime_state", "runtime_project")? {
         return Ok(());
     }
-    conn.execute("ALTER TABLE app_runtime_state ADD COLUMN runtime_project TEXT", [])
-        .map_err(|e| {
-            format!("failed to add runtime_project column to app_runtime_state table: {e}")
-        })?;
+    conn.execute(
+        "ALTER TABLE app_runtime_state ADD COLUMN runtime_project TEXT",
+        [],
+    )
+    .map_err(|e| format!("failed to add runtime_project column to app_runtime_state table: {e}"))?;
     Ok(())
 }
 
@@ -789,7 +790,9 @@ pub fn take_pending_git_request(app_id: &str) -> Result<Option<PendingGitRequest
                 continue;
             }
             Err(err) => {
-                return Err(format!("failed to begin sqlite transaction for {app_id}: {err}"));
+                return Err(format!(
+                    "failed to begin sqlite transaction for {app_id}: {err}"
+                ));
             }
         };
 
@@ -818,7 +821,9 @@ pub fn take_pending_git_request(app_id: &str) -> Result<Option<PendingGitRequest
                 continue;
             }
             Err(err) => {
-                return Err(format!("failed to read pending git request for {app_id}: {err}"));
+                return Err(format!(
+                    "failed to read pending git request for {app_id}: {err}"
+                ));
             }
         };
 

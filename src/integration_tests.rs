@@ -883,9 +883,6 @@ fn integration_rust() {
     assert!(resp.contains("ok"), "expected 'ok' in response: {resp}");
 }
 
-
-
-
 // RAII guard: launches an Incus VM; force-stops + deletes on drop.
 struct VmGuard {
     name: String,

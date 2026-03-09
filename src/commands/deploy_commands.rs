@@ -547,12 +547,9 @@ pub fn deploy(
                 .ok()
                 .and_then(|target| target.map(|target| target.sha))
                 .or_else(|| {
-                    read_git_deploy_state(app)
-                        .ok()
-                        .flatten()
-                        .and_then(|state| {
-                            (state.status == GitDeployStatus::Success).then_some(state.sha)
-                        })
+                    read_git_deploy_state(app).ok().flatten().and_then(|state| {
+                        (state.status == GitDeployStatus::Success).then_some(state.sha)
+                    })
                 })
         },
     );

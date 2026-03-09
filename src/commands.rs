@@ -6,8 +6,8 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,13 +16,16 @@ use serde::{Deserialize, Serialize};
 use crate::app_name;
 use crate::app_state;
 use crate::container;
-use crate::control_plane::{AppPhase, AppRuntimeState, DesiredState, ReconcileIntentContext, RuntimeSnapshot};
+use crate::control_plane::{
+    AppPhase, AppRuntimeState, DesiredState, ReconcileIntentContext, RuntimeSnapshot,
+};
+use crate::deploy_log;
 use crate::deploy_state::{
     CleanupJobState, DeployInterruptState, DeployLockMetadata, GitCheckoutTarget, GitDeployState,
     GitDeployStatus, PendingGitDeployRequest,
 };
-use crate::deploy_log;
 use crate::detect;
+use crate::git::GIT_LOCAL_ENV_VARS;
 use crate::reconcile_command::{self, ReconcileCommandRequest};
 use crate::reconcile_runtime;
 use crate::runtime_graph;
@@ -619,20 +622,32 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_cmd_in(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
-    let status = Command::new(program)
+fn scrub_git_local_env(cmd: &mut Command) {
+    for name in GIT_LOCAL_ENV_VARS {
+        cmd.env_remove(name);
+    }
+}
+
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    scrub_git_local_env(&mut cmd);
+    cmd
+}
+
+fn run_git_in(args: &[&str], cwd: &Path) -> Result<(), String> {
+    let status = git_command()
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
-        .map_err(|e| format!("failed to run {program}: {e}"))?;
+        .map_err(|e| format!("failed to run git: {e}"))?;
     if !status.success() {
         let pretty = if args.is_empty() {
-            program.to_string()
+            "git".to_string()
         } else {
-            format!("{program} {}", args.join(" "))
+            format!("git {}", args.join(" "))
         };
         return Err(format!("command failed: {pretty}"));
     }
@@ -659,18 +674,18 @@ fn run_cmd_capture(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_cmd_capture_in(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
-    let output = Command::new(program)
+fn run_git_capture_in(args: &[&str], cwd: &Path) -> Result<String, String> {
+    let output = git_command()
         .args(args)
         .current_dir(cwd)
         .output()
-        .map_err(|e| format!("failed to run {program}: {e}"))?;
+        .map_err(|e| format!("failed to run git: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let pretty = if args.is_empty() {
-            program.to_string()
+            "git".to_string()
         } else {
-            format!("{program} {}", args.join(" "))
+            format!("git {}", args.join(" "))
         };
         if stderr.is_empty() {
             return Err(format!("command failed: {pretty}"));
@@ -2780,12 +2795,7 @@ fn update_reconcile_phase_from_lease(app: &str, phase: &str, last_error: Option<
     } else {
         AppPhase::Reconciling
     };
-    reconcile_runtime::update_phase(
-        app,
-        phase,
-        control_plane_snapshot(app),
-        last_error,
-    );
+    reconcile_runtime::update_phase(app, phase, control_plane_snapshot(app), last_error);
 }
 
 fn refresh_active_reconcile_lease(app: &str) -> Result<(), String> {
@@ -3245,7 +3255,7 @@ fn checkout_code_in(
 
     match target {
         None => {
-            let status = Command::new("git")
+            let status = git_command()
                 .args(["clone", "--depth", "1"])
                 .arg(repo_dir)
                 .arg(build_dir)
@@ -3256,7 +3266,7 @@ fn checkout_code_in(
             }
         }
         Some(target) => {
-            let status = Command::new("git")
+            let status = git_command()
                 .args(["clone", "--no-checkout"])
                 .arg(repo_dir)
                 .arg(build_dir)
@@ -3267,18 +3277,13 @@ fn checkout_code_in(
             }
 
             let checkout_target = checkout_ref_target(&target.ref_name);
-            run_cmd_in(
-                "git",
-                &["checkout", "--detach", &checkout_target],
-                build_dir,
-            )
-            .map_err(|e| format!("failed to checkout {}: {e}", target.ref_name))?;
+            run_git_in(&["checkout", "--detach", &checkout_target], build_dir)
+                .map_err(|e| format!("failed to checkout {}: {e}", target.ref_name))?;
 
-            let object_type =
-                run_cmd_capture_in("git", &["cat-file", "-t", &target.sha], build_dir)
-                    .map_err(|e| format!("failed to resolve pushed object {}: {e}", target.sha))?;
+            let object_type = run_git_capture_in(&["cat-file", "-t", &target.sha], build_dir)
+                .map_err(|e| format!("failed to resolve pushed object {}: {e}", target.sha))?;
             if object_type == "commit" {
-                let head = run_cmd_capture_in("git", &["rev-parse", "HEAD"], build_dir)?;
+                let head = run_git_capture_in(&["rev-parse", "HEAD"], build_dir)?;
                 if head != target.sha {
                     return Err(format!(
                         "checked out commit {head} does not match pushed commit {}",
@@ -3286,9 +3291,8 @@ fn checkout_code_in(
                     ));
                 }
             } else if object_type == "tag" {
-                let resolved =
-                    run_cmd_capture_in("git", &["rev-parse", &target.ref_name], build_dir)
-                        .map_err(|e| format!("failed to resolve {}: {e}", target.ref_name))?;
+                let resolved = run_git_capture_in(&["rev-parse", &target.ref_name], build_dir)
+                    .map_err(|e| format!("failed to resolve {}: {e}", target.ref_name))?;
                 if resolved != target.sha {
                     return Err(format!(
                         "checked out ref {} resolved to {resolved}, expected {}",
@@ -4503,7 +4507,6 @@ fn reconcile_family_instances_strict(
         ))
     }
 }
-
 
 fn cleanup_pending_detail(app: &str) -> Option<String> {
     deploy_commands::cleanup_pending_detail(app)
@@ -6131,6 +6134,23 @@ devices:
     }
 
     #[test]
+    fn scrub_git_local_env_removes_repo_local_git_vars() {
+        let output = {
+            let mut cmd = Command::new("env");
+            cmd.env("HOME", "/tmp/psht-home");
+            cmd.env("GIT_DIR", ".");
+            cmd.env("GIT_WORK_TREE", "/tmp/worktree");
+            scrub_git_local_env(&mut cmd);
+            cmd.output().unwrap()
+        };
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("HOME=/tmp/psht-home"));
+        assert!(!stdout.contains("GIT_DIR=."));
+        assert!(!stdout.contains("GIT_WORK_TREE=/tmp/worktree"));
+    }
+
+    #[test]
     fn command_entrypoints_reject_invalid_app_name() {
         for result in [
             deploy("bad/name", None, None, false),
@@ -6326,10 +6346,6 @@ devices:
         assert!(cmd.contains("listener process(es) on port 3430 did not exit"));
     }
 
-
-
-
-
     #[test]
     fn parse_env_assignment_accepts_empty_value() {
         let (name, value) = parse_env_assignment("A=").unwrap();
@@ -6492,10 +6508,6 @@ devices:
         let log = fs::read_to_string(&log_path).expect("failed to read log");
         assert!(log.contains("ok"));
     }
-
-
-
-
 
     #[test]
     fn resource_pressure_error_detection_matches_fork_failures() {

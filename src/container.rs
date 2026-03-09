@@ -638,7 +638,6 @@ pub fn add_proxy_in_project(
         .run()
 }
 
-
 pub fn remove_proxy_in_project(instance_name: &str, project: &str) -> Result<(), String> {
     let output = incus()
         .arg("--project")
@@ -795,7 +794,6 @@ fn stack_image_alias(stack: &str, hash: &str) -> String {
     format!("psht-stack-{stack}-{hash}")
 }
 
-
 #[allow(dead_code)]
 pub fn image_exists(stack: &str, hash: &str) -> bool {
     let alias = stack_image_alias(stack, hash);
@@ -808,16 +806,12 @@ pub fn image_exists(stack: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
-
-
 #[allow(dead_code)]
 pub fn create_from_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
     let alias = stack_image_alias(stack, hash);
     let name = container_name(app);
     launch_with_project(&name, &alias, None)
 }
-
-
 
 #[allow(dead_code)]
 pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
@@ -832,8 +826,6 @@ pub fn publish_image(app: &str, stack: &str, hash: &str) -> Result<(), String> {
         .run()?;
     incus().arg("start").arg(&name).run()
 }
-
-
 
 pub fn exists(app: &str) -> bool {
     let name = resolved_instance_name(app);
@@ -1036,7 +1028,11 @@ mod tests {
     use crate::control_plane::{self, AppRuntimeState};
 
     fn unique_app(prefix: &str) -> String {
-        format!("{prefix}-{}-{}", std::process::id(), crate::sqlite_store::next_app_generation(prefix).unwrap_or(1))
+        format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            crate::sqlite_store::next_app_generation(prefix).unwrap_or(1)
+        )
     }
 
     #[test]
@@ -1456,7 +1452,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn image_exists_command_builds_correctly() {
         let alias = stack_image_alias("node", "abc123");
@@ -1473,7 +1468,6 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec!["launch", "psht-stack-node-abc123", "psht-myapp"]);
     }
-
 
     #[test]
     fn publish_image_stop_command_builds_correctly() {

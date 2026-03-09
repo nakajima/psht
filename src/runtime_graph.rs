@@ -211,7 +211,10 @@ mod tests {
 
     #[test]
     fn app_ref_from_instance_name_handles_prefixed_and_unprefixed_values() {
-        assert_eq!(app_ref_from_instance_name("psht-hyperlinked").as_deref(), Some("hyperlinked"));
+        assert_eq!(
+            app_ref_from_instance_name("psht-hyperlinked").as_deref(),
+            Some("hyperlinked")
+        );
         assert_eq!(
             app_ref_from_instance_name("hyperlinked-build-123").as_deref(),
             Some("hyperlinked-build-123")

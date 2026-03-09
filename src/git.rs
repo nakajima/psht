@@ -6,6 +6,20 @@ use std::process;
 
 use crate::app_name;
 
+pub(crate) const GIT_LOCAL_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_NAMESPACE",
+    "GIT_SUPER_PREFIX",
+    "GIT_QUARANTINE_PATH",
+];
+
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
@@ -47,6 +61,7 @@ fn install_hook_at(app: &str, repo: &PathBuf) -> Result<(), String> {
     let current_exe = env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "psht".to_string());
+    let unset_git_env = format!("unset {}\n", GIT_LOCAL_ENV_VARS.join(" "));
     let hook_content = format!(
         "#!/bin/sh
 set -eu
@@ -66,8 +81,10 @@ done
 if [ \"$line_count\" -eq 0 ]; then
   exit 0
 fi
+{}
 exec {} deploy {} --ref \"$deploy_ref\" --sha \"$deploy_sha\"
 ",
+        unset_git_env,
         shell_quote(&current_exe),
         shell_quote(app)
     );
@@ -140,6 +157,8 @@ mod tests {
         assert!(content.contains("deploy 'hooktest' --ref \"$deploy_ref\" --sha \"$deploy_sha\""));
         assert!(content.contains("while IFS=' ' read -r old new ref; do"));
         assert!(content.contains("push updates multiple refs"));
+        assert!(content.contains("unset GIT_DIR GIT_WORK_TREE"));
+        assert!(content.find("unset ").unwrap() < content.find("exec ").unwrap());
         assert!(content.starts_with("#!/bin/sh"));
         let perms = fs::metadata(&hook_path).unwrap().permissions();
         assert_ne!(perms.mode() & 0o111, 0, "hook should be executable");

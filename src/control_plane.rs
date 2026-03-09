@@ -297,8 +297,8 @@ pub fn begin_reconcile_intent(
     )?;
 
     if snapshot.candidate_instance.is_none() {
-        snapshot.candidate_instance = sqlite_store::get_app_status(app)?
-            .and_then(|status| status.candidate_instance);
+        snapshot.candidate_instance =
+            sqlite_store::get_app_status(app)?.and_then(|status| status.candidate_instance);
     }
 
     upsert_status(&AppStatus {
@@ -404,7 +404,9 @@ pub fn complete_reconcile_intent(
         active_instance: snapshot.active_instance,
         candidate_instance: snapshot.candidate_instance,
         previous_instance: snapshot.previous_instance,
-        active_revision: revision.map(|value| value.to_string()).or(snapshot.active_revision),
+        active_revision: revision
+            .map(|value| value.to_string())
+            .or(snapshot.active_revision),
         candidate_revision: snapshot.candidate_revision,
         health,
         last_error,
@@ -440,8 +442,14 @@ mod tests {
 
     #[test]
     fn desired_state_normalizes_unknown_values_to_running() {
-        assert_eq!(DesiredState::from_persisted("stopped"), DesiredState::Stopped);
-        assert_eq!(DesiredState::from_persisted("running"), DesiredState::Running);
+        assert_eq!(
+            DesiredState::from_persisted("stopped"),
+            DesiredState::Stopped
+        );
+        assert_eq!(
+            DesiredState::from_persisted("running"),
+            DesiredState::Running
+        );
         assert_eq!(DesiredState::from_persisted("weird"), DesiredState::Running);
     }
 
@@ -456,7 +464,10 @@ mod tests {
     #[test]
     fn health_states_encode_expected_reason() {
         assert_eq!(HealthState::healthy().reason, None);
-        assert_eq!(HealthState::reconciling().reason.as_deref(), Some("reconciling"));
+        assert_eq!(
+            HealthState::reconciling().reason.as_deref(),
+            Some("reconciling")
+        );
         assert_eq!(HealthState::blocked().reason.as_deref(), Some("blocked"));
     }
 }
