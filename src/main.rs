@@ -22,8 +22,16 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
-const WEB_DEFAULT_BIND: &str = "127.0.0.1";
+const WEB_DEFAULT_BIND_LOCAL: &str = "127.0.0.1";
+const WEB_DEFAULT_BIND_SERVICE: &str = "0.0.0.0";
 const WEB_DEFAULT_PORT: u16 = 8787;
+
+#[derive(Debug, PartialEq, Eq)]
+enum WebInvocation {
+    Serve { bind: String, port: u16 },
+    Start { bind: String, port: u16 },
+    Stop,
+}
 
 #[derive(Parser)]
 #[command(
@@ -255,29 +263,13 @@ fn run() -> Result<(), String> {
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
         Command::Health => commands::health(),
-        Command::Web { action, bind, port } => match action.as_deref() {
-            None | Some("serve") => {
-                let bind = bind.as_deref().unwrap_or(WEB_DEFAULT_BIND);
-                let port = port.unwrap_or(WEB_DEFAULT_PORT);
-                commands::web(bind, port)
+        Command::Web { action, bind, port } => {
+            match resolve_web_invocation(action.as_deref(), bind.as_deref(), port)? {
+                WebInvocation::Serve { bind, port } => commands::web(&bind, port),
+                WebInvocation::Start { bind, port } => commands::web_start(&bind, port),
+                WebInvocation::Stop => commands::web_stop(),
             }
-            Some("start") => {
-                let bind = bind.as_deref().unwrap_or(WEB_DEFAULT_BIND);
-                let port = port.unwrap_or(WEB_DEFAULT_PORT);
-                commands::web_start(bind, port)
-            }
-            Some("stop") => {
-                if bind.is_some() || port.is_some() {
-                    return Err(
-                        "`psht-server web stop` does not accept `--bind` or `--port`".to_string(),
-                    );
-                }
-                commands::web_stop()
-            }
-            Some(other) => Err(format!(
-                "unknown web action '{other}'; expected one of: serve, start, stop"
-            )),
-        },
+        }
         Command::Daemon => commands::daemon(),
         Command::DebugResources { app, candidate } => {
             if let Some(app) = app.as_deref() {
@@ -309,6 +301,34 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
         process::exit(1);
+    }
+}
+
+fn resolve_web_invocation(
+    action: Option<&str>,
+    bind: Option<&str>,
+    port: Option<u16>,
+) -> Result<WebInvocation, String> {
+    match action {
+        None | Some("serve") => Ok(WebInvocation::Serve {
+            bind: bind.unwrap_or(WEB_DEFAULT_BIND_LOCAL).to_string(),
+            port: port.unwrap_or(WEB_DEFAULT_PORT),
+        }),
+        Some("start") => Ok(WebInvocation::Start {
+            bind: bind.unwrap_or(WEB_DEFAULT_BIND_SERVICE).to_string(),
+            port: port.unwrap_or(WEB_DEFAULT_PORT),
+        }),
+        Some("stop") => {
+            if bind.is_some() || port.is_some() {
+                return Err(
+                    "`psht-server web stop` does not accept `--bind` or `--port`".to_string(),
+                );
+            }
+            Ok(WebInvocation::Stop)
+        }
+        Some(other) => Err(format!(
+            "unknown web action '{other}'; expected one of: serve, start, stop"
+        )),
     }
 }
 
@@ -721,6 +741,34 @@ mod tests {
                 port: None,
             }
         );
+    }
+
+    #[test]
+    fn resolve_web_invocation_defaults_local_for_serve() {
+        assert_eq!(
+            resolve_web_invocation(None, None, None).unwrap(),
+            WebInvocation::Serve {
+                bind: WEB_DEFAULT_BIND_LOCAL.to_string(),
+                port: WEB_DEFAULT_PORT,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_web_invocation_defaults_remote_for_start() {
+        assert_eq!(
+            resolve_web_invocation(Some("start"), None, None).unwrap(),
+            WebInvocation::Start {
+                bind: WEB_DEFAULT_BIND_SERVICE.to_string(),
+                port: WEB_DEFAULT_PORT,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_web_invocation_rejects_stop_flags() {
+        let err = resolve_web_invocation(Some("stop"), Some("0.0.0.0"), None).unwrap_err();
+        assert!(err.contains("does not accept"));
     }
 
     #[test]

@@ -54,7 +54,7 @@ Serve a plain built-in web UI for app status and host admin actions.
 
 The default bind is `127.0.0.1`. For private Tailscale/LAN access, pass a different bind address explicitly.
 
-#### `sudo psht-server web start [--bind 127.0.0.1] [--port 8787]`
+#### `sudo psht-server web start [--bind 0.0.0.0] [--port 8787]`
 
 Install or update a `psht-web.service` systemd unit, enable it, and start the web UI in the background.
 
