@@ -22,6 +22,9 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
+const WEB_DEFAULT_BIND: &str = "127.0.0.1";
+const WEB_DEFAULT_PORT: u16 = 8787;
+
 #[derive(Parser)]
 #[command(
     name = "psht-server",
@@ -71,14 +74,17 @@ enum Command {
     Doctor,
     /// Check deployed app health
     Health,
-    /// Serve a basic web UI
+    /// Manage the web UI
     Web {
-        /// Bind address for the web UI
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// Listen port for the web UI
-        #[arg(long, default_value_t = 8787)]
-        port: u16,
+        /// Optional action: serve, start, or stop
+        #[arg(value_name = "ACTION", value_parser = ["serve", "start", "stop"])]
+        action: Option<String>,
+        /// Bind address for the web UI serve/start commands
+        #[arg(long)]
+        bind: Option<String>,
+        /// Listen port for the web UI serve/start commands
+        #[arg(long)]
+        port: Option<u16>,
     },
     #[command(hide = true)]
     Daemon,
@@ -249,7 +255,29 @@ fn run() -> Result<(), String> {
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
         Command::Health => commands::health(),
-        Command::Web { bind, port } => commands::web(&bind, port),
+        Command::Web { action, bind, port } => match action.as_deref() {
+            None | Some("serve") => {
+                let bind = bind.as_deref().unwrap_or(WEB_DEFAULT_BIND);
+                let port = port.unwrap_or(WEB_DEFAULT_PORT);
+                commands::web(bind, port)
+            }
+            Some("start") => {
+                let bind = bind.as_deref().unwrap_or(WEB_DEFAULT_BIND);
+                let port = port.unwrap_or(WEB_DEFAULT_PORT);
+                commands::web_start(bind, port)
+            }
+            Some("stop") => {
+                if bind.is_some() || port.is_some() {
+                    return Err(
+                        "`psht-server web stop` does not accept `--bind` or `--port`".to_string(),
+                    );
+                }
+                commands::web_stop()
+            }
+            Some(other) => Err(format!(
+                "unknown web action '{other}'; expected one of: serve, start, stop"
+            )),
+        },
         Command::Daemon => commands::daemon(),
         Command::DebugResources { app, candidate } => {
             if let Some(app) = app.as_deref() {
@@ -631,8 +659,66 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Web {
-                bind: "127.0.0.1".to_string(),
-                port: 8787,
+                action: None,
+                bind: None,
+                port: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_web_serve_with_flags() {
+        let cli = parse_cli(&[
+            "psht-server",
+            "web",
+            "serve",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            "9999",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Web {
+                action: Some("serve".to_string()),
+                bind: Some("0.0.0.0".to_string()),
+                port: Some(9999),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_web_start_with_flags() {
+        let cli = parse_cli(&[
+            "psht-server",
+            "web",
+            "start",
+            "--bind",
+            "100.64.0.1",
+            "--port",
+            "8788",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Web {
+                action: Some("start".to_string()),
+                bind: Some("100.64.0.1".to_string()),
+                port: Some(8788),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_web_stop() {
+        let cli = parse_cli(&["psht-server", "web", "stop"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Web {
+                action: Some("stop".to_string()),
+                bind: None,
+                port: None,
             }
         );
     }

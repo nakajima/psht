@@ -102,6 +102,8 @@ const DEPLOY_ERR_SETUP_TRANSIENT_MARKER: &str = "__psht_setup_transient_failure_
 const DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER: &str = "__psht_setup_nonretryable_failure__:";
 const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
 const LEGACY_SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
+const WEB_SERVICE_NAME: &str = "psht-web.service";
+const WEB_SERVICE_PATH: &str = "/etc/systemd/system/psht-web.service";
 const SUPERVISE_DAEMON_LOCK_APP: &str = "__supervise-daemon__";
 const SUPERVISE_DAEMON_INTERVAL_SECS: u64 = 30;
 const SUPERVISE_DAEMON_ERROR_BACKOFF_SECS: u64 = 5;
@@ -133,7 +135,7 @@ use self::deploy_commands::{
 use self::admin_commands::{
     cli_update_manifest, cli_update_manifest_json, install_binary_atomically,
     join_tailscale_for_repair_with_fallback, setup_script, supervise_service_unit_content,
-    update_script, write_oauth_config,
+    update_script, web_service_unit_content, write_oauth_config,
 };
 #[cfg(test)]
 use self::deploy_commands::{
@@ -4617,6 +4619,14 @@ pub fn web(bind: &str, port: u16) -> Result<(), String> {
     web_ui::serve(bind, port)
 }
 
+pub fn web_start(bind: &str, port: u16) -> Result<(), String> {
+    admin_commands::web_start(bind, port)
+}
+
+pub fn web_stop() -> Result<(), String> {
+    admin_commands::web_stop()
+}
+
 pub fn daemon() -> Result<(), String> {
     admin_commands::daemon()
 }
@@ -6447,6 +6457,22 @@ devices:
         let unit =
             supervise_service_unit_content("/opt/psht/bin/psht-server", Path::new("/home/psht"));
         assert!(unit.contains("ExecStart=/opt/psht/bin/psht-server daemon"));
+        assert!(unit.contains("Environment=HOME=/home/psht"));
+        assert!(unit.contains("User=psht"));
+        assert!(unit.contains("Restart=always"));
+    }
+
+    #[test]
+    fn web_service_unit_sets_execstart_bind_and_port() {
+        let unit = web_service_unit_content(
+            "/opt/psht/bin/psht-server",
+            Path::new("/home/psht"),
+            "100.64.0.1",
+            8788,
+        );
+        assert!(unit.contains(
+            "ExecStart=/opt/psht/bin/psht-server web serve --bind 100.64.0.1 --port 8788"
+        ));
         assert!(unit.contains("Environment=HOME=/home/psht"));
         assert!(unit.contains("User=psht"));
         assert!(unit.contains("Restart=always"));

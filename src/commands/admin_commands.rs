@@ -255,6 +255,61 @@ fn install_supervision_units(psht_bin: &str, psht_home: &Path) -> Result<(), Str
     Ok(())
 }
 
+pub(super) fn web_service_unit_content(
+    psht_bin: &str,
+    psht_home: &Path,
+    bind: &str,
+    port: u16,
+) -> String {
+    let home = psht_home.to_string_lossy();
+    format!(
+        "[Unit]\nDescription=psht web UI\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=psht\nGroup=psht\nWorkingDirectory={home}\nEnvironment=HOME={home}\nExecStart={psht_bin} web serve --bind {bind} --port {port}\nRestart=always\nRestartSec=2\nKillMode=process\n\n[Install]\nWantedBy=multi-user.target\n"
+    )
+}
+
+fn install_web_unit(psht_bin: &str, psht_home: &Path, bind: &str, port: u16) -> Result<(), String> {
+    let service = web_service_unit_content(psht_bin, psht_home, bind, port);
+    fs::write(WEB_SERVICE_PATH, service)
+        .map_err(|e| format!("failed to write {WEB_SERVICE_PATH}: {e}"))?;
+    run_cmd("chmod", &["644", WEB_SERVICE_PATH])?;
+    run_cmd("systemctl", &["daemon-reload"])?;
+    run_cmd("systemctl", &["enable", WEB_SERVICE_NAME])?;
+    run_cmd("systemctl", &["restart", WEB_SERVICE_NAME])?;
+    Ok(())
+}
+
+pub fn web_start(bind: &str, port: u16) -> Result<(), String> {
+    if run_cmd_capture("id", &["-u"])? != "0" {
+        return Err("Run this command as root: sudo psht-server web start".to_string());
+    }
+    if !command_succeeds("id", &["psht"]) {
+        return Err("psht user is missing. Run: sudo psht-server bootstrap".to_string());
+    }
+
+    let current_bin = current_psht_binary()?;
+    let psht_bin = prepare_server_binary(&current_bin)?;
+    let psht_bin_str = psht_bin.to_string_lossy().to_string();
+    let psht_home = psht_user_home_dir();
+
+    install_web_unit(&psht_bin_str, &psht_home, bind, port)?;
+    println!("=====> psht web UI running via systemd on http://{bind}:{port}");
+    Ok(())
+}
+
+pub fn web_stop() -> Result<(), String> {
+    if run_cmd_capture("id", &["-u"])? != "0" {
+        return Err("Run this command as root: sudo psht-server web stop".to_string());
+    }
+    if !Path::new(WEB_SERVICE_PATH).exists() {
+        println!("psht web UI service is not installed.");
+        return Ok(());
+    }
+
+    run_cmd("systemctl", &["disable", "--now", WEB_SERVICE_NAME])?;
+    println!("=====> psht web UI stopped");
+    Ok(())
+}
+
 pub fn bootstrap() -> Result<(), String> {
     if run_cmd_capture("id", &["-u"])? != "0" {
         return Err("Run this command as root: sudo psht-server bootstrap".to_string());

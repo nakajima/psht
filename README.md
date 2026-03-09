@@ -44,7 +44,7 @@ Check to see how the server installation is doing.
 
 Check to see how apps are doing.
 
-#### `sudo psht-server web [--bind 127.0.0.1] [--port 8787]`
+#### `psht-server web [serve] [--bind 127.0.0.1] [--port 8787]`
 
 Serve a plain built-in web UI for app status and host admin actions.
 
@@ -53,6 +53,14 @@ Serve a plain built-in web UI for app status and host admin actions.
 - Host page shows doctor/health output and can trigger `upgrade`.
 
 The default bind is `127.0.0.1`. For private Tailscale/LAN access, pass a different bind address explicitly.
+
+#### `sudo psht-server web start [--bind 127.0.0.1] [--port 8787]`
+
+Install or update a `psht-web.service` systemd unit, enable it, and start the web UI in the background.
+
+#### `sudo psht-server web stop`
+
+Stop and disable the `psht-web.service` unit.
 
 ## on ur local computer, after u set up the server
 
