@@ -57,7 +57,12 @@ enum Command {
     /// Restart an app
     Restart { app: String },
     /// Stop and remove an app
-    Destroy { app: String },
+    Destroy {
+        /// Preserve the app's /storage volume
+        #[arg(long)]
+        keep_storage: bool,
+        app: String,
+    },
     /// Set up this server as a psht host
     Bootstrap,
     /// Upgrade psht server, incus, and stacks
@@ -66,6 +71,15 @@ enum Command {
     Doctor,
     /// Check deployed app health
     Health,
+    /// Serve a basic web UI
+    Web {
+        /// Bind address for the web UI
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Listen port for the web UI
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
     #[command(hide = true)]
     Daemon,
     #[command(hide = true)]
@@ -225,9 +239,9 @@ fn run() -> Result<(), String> {
             app_name::validate_app_name(&app)?;
             commands::restart(&app)
         }
-        Command::Destroy { app } => {
+        Command::Destroy { app, keep_storage } => {
             app_name::validate_app_name(&app)?;
-            commands::destroy(&app)
+            commands::destroy_with_options(&app, commands::DestroyOptions { keep_storage })
         }
         Command::Setup => commands::setup(),
         Command::UpdateCli => commands::update(),
@@ -235,6 +249,7 @@ fn run() -> Result<(), String> {
         Command::Upgrade => commands::upgrade_server(),
         Command::Doctor => commands::doctor(),
         Command::Health => commands::health(),
+        Command::Web { bind, port } => commands::web(&bind, port),
         Command::Daemon => commands::daemon(),
         Command::DebugResources { app, candidate } => {
             if let Some(app) = app.as_deref() {
@@ -471,7 +486,20 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Destroy {
-                app: "myapp".to_string()
+                app: "myapp".to_string(),
+                keep_storage: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_destroy_keep_storage() {
+        let cli = parse_cli(&["psht-server", "destroy", "--keep-storage", "myapp"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Destroy {
+                app: "myapp".to_string(),
+                keep_storage: true,
             }
         );
     }
@@ -595,6 +623,18 @@ mod tests {
     fn parse_health() {
         let cli = parse_cli(&["psht-server", "health"]).unwrap();
         assert_eq!(cli.command, Command::Health);
+    }
+
+    #[test]
+    fn parse_web() {
+        let cli = parse_cli(&["psht-server", "web"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Web {
+                bind: "127.0.0.1".to_string(),
+                port: 8787,
+            }
+        );
     }
 
     #[test]

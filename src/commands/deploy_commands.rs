@@ -19,6 +19,10 @@ pub(super) fn is_transient_deploy_app_for(app: &str, candidate: &str) -> bool {
     false
 }
 
+fn previous_cleanup_target_allowed(app: &str, candidate: &str) -> bool {
+    candidate == app || is_transient_deploy_app_for(app, candidate)
+}
+
 fn clear_previous_runtime_reference_if_missing(app: &str) -> Result<(), String> {
     let Some(state) = read_app_runtime_state(app)? else {
         return Ok(());
@@ -81,7 +85,7 @@ pub fn cleanup_previous(app: &str) -> Result<(), String> {
             "cleanup job has invalid scheduled previous instance".to_string(),
         );
     };
-    if !is_transient_deploy_app_for(app, &scheduled_previous_app) {
+    if !previous_cleanup_target_allowed(app, &scheduled_previous_app) {
         clear_cleanup_job(app)?;
         return Ok(());
     }
@@ -232,6 +236,41 @@ pub(super) fn pending_force_request_is_ours(
             if request.request_id.as_deref() == Some(request_id)
                 || (request.request_id.is_none() && request.force && request.sha == target_sha)
     )
+}
+
+fn clear_owned_deploy_interrupt(app: &str, request_id: &str) -> Result<bool, String> {
+    let Some(state) = read_deploy_interrupt(app)? else {
+        return Ok(false);
+    };
+    if state.request_id != request_id {
+        return Ok(false);
+    }
+    clear_deploy_interrupt(app)?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForcedDeployTakeoverPrep {
+    cleared_interrupt: bool,
+    cleared_pending_request: bool,
+}
+
+fn prepare_for_forced_deploy_takeover(
+    app: &str,
+    target: &GitCheckoutTarget,
+    request_id: &str,
+) -> Result<ForcedDeployTakeoverPrep, String> {
+    let cleared_interrupt = clear_owned_deploy_interrupt(app, request_id)?;
+    let pending_request = read_pending_git_request(app)?;
+    let cleared_pending_request =
+        pending_force_request_is_ours(pending_request.as_ref(), request_id, &target.sha);
+    if cleared_pending_request {
+        let _ = take_pending_git_request(app)?;
+    }
+    Ok(ForcedDeployTakeoverPrep {
+        cleared_interrupt,
+        cleared_pending_request,
+    })
 }
 
 fn deploy_once(
@@ -386,7 +425,7 @@ fn wait_for_forced_pending_deploy_completion(
                 "=====> Forced deploy complete for {} ({})",
                 target.ref_name, target.sha
             );
-            let _ = clear_deploy_interrupt(app);
+            let _ = clear_owned_deploy_interrupt(app, request_id);
             return Ok(());
         }
 
@@ -437,9 +476,12 @@ fn wait_for_forced_pending_deploy_completion(
                 ));
             };
             eprintln!("-----> Starting forced deploy takeover");
-            let _ = take_pending_git_request(app)?;
+            let prep = prepare_for_forced_deploy_takeover(app, target, request_id)?;
+            if prep.cleared_interrupt {
+                eprintln!("       Cleared interrupt request for forced deploy takeover");
+            }
             let result = deploy_once(app, Some(target), true, false);
-            let _ = clear_deploy_interrupt(app);
+            let _ = clear_owned_deploy_interrupt(app, request_id);
             return result;
         }
 
@@ -450,11 +492,12 @@ fn wait_for_forced_pending_deploy_completion(
             eprintln!(
                 "-----> Active deploy did not acknowledge interrupt; taking over forced deploy"
             );
-            if pending_is_ours {
-                let _ = take_pending_git_request(app)?;
+            let prep = prepare_for_forced_deploy_takeover(app, target, request_id)?;
+            if prep.cleared_interrupt {
+                eprintln!("       Cleared interrupt request for forced deploy takeover");
             }
             let result = deploy_once(app, Some(target), true, false);
-            let _ = clear_deploy_interrupt(app);
+            let _ = clear_owned_deploy_interrupt(app, request_id);
             return result;
         }
 
@@ -726,43 +769,208 @@ fn push_impl(app: &str, force: bool, ctx: &ReconcileIntentContext) -> Result<(),
 }
 
 fn deploy_from(app: &str, code_dir: &Path, force_fresh_setup_image: bool) -> Result<(), String> {
-    deploy_from_in_place(app, code_dir, force_fresh_setup_image)
+    deploy_zero_downtime(app, code_dir, force_fresh_setup_image)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InPlaceSetupAction {
-    CreateFresh,
-    ReconfigureExisting,
-    ReuseExisting,
+const CANDIDATE_READY_TIMEOUT_SECS: u64 = 60;
+const DEPLOY_PROGRESS_HEARTBEAT_SECS: u64 = 10;
+const APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS: u64 = 3;
+
+fn deploy_instance_id() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis()
+        .to_string()
 }
 
-fn select_in_place_setup_action(
-    container_exists: bool,
-    remote_hash: &str,
-    setup_hash: &str,
-    force_fresh_setup_image: bool,
-) -> InPlaceSetupAction {
-    if !container_exists || force_fresh_setup_image {
-        InPlaceSetupAction::CreateFresh
-    } else if remote_hash == setup_hash {
-        InPlaceSetupAction::ReuseExisting
-    } else {
-        InPlaceSetupAction::ReconfigureExisting
+fn candidate_app_name(app: &str, deploy_id: &str) -> String {
+    format!("{app}-build-{deploy_id}")
+}
+
+fn failed_candidate_app_name(app: &str, deploy_id: &str) -> String {
+    format!("{app}-failed-{deploy_id}")
+}
+
+fn spawn_cleanup_previous_worker(app: &str) -> Result<(), String> {
+    let exe = current_psht_binary()?;
+    Command::new(exe)
+        .args(["cleanup", "previous", app])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn background cleanup worker: {e}"))?;
+    Ok(())
+}
+
+fn queue_previous_cleanup(
+    app: &str,
+    active_app_ref: &str,
+    previous_app_ref: &str,
+) -> Result<(), String> {
+    let now = now_unix_secs();
+    write_cleanup_job(
+        app,
+        &CleanupJobState {
+            app: app.to_string(),
+            active_instance_at_schedule: instance_name_from_app_ref(active_app_ref),
+            scheduled_previous_instance: instance_name_from_app_ref(previous_app_ref),
+            attempts: 0,
+            last_error: None,
+            scheduled_at: now,
+            updated_at: now,
+        },
+    )
+}
+
+fn queue_previous_cleanup_in_background(app: &str, active_app_ref: &str, previous_app_ref: &str) {
+    if let Err(err) = queue_previous_cleanup(app, active_app_ref, previous_app_ref) {
+        eprintln!("       Warning: failed to schedule background cleanup: {err}");
+        return;
+    }
+    eprintln!("       Cleaning previous active container in background");
+    if let Err(err) = spawn_cleanup_previous_worker(app) {
+        eprintln!("       Warning: failed to start background cleanup worker: {err}");
     }
 }
 
-fn deploy_from_in_place(
+fn wait_for_tcp_listener(
+    app: &str,
+    port: u16,
+    timeout_secs: u64,
+    label: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut next_heartbeat = DEPLOY_PROGRESS_HEARTBEAT_SECS;
+
+    loop {
+        let output = container::exec_output(
+            app,
+            &format!(
+                "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
+            ),
+        )?;
+        if output.trim() == "ready" {
+            return Ok(());
+        }
+
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= APP_PROCESS_EARLY_EXIT_CHECK_GRACE_SECS && !app_process_is_running(app)? {
+            let mut message = format!(
+                "{label} failed before TCP :{port} became ready because app process exited"
+            );
+            if let Ok(command) = read_start_command(app) {
+                message.push_str(&format!("\nStart command: {}", command.trim()));
+            }
+            if let Some(log_excerpt) = app_log_tail(app, APP_LOG_TAIL_LINES) {
+                message.push_str("\nLast app log lines:\n");
+                message.push_str(&log_excerpt);
+            }
+            return Err(message);
+        }
+
+        if elapsed >= timeout_secs {
+            return Err(format!(
+                "{label} timed out after {timeout_secs}s waiting for TCP :{port}"
+            ));
+        }
+
+        if elapsed >= next_heartbeat {
+            eprintln!("       Still waiting for TCP :{port} ({elapsed}s elapsed)");
+            next_heartbeat += DEPLOY_PROGRESS_HEARTBEAT_SECS;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, project: &str) {
+    if !container::exists(candidate_app) {
+        return;
+    }
+
+    let failed_app = failed_candidate_app_name(app, deploy_id);
+    if container::exists(&failed_app)
+        && let Err(err) = cleanup_container_for_rebuild(&failed_app, project)
+    {
+        eprintln!("       Warning: failed to clear older failed candidate: {err}");
+    }
+
+    let candidate_instance = instance_name_from_app_ref(candidate_app);
+    let failed_instance = instance_name_from_app_ref(&failed_app);
+
+    let _ = container::remove_proxy_in_project(&candidate_instance, project);
+    let _ = container::exec_cmd(candidate_app, "tailscale down >/dev/null 2>&1 || true");
+    let _ = container::exec_cmd(
+        candidate_app,
+        "systemctl stop tailscaled >/dev/null 2>&1 || true",
+    );
+    let _ = container::remove_storage_mount(candidate_app);
+    let _ = container::remove_tailscale_state_mount(candidate_app);
+    if container::is_running(candidate_app).unwrap_or(false) {
+        let _ = container::stop(candidate_app);
+    }
+
+    match container::rename_instance_in_project(&candidate_instance, &failed_instance, project) {
+        Ok(()) => eprintln!("       Preserved failed candidate as {failed_app}"),
+        Err(err) => eprintln!("       Warning: failed to preserve failed candidate: {err}"),
+    }
+}
+
+fn disconnect_active_tailnet_for_cutover(app: &str, active_app: &str) -> Result<(), String> {
+    let device_id = read_tailscale_self_snapshot(active_app)
+        .ok()
+        .and_then(|snapshot| {
+            snapshot.device_id.clone().or_else(|| {
+                resolve_tailscale_device_id_from_tailnet(&snapshot)
+                    .ok()
+                    .flatten()
+            })
+        });
+
+    let _ = container::exec_cmd(active_app, "tailscale down >/dev/null 2>&1 || true");
+    let _ = container::exec_cmd(
+        active_app,
+        "systemctl stop tailscaled >/dev/null 2>&1 || true",
+    );
+
+    let Some(device_id) = device_id else {
+        return Ok(());
+    };
+
+    let token = tailscale::tailnet_access_token()?;
+    tailscale::delete_tailnet_device(&token, &device_id)?;
+    let _ = sqlite_store::retire_owned_tailscale_device(app, &device_id);
+    Ok(())
+}
+
+fn restore_active_tailnet_after_rollback(app: &str, active_app: &str, port: u16) {
+    eprintln!("       Restoring previous tailnet identity");
+    match acquire_exact_tailscale_hostname_for_deploy(active_app, app) {
+        Ok(name) => {
+            if name.is_some()
+                && let Err(err) = tailscale::expose_http_in_container(active_app, port)
+            {
+                eprintln!("       Warning: failed to re-expose previous tailnet HTTP: {err}");
+            }
+        }
+        Err(err) => {
+            eprintln!("       Warning: failed to restore previous tailnet identity: {err}");
+        }
+    }
+}
+
+fn deploy_zero_downtime(
     app: &str,
     code_dir: &Path,
-    force_fresh_setup_image: bool,
+    _force_fresh_setup_image: bool,
 ) -> Result<(), String> {
-    let current_uid = run_cmd_capture("id", &["-u"])?;
-    let current_project = format!("user-{}", current_uid.trim());
+    let current_project = current_project_name()?;
     if command_succeeds("incus", &["project", "show", &current_project]) {
         ensure_project_default_profile(&current_project)?;
     }
     init_stacks_in(&stacks_dir())?;
-    check_deploy_interrupt(app, "in-place preflight")?;
+    check_deploy_interrupt(app, "deploy preflight")?;
 
     eprintln!("-----> Detecting app type");
     let config = detect::detect(code_dir)?;
@@ -774,7 +982,7 @@ fn deploy_from_in_place(
     } else {
         None
     };
-    check_deploy_interrupt(app, "in-place detect and env checks")?;
+    check_deploy_interrupt(app, "deploy detect and env checks")?;
 
     if code_dir.join("psht-stack.sh").exists() {
         eprintln!("       Using custom stack");
@@ -785,155 +993,222 @@ fn deploy_from_in_place(
     let apt_fingerprint = apt_packages_fingerprint(&config.apt_packages);
     let setup_hash = setup_hash(&hash, apt_fingerprint.as_deref());
     let skip_tailscale = env::var_os("PSHT_SKIP_TAILSCALE").is_some();
+    let port = allocate_port(app);
+
     eprintln!("-----> Ensuring app storage volume");
     let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
-    let tailscale_volume = if skip_tailscale {
-        None
-    } else {
-        eprintln!("-----> Ensuring tailscale state volume");
-        Some(ensure_app_tailscale_volume(app)?)
-    };
+    let old_active_app = resolve_active_app_ref(app)?;
+    let deploy_id = deploy_instance_id();
+    let candidate_app = candidate_app_name(app, &deploy_id);
+    let failed_app = failed_candidate_app_name(app, &deploy_id);
 
-    let port = allocate_port(app);
-    let mut tailnet_hostname = if skip_tailscale {
-        None
-    } else {
-        tailscale::dns_name_in_container(app)
-    };
-    let container_exists = container::exists(app);
-    let mut remote_hash = String::new();
-    if container_exists {
-        write_app_runtime_state_in_project(app, app, None, &current_project)?;
-        check_deploy_interrupt(app, "in-place setup inspection")?;
-        wait_for_container_operation_quiet(app, &current_project, Some(app))?;
-        if !force_fresh_setup_image {
-            if !container::is_running(app)? {
-                eprintln!("-----> Starting existing container for setup inspection");
-                container::start(app)?;
-            }
-            remote_hash = container::exec_output(app, "cat /etc/psht-setup-hash 2>/dev/null")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        }
+    if container::exists(&candidate_app) {
+        let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
     }
-    let setup_action = select_in_place_setup_action(
-        container_exists,
-        &remote_hash,
-        &setup_hash,
-        force_fresh_setup_image,
-    );
-    let needs_setup = !matches!(setup_action, InPlaceSetupAction::ReuseExisting);
+    if container::exists(&failed_app) {
+        let _ = cleanup_container_for_rebuild(&failed_app, &current_project);
+    }
 
-    match setup_action {
-        InPlaceSetupAction::CreateFresh => {
-            if container_exists {
-                eprintln!("-----> Fresh container requested; rebuilding container");
-                cleanup_container_for_rebuild(app, &current_project)?;
-            }
-        }
-        InPlaceSetupAction::ReconfigureExisting => {
-            eprintln!("-----> Reconfiguring existing container");
-            stop_app_process_on_port(app, port)?;
-        }
-        InPlaceSetupAction::ReuseExisting => {
-            eprintln!("-----> Reusing container");
-            stop_app_process_on_port(app, port)?;
-        }
-    };
+    if let Some(old_active_app) = old_active_app.as_deref() {
+        wait_for_container_operation_quiet(old_active_app, &current_project, Some(app))?;
+    }
 
-    check_deploy_interrupt(app, "in-place setup evaluation")?;
-    if needs_setup {
-        check_deploy_interrupt(app, "in-place setup start")?;
-        if matches!(setup_action, InPlaceSetupAction::CreateFresh) {
-            wait_for_container_operation_quiet(app, &current_project, Some(app))?;
-            eprintln!("-----> Creating container");
-            eprintln!("       First run may take a while while Ubuntu image downloads");
-            ensure_create_prereqs(&current_project)?;
-            container::create_in_project(app, &current_project)?;
-            write_app_runtime_state_in_project(app, app, None, &current_project)?;
+    eprintln!("-----> Preparing candidate container");
+    eprintln!("       Candidate: {candidate_app}");
+    if old_active_app.is_some() {
+        eprintln!("       Traffic remains on current container");
+    }
 
-            if skip_tailscale {
-                eprintln!("-----> Skipping tailscale setup");
-            } else {
-                eprintln!("-----> Installing tailscale");
-                tailscale::install_in_container(app)?;
-            }
-        } else if skip_tailscale {
-            eprintln!("-----> Skipping tailscale setup");
+    let build_candidate_result = (|| -> Result<(), String> {
+        check_deploy_interrupt(app, "candidate create")?;
+        ensure_create_prereqs(&current_project)?;
+        eprintln!("-----> Creating candidate container");
+        eprintln!("       First run may take a while while Ubuntu image downloads");
+        container::create_in_project(&candidate_app, &current_project)?;
+
+        if skip_tailscale {
+            eprintln!("-----> Skipping tailscale setup in candidate");
         } else {
-            eprintln!("-----> Ensuring tailscale is available");
-            tailscale::install_in_container(app)?;
+            eprintln!("-----> Installing tailscale in candidate");
+            check_deploy_interrupt(app, "candidate tailscale install")?;
+            tailscale::install_in_container(&candidate_app)?;
         }
 
-        eprintln!("-----> Setting up runtime");
-        container::push_file(app, &script_path.to_string_lossy(), "/tmp/setup.sh")?;
+        eprintln!("-----> Setting up candidate runtime");
+        container::push_file(
+            &candidate_app,
+            &script_path.to_string_lossy(),
+            "/tmp/setup.sh",
+        )?;
         run_setup_command_with_logging(
-            app,
+            &candidate_app,
             "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-            "in-place runtime setup",
+            "candidate runtime setup",
         )?;
 
-        check_deploy_interrupt(app, "in-place package setup")?;
-        install_apt_packages(app, &config.apt_packages)?;
-
+        check_deploy_interrupt(app, "candidate package setup")?;
+        install_apt_packages(&candidate_app, &config.apt_packages)?;
         container::exec_cmd(
-            app,
+            &candidate_app,
             &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
         )?;
 
-        if skip_tailscale {
-            eprintln!("-----> Skipping tailnet connection");
-        } else {
-            if let Some((tailscale_pool, tailscale_state_volume)) = tailscale_volume.as_ref() {
-                container::ensure_tailscale_state_mount(
-                    app,
-                    tailscale_pool,
-                    tailscale_state_volume,
-                )?;
-            }
-            eprintln!("-----> Connecting to tailnet");
-            check_deploy_interrupt(app, "in-place tailscale connection")?;
-            tailnet_hostname = acquire_exact_tailscale_hostname_for_deploy(app, app)?;
+        eprintln!("-----> Attaching storage to candidate container");
+        check_deploy_interrupt(app, "candidate storage attach")?;
+        container::ensure_storage_mount(&candidate_app, &storage_pool, &storage_volume)?;
+
+        eprintln!("-----> Pushing code to candidate");
+        check_deploy_interrupt(app, "candidate code push")?;
+        container::push_code(&candidate_app, &code_dir.to_string_lossy())?;
+        persist_start_command(&candidate_app, &config.start_command)?;
+        persist_required_env(&candidate_app, &config.required_env)?;
+        run_hook(
+            &candidate_app,
+            "preinstall",
+            config.preinstall_command.as_deref(),
+        )?;
+
+        if let Some(command) = app_workdir_command(&config.install_command) {
+            eprintln!("-----> Installing candidate dependencies");
+            run_install_command_with_logging(
+                &candidate_app,
+                &command,
+                "candidate dependency install",
+            )?;
         }
 
-        let port = allocate_port(app);
-        eprintln!("-----> Setting up port forwarding on :{port}");
-        ensure_proxy_attached_with_recovery(app, &current_project, port, port)?;
+        run_hook(
+            &candidate_app,
+            "postinstall",
+            config.postinstall_command.as_deref(),
+        )?;
+
+        eprintln!("-----> Starting candidate");
+        check_deploy_interrupt(app, "candidate app start")?;
+        launch_app_process(&candidate_app, port, &config.start_command, &app_env)?;
+
+        eprintln!("-----> Waiting for candidate readiness");
+        wait_for_tcp_listener(
+            &candidate_app,
+            port,
+            CANDIDATE_READY_TIMEOUT_SECS,
+            "candidate readiness",
+        )?;
+        Ok(())
+    })();
+
+    if let Err(err) = build_candidate_result {
+        if is_deploy_interrupted_error(&err) {
+            let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+        } else {
+            preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
+        }
+        return Err(err);
     }
 
-    check_deploy_interrupt(app, "in-place storage attach")?;
-    container::ensure_storage_mount(app, &storage_pool, &storage_volume)?;
-
-    eprintln!("-----> Pushing code to container");
-    check_deploy_interrupt(app, "in-place code push")?;
-    container::push_code(app, &code_dir.to_string_lossy())?;
-    persist_start_command(app, &config.start_command)?;
-    persist_required_env(app, &config.required_env)?;
-    run_hook(app, "preinstall", config.preinstall_command.as_deref())?;
-
-    if let Some(command) = app_workdir_command(&config.install_command) {
-        eprintln!("-----> Installing dependencies");
-        run_install_command_with_logging(app, &command, "dependency install")?;
-    }
-
-    run_hook(app, "postinstall", config.postinstall_command.as_deref())?;
-
-    eprintln!("-----> Starting app");
-    check_deploy_interrupt(app, "in-place app start")?;
-    launch_app_process(app, port, &config.start_command, &app_env)?;
+    let mut tailnet_hostname = None;
+    let mut candidate_tailnet_ready = false;
+    let mut proxy_points_to_candidate = false;
+    let mut old_tailnet_disconnected = false;
 
     if !skip_tailscale {
-        tailnet_hostname = tailnet_hostname.or_else(|| tailscale::dns_name_in_container(app));
-    }
-    if !skip_tailscale && tailnet_hostname.is_some() {
-        if let Err(e) = tailscale::expose_http_in_container(app, port) {
-            eprintln!("       Warning: failed to expose tailnet HTTP on :80: {e}");
+        if let Some(old_active_app) = old_active_app.as_deref() {
+            eprintln!("-----> Preparing tailnet cutover");
+            let tailnet_cutover = (|| -> Result<(), String> {
+                check_deploy_interrupt(app, "tailnet cutover")?;
+                disconnect_active_tailnet_for_cutover(app, old_active_app)?;
+                old_tailnet_disconnected = true;
+                tailnet_hostname =
+                    acquire_exact_tailscale_hostname_for_deploy(&candidate_app, app)?;
+                candidate_tailnet_ready = tailnet_hostname.is_some();
+                if candidate_tailnet_ready
+                    && let Err(err) = tailscale::expose_http_in_container(&candidate_app, port)
+                {
+                    eprintln!("       Warning: failed to expose tailnet HTTP on :80: {err}");
+                }
+                Ok(())
+            })();
+
+            if let Err(err) = tailnet_cutover {
+                if old_tailnet_disconnected {
+                    restore_active_tailnet_after_rollback(app, old_active_app, port);
+                }
+                if is_deploy_interrupted_error(&err) {
+                    let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+                } else {
+                    preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
+                }
+                return Err(err);
+            }
+        } else {
+            eprintln!("-----> Connecting candidate to tailnet");
+            check_deploy_interrupt(app, "candidate tailscale connection")?;
+            tailnet_hostname = acquire_exact_tailscale_hostname_for_deploy(&candidate_app, app)?;
+            candidate_tailnet_ready = tailnet_hostname.is_some();
+            if candidate_tailnet_ready
+                && let Err(err) = tailscale::expose_http_in_container(&candidate_app, port)
+            {
+                eprintln!("       Warning: failed to expose tailnet HTTP on :80: {err}");
+            }
         }
     }
 
-    check_deploy_interrupt(app, "in-place finalize")?;
-    write_app_runtime_state(app, app, None)?;
+    let cutover_result = (|| -> Result<(), String> {
+        eprintln!("-----> Switching traffic");
+        check_deploy_interrupt(app, "proxy cutover")?;
+        ensure_proxy_attached_with_recovery(&candidate_app, &current_project, port, port)?;
+        proxy_points_to_candidate = true;
+
+        check_deploy_interrupt(app, "runtime state cutover")?;
+        write_app_runtime_state(app, &candidate_app, old_active_app.as_deref())?;
+
+        if let Some(old_active_app) = old_active_app.as_deref() {
+            eprintln!("       Stopping previous app process");
+            if let Err(err) = stop_app_process_on_port(old_active_app, port) {
+                eprintln!("       Warning: failed to stop previous app process: {err}");
+            }
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = cutover_result {
+        if let Some(old_active_app) = old_active_app.as_deref() {
+            let _ =
+                ensure_proxy_attached_with_recovery(old_active_app, &current_project, port, port);
+            if candidate_tailnet_ready {
+                let _ =
+                    container::exec_cmd(&candidate_app, "tailscale down >/dev/null 2>&1 || true");
+                let _ = container::exec_cmd(
+                    &candidate_app,
+                    "systemctl stop tailscaled >/dev/null 2>&1 || true",
+                );
+            }
+            if old_tailnet_disconnected || candidate_tailnet_ready {
+                restore_active_tailnet_after_rollback(app, old_active_app, port);
+            }
+        } else if proxy_points_to_candidate {
+            let candidate_instance = instance_name_from_app_ref(&candidate_app);
+            let _ = container::remove_proxy_in_project(&candidate_instance, &current_project);
+        }
+
+        if is_deploy_interrupted_error(&err) {
+            let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
+            return Err(err);
+        }
+
+        preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
+        if old_active_app.is_some() {
+            return Err(format!(
+                "deploy cutover failed and rollback was applied: {err}"
+            ));
+        }
+        return Err(err);
+    }
+
+    if let Some(old_active_app) = old_active_app.as_deref() {
+        queue_previous_cleanup_in_background(app, &candidate_app, old_active_app);
+    }
 
     let build_number = increment_build_number(app)?;
 
@@ -949,6 +1224,14 @@ fn deploy_from_in_place(
         eprintln!("       Warning: failed to clear binary hash: {e}");
     }
 
+    eprintln!("-----> Verifying live endpoint");
+    wait_for_tcp_listener(
+        &candidate_app,
+        port,
+        CANDIDATE_READY_TIMEOUT_SECS,
+        "post-cutover verification",
+    )?;
+
     eprintln!("=====> App {app} deployed on port {port} (build {build_number})");
     Ok(())
 }
@@ -956,36 +1239,158 @@ fn deploy_from_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn select_in_place_setup_action_prefers_create_when_missing() {
-        assert_eq!(
-            select_in_place_setup_action(false, "", "abc", false),
-            InPlaceSetupAction::CreateFresh
-        );
+    fn unique_test_app(prefix: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{}-{now}", std::process::id())
+    }
+
+    fn main_target(sha: &str) -> GitCheckoutTarget {
+        GitCheckoutTarget {
+            ref_name: "refs/heads/main".to_string(),
+            sha: sha.to_string(),
+        }
+    }
+
+    fn sqlite_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
     #[test]
-    fn select_in_place_setup_action_prefers_create_when_forced() {
-        assert_eq!(
-            select_in_place_setup_action(true, "abc", "abc", true),
-            InPlaceSetupAction::CreateFresh
-        );
+    fn candidate_app_name_uses_build_suffix() {
+        assert_eq!(candidate_app_name("demo", "42"), "demo-build-42");
     }
 
     #[test]
-    fn select_in_place_setup_action_reuses_matching_hash() {
-        assert_eq!(
-            select_in_place_setup_action(true, "abc", "abc", false),
-            InPlaceSetupAction::ReuseExisting
-        );
+    fn failed_candidate_app_name_uses_failed_suffix() {
+        assert_eq!(failed_candidate_app_name("demo", "42"), "demo-failed-42");
     }
 
     #[test]
-    fn select_in_place_setup_action_reconfigures_hash_mismatch() {
-        assert_eq!(
-            select_in_place_setup_action(true, "", "abc", false),
-            InPlaceSetupAction::ReconfigureExisting
+    fn previous_cleanup_target_allows_canonical_previous_instance() {
+        assert!(previous_cleanup_target_allowed("demo", "demo"));
+    }
+
+    #[test]
+    fn previous_cleanup_target_allows_transient_previous_instance() {
+        assert!(previous_cleanup_target_allowed("demo", "demo-build-42"));
+        assert!(previous_cleanup_target_allowed("demo", "demo-prev-42"));
+        assert!(previous_cleanup_target_allowed("demo", "demo-failed-42"));
+        assert!(!previous_cleanup_target_allowed("demo", "other-build-42"));
+    }
+
+    #[test]
+    fn forced_takeover_prep_clears_owned_interrupt_and_pending_request() {
+        let _guard = sqlite_test_guard();
+        let app = unique_test_app("takeover-owned");
+        let request_id = "req-123";
+        let target = main_target("deadbeef");
+        let pending = PendingGitDeployRequest::from_target(
+            &target,
+            true,
+            Some(request_id.to_string()),
+            Some(123),
         );
+        write_pending_git_request(&app, &pending).unwrap();
+        request_deploy_interrupt(
+            &app,
+            &DeployInterruptState {
+                request_id: request_id.to_string(),
+                requested_at: 123,
+                target_sha: target.sha.clone(),
+            },
+        )
+        .unwrap();
+
+        let prep = prepare_for_forced_deploy_takeover(&app, &target, request_id).unwrap();
+
+        assert_eq!(
+            prep,
+            ForcedDeployTakeoverPrep {
+                cleared_interrupt: true,
+                cleared_pending_request: true,
+            }
+        );
+        assert!(read_deploy_interrupt(&app).unwrap().is_none());
+        assert!(read_pending_git_request(&app).unwrap().is_none());
+    }
+
+    #[test]
+    fn forced_takeover_prep_preserves_foreign_interrupt_and_pending_request() {
+        let _guard = sqlite_test_guard();
+        let app = unique_test_app("takeover-foreign");
+        let target = main_target("deadbeef");
+        let pending = PendingGitDeployRequest::from_target(
+            &target,
+            true,
+            Some("req-999".to_string()),
+            Some(456),
+        );
+        write_pending_git_request(&app, &pending).unwrap();
+        request_deploy_interrupt(
+            &app,
+            &DeployInterruptState {
+                request_id: "req-999".to_string(),
+                requested_at: 456,
+                target_sha: target.sha.clone(),
+            },
+        )
+        .unwrap();
+
+        let prep = prepare_for_forced_deploy_takeover(&app, &target, "req-123").unwrap();
+
+        assert_eq!(
+            prep,
+            ForcedDeployTakeoverPrep {
+                cleared_interrupt: false,
+                cleared_pending_request: false,
+            }
+        );
+        assert_eq!(
+            read_deploy_interrupt(&app).unwrap().unwrap(),
+            DeployInterruptState {
+                request_id: "req-999".to_string(),
+                requested_at: 456,
+                target_sha: target.sha.clone(),
+            }
+        );
+        assert_eq!(read_pending_git_request(&app).unwrap().unwrap(), pending);
+    }
+
+    #[test]
+    fn forced_takeover_prep_claims_legacy_force_request_without_request_id() {
+        let _guard = sqlite_test_guard();
+        let app = unique_test_app("takeover-legacy");
+        let request_id = "req-123";
+        let target = main_target("deadbeef");
+        let pending = PendingGitDeployRequest::from_target(&target, true, None, None);
+        write_pending_git_request(&app, &pending).unwrap();
+        request_deploy_interrupt(
+            &app,
+            &DeployInterruptState {
+                request_id: request_id.to_string(),
+                requested_at: 123,
+                target_sha: target.sha.clone(),
+            },
+        )
+        .unwrap();
+
+        let prep = prepare_for_forced_deploy_takeover(&app, &target, request_id).unwrap();
+
+        assert_eq!(
+            prep,
+            ForcedDeployTakeoverPrep {
+                cleared_interrupt: true,
+                cleared_pending_request: true,
+            }
+        );
+        assert!(read_deploy_interrupt(&app).unwrap().is_none());
+        assert!(read_pending_git_request(&app).unwrap().is_none());
     }
 }

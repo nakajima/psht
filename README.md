@@ -44,6 +44,16 @@ Check to see how the server installation is doing.
 
 Check to see how apps are doing.
 
+#### `sudo psht-server web [--bind 127.0.0.1] [--port 8787]`
+
+Serve a plain built-in web UI for app status and host admin actions.
+
+- Dashboard shows apps, status, health, and whether the server is out of date.
+- App pages show health, recent logs, deploy history, and lifecycle/Tailscale controls.
+- Host page shows doctor/health output and can trigger `upgrade`.
+
+The default bind is `127.0.0.1`. For private Tailscale/LAN access, pass a different bind address explicitly.
+
 ## on ur local computer, after u set up the server
 
 Install `psht` from the latest release (same version as your server is recommended), then configure your project host in `~/.psht/config.toml`:
@@ -78,6 +88,10 @@ See the logs for the current app (or pass `--app` to see a specific app). Passin
 
 Control the current app lifecycle from your project directory.
 
+#### `psht destroy [--keep-storage]`
+
+Destroy removes the app container. By default it also removes the persistent `/storage` volume; pass `--keep-storage` to preserve it for a later redeploy.
+
 #### `psht tailscale`
 
 Manage tailscale for the app.
@@ -87,7 +101,7 @@ Manage tailscale for the app.
 Set environment variables for the app.
 These vars are also loaded in interactive Tailscale SSH logins to the app container.
 
-- Per-app persistent storage mounted at `/storage` (survives deploys/rebuilds, removed by `destroy`).
+- Per-app persistent storage mounted at `/storage` (survives deploys/rebuilds, removed by `destroy` unless you pass `--keep-storage`).
 
 ### Optional InfluxDB Stats
 

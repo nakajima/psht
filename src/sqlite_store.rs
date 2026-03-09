@@ -126,6 +126,17 @@ pub struct ReconcileAttemptRow {
     pub detail_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployHistoryRow {
+    pub id: i64,
+    pub app_id: String,
+    pub generation: i64,
+    pub revision: Option<String>,
+    pub outcome: String,
+    pub summary: String,
+    pub created_at_ms: i64,
+}
+
 fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/home/psht".to_string()))
 }
@@ -596,6 +607,43 @@ pub fn append_deploy_history(
     )
     .map_err(|e| format!("failed to append deploy history for {app_id}: {e}"))?;
     Ok(())
+}
+
+pub fn list_deploy_history(app_id: &str, limit: usize) -> Result<Vec<DeployHistoryRow>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, app_id, generation, revision, outcome, summary, created_at_ms
+             FROM deploy_history
+             WHERE app_id = ?1
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| format!("failed to prepare deploy history query for {app_id}: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![app_id, limit as i64], |row| {
+            Ok(DeployHistoryRow {
+                id: row.get(0)?,
+                app_id: row.get(1)?,
+                generation: row.get(2)?,
+                revision: row.get(3)?,
+                outcome: row.get(4)?,
+                summary: row.get(5)?,
+                created_at_ms: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("failed to query deploy history for {app_id}: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed to read deploy history row for {app_id}: {e}"))?);
+    }
+    Ok(out)
 }
 
 pub fn upsert_app_runtime_state(row: &AppRuntimeStateRow) -> Result<(), String> {

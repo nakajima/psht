@@ -1,13 +1,30 @@
 use super::*;
 
 pub fn ps() -> Result<(), String> {
-    let containers = container::list()?;
-    let apps = app_targets_from_runtime_state(&containers)?;
-    if apps.is_empty() {
+    let rows = ps_rows()?;
+    if rows.is_empty() {
         println!("No apps running.");
         return Ok(());
     }
     println!("{:<20} {:<10}", "APP", "STATUS");
+    for row in rows {
+        println!("{:<20} {:<10}", row.app, row.status);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PsRow {
+    pub(super) app: String,
+    pub(super) active_app: Option<String>,
+    pub(super) container_status: String,
+    pub(super) status: String,
+}
+
+pub(super) fn ps_rows() -> Result<Vec<PsRow>, String> {
+    let containers = container::list()?;
+    let apps = app_targets_from_runtime_state(&containers)?;
+    let mut rows = Vec::with_capacity(apps.len());
     for (app, active_app, container_status) in apps {
         let container_state = ps_container_state(&container_status);
         let service_ready = match container_state {
@@ -35,10 +52,15 @@ pub fn ps() -> Result<(), String> {
             },
             PsContainerState::Stopped | PsContainerState::Missing => None,
         };
-        let status = ps_status_from_parts(container_state, service_ready);
-        println!("{:<20} {:<10}", app, status);
+        let status = ps_status_from_parts(container_state, service_ready).to_string();
+        rows.push(PsRow {
+            app,
+            active_app,
+            container_status,
+            status,
+        });
     }
-    Ok(())
+    Ok(rows)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +97,7 @@ pub(super) fn ps_status_from_parts(
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AppHealthReport {
     pub(super) app: String,
     pub(super) healthy: bool,

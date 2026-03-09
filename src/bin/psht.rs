@@ -65,7 +65,12 @@ enum CliCommand {
     /// Restart an app
     Restart { app: Option<String> },
     /// Stop and remove an app
-    Destroy { app: Option<String> },
+    Destroy {
+        /// Preserve the app's /storage volume
+        #[arg(long)]
+        keep_storage: bool,
+        app: Option<String>,
+    },
     /// Manage environment variables for the project app
     Env {
         #[arg(value_name = "KEY=value")]
@@ -1705,10 +1710,15 @@ fn run() -> Result<(), String> {
             let app = resolve_command_app(&cwd, app.as_deref())?;
             ssh_cmd(&host, &["restart", &app])
         }
-        CliCommand::Destroy { app } => {
+        CliCommand::Destroy { app, keep_storage } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
             let app = resolve_command_app(&cwd, app.as_deref())?;
-            ssh_cmd(&host, &["destroy", &app])
+            let mut args = vec!["destroy"];
+            if keep_storage {
+                args.push("--keep-storage");
+            }
+            args.push(&app);
+            ssh_cmd(&host, &args)
         }
         CliCommand::Env { assignments } => {
             let host = resolve_host_from(&config, &cwd.to_string_lossy())?;
@@ -1941,6 +1951,18 @@ mod tests {
                 assert_eq!(app.as_deref(), Some("demo"));
             }
             _ => panic!("expected restart command"),
+        }
+    }
+
+    #[test]
+    fn destroy_command_parses_with_keep_storage() {
+        let cli = Cli::try_parse_from(["psht", "destroy", "--keep-storage", "demo"]).unwrap();
+        match cli.command {
+            CliCommand::Destroy { app, keep_storage } => {
+                assert_eq!(app.as_deref(), Some("demo"));
+                assert!(keep_storage);
+            }
+            _ => panic!("expected destroy command"),
         }
     }
 

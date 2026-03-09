@@ -1143,3 +1143,42 @@ fn integration_destroy_removes_app_storage_volume() {
         "storage volume should be removed by destroy"
     );
 }
+
+#[test]
+fn integration_destroy_keeps_app_storage_volume_when_requested() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-storage-preserve");
+    let pool = default_storage_pool_name().expect("failed to get storage pool");
+    let volume = storage_volume_name(&app);
+    delete_storage_volume_if_exists(&pool, &volume).expect("failed to clear stale storage volume");
+    let _storage_guard = StorageVolumeGuard::new(&pool, &volume);
+
+    {
+        let _guard = ContainerGuard::new(&app).expect("create container failed");
+        wait_for_container_network(&app).expect("container network not ready");
+        ensure_storage_volume(&pool, &volume).expect("failed to create app storage volume");
+        container::ensure_storage_mount(&app, &pool, &volume).expect("failed to attach storage");
+        exec_output(
+            &app,
+            "mkdir -p /storage && printf '%s\\n' 'sentinel' > /storage/persist.txt",
+        )
+        .expect("failed to write storage sentinel");
+
+        commands::destroy_with_options(&app, commands::DestroyOptions { keep_storage: true })
+            .expect("commands::destroy_with_options failed");
+    }
+
+    assert!(
+        storage_volume_exists(&pool, &volume),
+        "storage volume should be preserved when requested"
+    );
+
+    {
+        let _guard = ContainerGuard::new(&app).expect("recreate container failed");
+        wait_for_container_network(&app).expect("container network not ready after recreate");
+        container::ensure_storage_mount(&app, &pool, &volume)
+            .expect("failed to reattach preserved storage");
+        let value = exec_output(&app, "cat /storage/persist.txt").expect("failed to read sentinel");
+        assert_eq!(value.trim(), "sentinel");
+    }
+}

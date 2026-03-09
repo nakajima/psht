@@ -123,6 +123,7 @@ mod admin_commands;
 mod deploy_commands;
 mod lifecycle_commands;
 mod observability_commands;
+mod web_ui;
 
 use self::deploy_commands::{
     check_deploy_interrupt, control_plane_snapshot, is_transient_deploy_app_for,
@@ -2663,20 +2664,6 @@ fn write_app_runtime_state(
     app_state::write_app_runtime_state(app, active_app_ref, previous_app_ref)
 }
 
-fn write_app_runtime_state_in_project(
-    app: &str,
-    active_app_ref: &str,
-    previous_app_ref: Option<&str>,
-    project_name: &str,
-) -> Result<(), String> {
-    app_state::write_app_runtime_state_in_project(
-        app,
-        active_app_ref,
-        previous_app_ref,
-        project_name,
-    )
-}
-
 fn clear_app_runtime_state(app: &str) -> Result<(), String> {
     app_state::clear_app_runtime_state(app)
 }
@@ -2911,17 +2898,24 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 fn send_kill_signal(pid: u32) -> Result<(), String> {
-    let status = Command::new("kill")
+    let output = Command::new("kill")
         .args(["-KILL", &pid.to_string()])
-        .status()
+        .output()
         .map_err(|e| format!("failed to execute kill -KILL {pid}: {e}"))?;
-    if status.success() {
+    if output.status.success() {
         return Ok(());
     }
     if !pid_is_alive(pid) {
         return Ok(());
     }
-    Err(format!("failed to send SIGKILL to lock holder pid {pid}"))
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if detail.is_empty() {
+        Err(format!("failed to send SIGKILL to lock holder pid {pid}"))
+    } else {
+        Err(format!(
+            "failed to send SIGKILL to lock holder pid {pid}: {detail}"
+        ))
+    }
 }
 
 fn write_new_lock_file(path: &Path) -> Result<(), std::io::Error> {
@@ -4619,6 +4613,10 @@ pub fn tailscale_down(app: &str) -> Result<(), String> {
     admin_commands::tailscale_down(app)
 }
 
+pub fn web(bind: &str, port: u16) -> Result<(), String> {
+    web_ui::serve(bind, port)
+}
+
 pub fn daemon() -> Result<(), String> {
     admin_commands::daemon()
 }
@@ -4639,8 +4637,17 @@ pub fn restart(app: &str) -> Result<(), String> {
     lifecycle_commands::restart(app)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DestroyOptions {
+    pub keep_storage: bool,
+}
+
+pub fn destroy_with_options(app: &str, options: DestroyOptions) -> Result<(), String> {
+    lifecycle_commands::destroy(app, options)
+}
+
 pub fn destroy(app: &str) -> Result<(), String> {
-    lifecycle_commands::destroy(app)
+    destroy_with_options(app, DestroyOptions::default())
 }
 
 #[cfg(test)]

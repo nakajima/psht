@@ -171,7 +171,7 @@ pub fn restart(app: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn destroy(app: &str) -> Result<(), String> {
+pub fn destroy(app: &str, options: DestroyOptions) -> Result<(), String> {
     app_name::validate_app_name(app)?;
     let active_app = resolve_existing_active_app_ref(app)?;
     let runtime_state = read_app_runtime_state(app)?;
@@ -195,7 +195,11 @@ pub fn destroy(app: &str) -> Result<(), String> {
         let _ = container::delete(&previous_app);
     }
 
-    delete_app_storage_volume(app)?;
+    if options.keep_storage {
+        eprintln!("       Preserving /storage volume");
+    } else {
+        delete_app_storage_volume(app)?;
+    }
     if let Err(e) = delete_app_tailscale_volume(app) {
         eprintln!("       Warning: failed to remove tailscale state volume: {e}");
     }

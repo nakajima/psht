@@ -664,6 +664,20 @@ pub fn remove_proxy_in_project(instance_name: &str, project: &str) -> Result<(),
     ))
 }
 
+pub fn rename_instance_in_project(
+    old_instance_name: &str,
+    new_instance_name: &str,
+    project: &str,
+) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("rename")
+        .arg(old_instance_name)
+        .arg(new_instance_name)
+        .run()
+}
+
 fn proxy_device_listen_value(device: &Value) -> Option<&str> {
     let Value::Object(map) = device else {
         return None;
@@ -1198,6 +1212,28 @@ mod tests {
         let cmd = incus().arg("rename").arg(&old_name).arg(&new_name).build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec!["rename", "psht-myapp", "psht-myapp-next"]);
+    }
+
+    #[test]
+    fn incus_project_rename_command_builds_correctly() {
+        let cmd = incus()
+            .arg("--project")
+            .arg("user-1000")
+            .arg("rename")
+            .arg("psht-myapp-build-1")
+            .arg("psht-myapp-failed-1")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "--project",
+                "user-1000",
+                "rename",
+                "psht-myapp-build-1",
+                "psht-myapp-failed-1"
+            ]
+        );
     }
 
     #[test]
