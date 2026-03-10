@@ -792,6 +792,158 @@ fn failed_candidate_app_name(app: &str, deploy_id: &str) -> String {
     format!("{app}-failed-{deploy_id}")
 }
 
+const TAILSCALE_STATE_DIR_PATH: &str = "/var/lib/tailscale";
+const SYSTEMD_MULTI_USER_WANTS_DIR: &str = "/etc/systemd/system/multi-user.target.wants";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidatePreparationStrategy {
+    ReusePreparedRuntime,
+    FreshProvision,
+}
+
+fn choose_candidate_preparation_strategy(
+    force_fresh_setup_image: bool,
+    has_active_instance: bool,
+    active_setup_hash: Option<&str>,
+    desired_setup_hash: &str,
+) -> CandidatePreparationStrategy {
+    if force_fresh_setup_image {
+        return CandidatePreparationStrategy::FreshProvision;
+    }
+    if has_active_instance && active_setup_hash == Some(desired_setup_hash) {
+        CandidatePreparationStrategy::ReusePreparedRuntime
+    } else {
+        CandidatePreparationStrategy::FreshProvision
+    }
+}
+
+fn read_container_setup_hash(app: &str) -> Result<Option<String>, String> {
+    let output = container::exec_output(app, "cat /etc/psht-setup-hash 2>/dev/null || true")?;
+    let hash = output.trim();
+    if hash.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hash.to_string()))
+    }
+}
+
+fn systemd_enable_symlink_path(service_name: &str) -> String {
+    format!("{SYSTEMD_MULTI_USER_WANTS_DIR}/{service_name}")
+}
+
+fn sanitize_cloned_candidate_runtime(
+    candidate_app: &str,
+    candidate_instance: &str,
+    project: &str,
+    skip_tailscale: bool,
+) -> Result<(), String> {
+    let _ = container::remove_proxy_in_project(candidate_instance, project);
+    let _ = container::remove_tailscale_state_mount(candidate_app);
+    let _ = container::remove_tailscale_state_seed_mount(candidate_app);
+
+    container::remove_file_in_instance_project(
+        candidate_instance,
+        project,
+        &systemd_enable_symlink_path(APP_SERVICE_NAME),
+    )?;
+
+    if !skip_tailscale {
+        container::remove_file_in_instance_project(
+            candidate_instance,
+            project,
+            &systemd_enable_symlink_path("tailscaled.service"),
+        )?;
+        container::remove_file_in_instance_project(
+            candidate_instance,
+            project,
+            TAILSCALE_STATE_DIR_PATH,
+        )?;
+        container::create_directory_in_instance_project(
+            candidate_instance,
+            project,
+            TAILSCALE_STATE_DIR_PATH,
+            "700",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn prepare_candidate_from_active_runtime(
+    candidate_app: &str,
+    active_app: &str,
+    project: &str,
+    port: u16,
+    skip_tailscale: bool,
+) -> Result<(), String> {
+    let candidate_instance = instance_name_from_app_ref(candidate_app);
+    let active_instance = instance_name_from_app_ref(active_app);
+
+    eprintln!("-----> Reusing prepared runtime from active container");
+    container::copy_instance_in_project(&active_instance, &candidate_instance, project)?;
+
+    eprintln!("-----> Sanitizing cloned candidate runtime");
+    sanitize_cloned_candidate_runtime(candidate_app, &candidate_instance, project, skip_tailscale)?;
+
+    eprintln!("-----> Starting cloned candidate runtime");
+    container::start(candidate_app)?;
+    container::exec_cmd_in_instance_project(
+        &candidate_instance,
+        project,
+        "systemctl daemon-reload >/dev/null 2>&1 || true",
+    )?;
+    if !skip_tailscale {
+        container::exec_cmd_in_instance_project(
+            &candidate_instance,
+            project,
+            "systemctl enable tailscaled >/dev/null 2>&1 || true",
+        )?;
+        reset_tailscale_for_retry(candidate_app)?;
+    }
+    stop_app_process_on_port(candidate_app, port)?;
+    Ok(())
+}
+
+fn prepare_candidate_fresh(
+    candidate_app: &str,
+    project: &str,
+    script_path: &Path,
+    setup_hash: &str,
+    apt_packages: &[String],
+    skip_tailscale: bool,
+) -> Result<(), String> {
+    ensure_create_prereqs(project)?;
+    eprintln!("-----> Creating candidate container");
+    eprintln!("       First run may take a while while Ubuntu image downloads");
+    container::create_in_project(candidate_app, project)?;
+
+    if skip_tailscale {
+        eprintln!("-----> Skipping tailscale setup in candidate");
+    } else {
+        eprintln!("-----> Installing tailscale in candidate");
+        tailscale::install_in_container(candidate_app)?;
+    }
+
+    eprintln!("-----> Setting up candidate runtime");
+    container::push_file(
+        candidate_app,
+        &script_path.to_string_lossy(),
+        "/tmp/setup.sh",
+    )?;
+    run_setup_command_with_logging(
+        candidate_app,
+        "chmod +x /tmp/setup.sh && /tmp/setup.sh",
+        "candidate runtime setup",
+    )?;
+
+    install_apt_packages(candidate_app, apt_packages)?;
+    container::exec_cmd(
+        candidate_app,
+        &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
+    )?;
+    Ok(())
+}
+
 fn spawn_cleanup_previous_worker(app: &str) -> Result<(), String> {
     let exe = current_psht_binary()?;
     Command::new(exe)
@@ -963,7 +1115,7 @@ fn restore_active_tailnet_after_rollback(app: &str, active_app: &str, port: u16)
 fn deploy_zero_downtime(
     app: &str,
     code_dir: &Path,
-    _force_fresh_setup_image: bool,
+    force_fresh_setup_image: bool,
 ) -> Result<(), String> {
     let current_project = current_project_name()?;
     if command_succeeds("incus", &["project", "show", &current_project]) {
@@ -998,6 +1150,21 @@ fn deploy_zero_downtime(
     eprintln!("-----> Ensuring app storage volume");
     let (storage_pool, storage_volume) = ensure_app_storage_volume(app)?;
     let old_active_app = resolve_active_app_ref(app)?;
+    let active_setup_hash = old_active_app.as_deref().and_then(|active_app| {
+        match read_container_setup_hash(active_app) {
+            Ok(hash) => hash,
+            Err(err) => {
+                eprintln!("       Warning: failed to read active setup hash: {err}");
+                None
+            }
+        }
+    });
+    let candidate_strategy = choose_candidate_preparation_strategy(
+        force_fresh_setup_image,
+        old_active_app.is_some(),
+        active_setup_hash.as_deref(),
+        &setup_hash,
+    );
     let deploy_id = deploy_instance_id();
     let candidate_app = candidate_app_name(app, &deploy_id);
     let failed_app = failed_candidate_app_name(app, &deploy_id);
@@ -1021,37 +1188,50 @@ fn deploy_zero_downtime(
 
     let build_candidate_result = (|| -> Result<(), String> {
         check_deploy_interrupt(app, "candidate create")?;
-        ensure_create_prereqs(&current_project)?;
-        eprintln!("-----> Creating candidate container");
-        eprintln!("       First run may take a while while Ubuntu image downloads");
-        container::create_in_project(&candidate_app, &current_project)?;
-
-        if skip_tailscale {
-            eprintln!("-----> Skipping tailscale setup in candidate");
-        } else {
-            eprintln!("-----> Installing tailscale in candidate");
-            check_deploy_interrupt(app, "candidate tailscale install")?;
-            tailscale::install_in_container(&candidate_app)?;
+        let mut reused_prepared_runtime = false;
+        if let (CandidatePreparationStrategy::ReusePreparedRuntime, Some(old_active_app)) =
+            (candidate_strategy, old_active_app.as_deref())
+        {
+            check_deploy_interrupt(app, "candidate runtime reuse")?;
+            match prepare_candidate_from_active_runtime(
+                &candidate_app,
+                old_active_app,
+                &current_project,
+                port,
+                skip_tailscale,
+            ) {
+                Ok(()) => reused_prepared_runtime = true,
+                Err(err) => {
+                    eprintln!(
+                        "       Warning: failed to clone prepared runtime from {old_active_app}: {err}"
+                    );
+                    let candidate_instance = instance_name_from_app_ref(&candidate_app);
+                    if container::exists_instance_in_project(&candidate_instance, &current_project)
+                    {
+                        cleanup_container_for_rebuild(&candidate_app, &current_project)?;
+                    }
+                    eprintln!("       Falling back to fresh candidate provisioning");
+                }
+            }
         }
 
-        eprintln!("-----> Setting up candidate runtime");
-        container::push_file(
-            &candidate_app,
-            &script_path.to_string_lossy(),
-            "/tmp/setup.sh",
-        )?;
-        run_setup_command_with_logging(
-            &candidate_app,
-            "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-            "candidate runtime setup",
-        )?;
-
-        check_deploy_interrupt(app, "candidate package setup")?;
-        install_apt_packages(&candidate_app, &config.apt_packages)?;
-        container::exec_cmd(
-            &candidate_app,
-            &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
-        )?;
+        if !reused_prepared_runtime {
+            check_deploy_interrupt(app, "candidate fresh provision")?;
+            prepare_candidate_fresh(
+                &candidate_app,
+                &current_project,
+                &script_path,
+                &setup_hash,
+                &config.apt_packages,
+                skip_tailscale,
+            )?;
+        } else {
+            check_deploy_interrupt(app, "candidate setup hash persist")?;
+            container::exec_cmd(
+                &candidate_app,
+                &format!("echo -n '{setup_hash}' > /etc/psht-setup-hash"),
+            )?;
+        }
 
         eprintln!("-----> Attaching storage to candidate container");
         check_deploy_interrupt(app, "candidate storage attach")?;
@@ -1270,6 +1450,30 @@ mod tests {
     #[test]
     fn failed_candidate_app_name_uses_failed_suffix() {
         assert_eq!(failed_candidate_app_name("demo", "42"), "demo-failed-42");
+    }
+
+    #[test]
+    fn choose_candidate_preparation_strategy_reuses_matching_active_runtime() {
+        assert_eq!(
+            choose_candidate_preparation_strategy(false, true, Some("setup-123"), "setup-123"),
+            CandidatePreparationStrategy::ReusePreparedRuntime
+        );
+    }
+
+    #[test]
+    fn choose_candidate_preparation_strategy_falls_back_when_hash_differs() {
+        assert_eq!(
+            choose_candidate_preparation_strategy(false, true, Some("setup-old"), "setup-new"),
+            CandidatePreparationStrategy::FreshProvision
+        );
+    }
+
+    #[test]
+    fn choose_candidate_preparation_strategy_honors_force_fresh() {
+        assert_eq!(
+            choose_candidate_preparation_strategy(true, true, Some("setup-123"), "setup-123"),
+            CandidatePreparationStrategy::FreshProvision
+        );
     }
 
     #[test]

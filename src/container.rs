@@ -32,6 +32,14 @@ fn container_name(app: &str) -> String {
     format!("psht-{app}")
 }
 
+fn instance_file_target(instance_name: &str, remote_path: &str) -> String {
+    if remote_path.starts_with('/') {
+        format!("{instance_name}{remote_path}")
+    } else {
+        format!("{instance_name}/{remote_path}")
+    }
+}
+
 fn resolved_target(app: &str) -> Option<runtime_graph::InstanceRef> {
     runtime_graph::resolve_instance(app).ok()
 }
@@ -384,6 +392,13 @@ fn remove_disk_mount(app: &str, device_name: &str, label: &str) -> Result<(), St
     ))
 }
 
+fn is_missing_file_error(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("not found")
+        || lowered.contains("no such file")
+        || lowered.contains("does not exist")
+}
+
 pub fn ensure_storage_mount(app: &str, pool: &str, volume: &str) -> Result<(), String> {
     ensure_disk_mount(
         app,
@@ -675,6 +690,77 @@ pub fn rename_instance_in_project(
         .arg("rename")
         .arg(old_instance_name)
         .arg(new_instance_name)
+        .run()
+}
+
+pub fn copy_instance_in_project(
+    source_instance_name: &str,
+    destination_instance_name: &str,
+    project: &str,
+) -> Result<(), String> {
+    incus()
+        .arg("--project")
+        .arg(project)
+        .arg("copy")
+        .arg(source_instance_name)
+        .arg(destination_instance_name)
+        .arg("--instance-only")
+        .arg("--stateless")
+        .run_rolling(5)
+}
+
+pub fn remove_file_in_instance_project(
+    instance_name: &str,
+    project: &str,
+    remote_path: &str,
+) -> Result<(), String> {
+    let target = instance_file_target(instance_name, remote_path);
+    let output = incus()
+        .arg("--project")
+        .arg(project)
+        .args(&["file", "delete", "--force"])
+        .arg(&target)
+        .build()
+        .output()
+        .map_err(|e| {
+            format!("failed to run incus --project {project} file delete {target}: {e}")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if is_missing_file_error(&stderr) {
+        return Ok(());
+    }
+    Err(format!(
+        "incus --project {project} file delete {target} failed: {stderr}"
+    ))
+}
+
+pub fn create_directory_in_instance_project(
+    instance_name: &str,
+    project: &str,
+    remote_path: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let target = instance_file_target(instance_name, remote_path);
+    incus()
+        .arg("--project")
+        .arg(project)
+        .args(&[
+            "file",
+            "create",
+            "--type=directory",
+            "--force",
+            "--create-dirs",
+        ])
+        .arg("--mode")
+        .arg(mode)
+        .arg("--uid")
+        .arg("0")
+        .arg("--gid")
+        .arg("0")
+        .arg(&target)
         .run()
 }
 
@@ -1237,6 +1323,32 @@ mod tests {
     }
 
     #[test]
+    fn incus_project_copy_command_builds_correctly() {
+        let cmd = incus()
+            .arg("--project")
+            .arg("user-1000")
+            .arg("copy")
+            .arg("psht-myapp")
+            .arg("psht-myapp-build-1")
+            .arg("--instance-only")
+            .arg("--stateless")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "--project",
+                "user-1000",
+                "copy",
+                "psht-myapp",
+                "psht-myapp-build-1",
+                "--instance-only",
+                "--stateless"
+            ]
+        );
+    }
+
+    #[test]
     fn incus_storage_add_command_builds_correctly() {
         let name = container_name("myapp");
         let cmd = incus()
@@ -1434,6 +1546,70 @@ mod tests {
                 "push",
                 "/home/psht/stacks/node.sh",
                 "psht-myapp/tmp/setup.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn incus_file_delete_command_builds_correctly() {
+        let cmd = incus()
+            .arg("--project")
+            .arg("user-1000")
+            .args(&["file", "delete", "--force"])
+            .arg("psht-myapp/var/lib/tailscale")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "--project",
+                "user-1000",
+                "file",
+                "delete",
+                "--force",
+                "psht-myapp/var/lib/tailscale"
+            ]
+        );
+    }
+
+    #[test]
+    fn incus_file_create_directory_command_builds_correctly() {
+        let cmd = incus()
+            .arg("--project")
+            .arg("user-1000")
+            .args(&[
+                "file",
+                "create",
+                "--type=directory",
+                "--force",
+                "--create-dirs",
+            ])
+            .arg("--mode")
+            .arg("700")
+            .arg("--uid")
+            .arg("0")
+            .arg("--gid")
+            .arg("0")
+            .arg("psht-myapp/var/lib/tailscale")
+            .build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                "--project",
+                "user-1000",
+                "file",
+                "create",
+                "--type=directory",
+                "--force",
+                "--create-dirs",
+                "--mode",
+                "700",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "psht-myapp/var/lib/tailscale"
             ]
         );
     }

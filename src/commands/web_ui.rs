@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +10,7 @@ use crate::app_name;
 use crate::container;
 use crate::control_plane;
 use crate::deploy_log;
+use crate::detect;
 use crate::sqlite_store;
 
 use super::observability_commands::{self, AppHealthReport, PsRow};
@@ -73,6 +75,8 @@ struct DashboardApp {
     health: String,
     phase: String,
     desired_state: String,
+    source_kind: Option<String>,
+    stack: Option<String>,
     active_instance: Option<String>,
 }
 
@@ -88,10 +92,68 @@ struct AppDetail {
     active_revision: Option<String>,
     candidate_revision: Option<String>,
     runtime_project: Option<String>,
+    generation: Option<i64>,
+    source_kind: Option<String>,
+    stack: Option<String>,
     health: AppHealthReport,
     deploy_history: Vec<sqlite_store::DeployHistoryRow>,
     logs: String,
     tailscale: String,
+    actions: AppActions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AppMetadata {
+    generation: Option<i64>,
+    source_kind: Option<String>,
+    stack: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppActions {
+    start: ActionState,
+    stop: ActionState,
+    restart: ActionState,
+    destroy: ActionState,
+    tailscale_up: ActionState,
+    tailscale_down: ActionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionState {
+    enabled: bool,
+    reason: Option<String>,
+}
+
+impl ActionState {
+    fn enabled() -> Self {
+        Self {
+            enabled: true,
+            reason: None,
+        }
+    }
+
+    fn disabled(reason: &str) -> Self {
+        Self {
+            enabled: false,
+            reason: Some(reason.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppStatusKind {
+    Running,
+    Down,
+    Stopped,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailscaleStatusKind {
+    Healthy,
+    Unhealthy,
+    Unavailable,
 }
 
 fn handle_connection(mut stream: TcpStream) -> Result<(), String> {
@@ -262,7 +324,7 @@ fn dashboard_response(request: &HttpRequest) -> HttpResponse {
     if apps.is_empty() {
         body.push_str("<p>No deployed apps found.</p>");
     } else {
-        body.push_str("<table><thead><tr><th>App</th><th>Status</th><th>Health</th><th>Phase</th><th>Desired</th><th>Active</th></tr></thead><tbody>");
+        body.push_str("<table><thead><tr><th>App</th><th>Status</th><th>Health</th><th>Phase</th><th>Desired</th><th>Source</th><th>Stack</th><th>Active</th></tr></thead><tbody>");
         for app in apps {
             let app_path = app_path(&app.app);
             body.push_str("<tr>");
@@ -274,6 +336,14 @@ fn dashboard_response(request: &HttpRequest) -> HttpResponse {
             body.push_str(&format!("<td>{}</td>", html_escape(&app.health)));
             body.push_str(&format!("<td>{}</td>", html_escape(&app.phase)));
             body.push_str(&format!("<td>{}</td>", html_escape(&app.desired_state)));
+            body.push_str(&format!(
+                "<td>{}</td>",
+                html_escape(app.source_kind.as_deref().unwrap_or("-"))
+            ));
+            body.push_str(&format!(
+                "<td>{}</td>",
+                html_escape(app.stack.as_deref().unwrap_or("-"))
+            ));
             body.push_str(&format!(
                 "<td>{}</td>",
                 html_escape(app.active_instance.as_deref().unwrap_or("-"))
@@ -328,6 +398,21 @@ fn app_response(request: &HttpRequest, app: &str) -> HttpResponse {
     body.push_str(&table_row_html("Desired", &detail.desired_state));
     body.push_str(&table_row_html("Phase", &detail.phase));
     body.push_str(&table_row_html(
+        "Generation",
+        &detail
+            .generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    ));
+    body.push_str(&table_row_html(
+        "Source",
+        detail.source_kind.as_deref().unwrap_or("-"),
+    ));
+    body.push_str(&table_row_html(
+        "Stack",
+        detail.stack.as_deref().unwrap_or("-"),
+    ));
+    body.push_str(&table_row_html(
         "Active instance",
         detail.active_instance.as_deref().unwrap_or("-"),
     ));
@@ -359,27 +444,41 @@ fn app_response(request: &HttpRequest, app: &str) -> HttpResponse {
 
     let next = app_path(&detail.app);
     body.push_str("<section><h2>Actions</h2>");
-    body.push_str(&action_form_html(&format!("{next}/start"), &next, "Start"));
-    body.push_str(&action_form_html(&format!("{next}/stop"), &next, "Stop"));
-    body.push_str(&action_form_html(
+    body.push_str(&action_button_html(
+        &format!("{next}/start"),
+        &next,
+        "Start",
+        &detail.actions.start,
+    ));
+    body.push_str(&action_button_html(
+        &format!("{next}/stop"),
+        &next,
+        "Stop",
+        &detail.actions.stop,
+    ));
+    body.push_str(&action_button_html(
         &format!("{next}/restart"),
         &next,
         "Restart",
+        &detail.actions.restart,
     ));
-    body.push_str(&action_form_html(
+    body.push_str(&action_button_html(
         &format!("{next}/destroy"),
         &next,
         "Destroy",
+        &detail.actions.destroy,
     ));
-    body.push_str(&action_form_html(
+    body.push_str(&action_button_html(
         &format!("{next}/tailscale/up"),
         &next,
         "Tailscale Up",
+        &detail.actions.tailscale_up,
     ));
-    body.push_str(&action_form_html(
+    body.push_str(&action_button_html(
         &format!("{next}/tailscale/down"),
         &next,
         "Tailscale Down",
+        &detail.actions.tailscale_down,
     ));
     body.push_str("</section>");
 
@@ -566,7 +665,7 @@ fn nav_html() -> String {
 
 fn page_html(title: &str, body: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>body{{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;line-height:1.4;}}nav{{margin:0 0 1rem 0;}}table{{border-collapse:collapse;width:100%;margin:0.5rem 0 1.5rem 0;}}th,td{{border:1px solid #d0d0d0;padding:0.5rem;text-align:left;vertical-align:top;}}pre{{background:#f5f5f5;border:1px solid #d0d0d0;padding:0.75rem;overflow-x:auto;white-space:pre-wrap;}}form{{display:inline-block;margin:0 0.5rem 0.5rem 0;}}button{{padding:0.35rem 0.6rem;}}section{{margin:1.5rem 0;}}.banner{{padding:0.75rem;border:1px solid #d0d0d0;margin:1rem 0;}}.banner.ok{{background:#eef8ee;}}.banner.error{{background:#fff0f0;}}.banner.warn{{background:#fff8e8;}}</style></head><body>{}</body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>body{{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;line-height:1.4;}}nav{{margin:0 0 1rem 0;}}table{{border-collapse:collapse;width:100%;margin:0.5rem 0 1.5rem 0;}}th,td{{border:1px solid #d0d0d0;padding:0.5rem;text-align:left;vertical-align:top;}}pre{{background:#f5f5f5;border:1px solid #d0d0d0;padding:0.75rem;overflow-x:auto;white-space:pre-wrap;}}form{{display:inline-block;margin:0;}}button{{padding:0.35rem 0.6rem;}}button:disabled{{opacity:0.6;cursor:not-allowed;}}section{{margin:1.5rem 0;}}.banner{{padding:0.75rem;border:1px solid #d0d0d0;margin:1rem 0;}}.banner.ok{{background:#eef8ee;}}.banner.error{{background:#fff0f0;}}.banner.warn{{background:#fff8e8;}}.action{{display:inline-flex;align-items:center;gap:0.35rem;margin:0 0.5rem 0.5rem 0;}}.action-note{{color:#555;font-size:0.9rem;}}</style></head><body>{}</body></html>",
         html_escape(title),
         body
     )
@@ -604,7 +703,7 @@ fn version_section_html(version: &VersionStatus, include_upgrade_action: bool) -
         section
             .push_str("<div class=\"banner warn\">A newer psht-server release is available.</div>");
         if include_upgrade_action {
-            section.push_str(&action_form_html(
+            section.push_str(&enabled_action_form_html(
                 "/host/upgrade",
                 "/host",
                 "Upgrade Server",
@@ -638,13 +737,27 @@ fn pre_section_html(title: &str, text: &str) -> String {
     )
 }
 
-fn action_form_html(action_path: &str, next: &str, label: &str) -> String {
+fn enabled_action_form_html(action_path: &str, next: &str, label: &str) -> String {
     let next = sanitize_redirect_target(next, "/");
     let action = format!("{action_path}?next={}", url_encode(&next));
     format!(
-        "<form method=\"post\" action=\"{}\"><button type=\"submit\">{}</button></form>",
+        "<span class=\"action\"><form method=\"post\" action=\"{}\"><button type=\"submit\">{}</button></form></span>",
         html_escape(&action),
         html_escape(label)
+    )
+}
+
+fn action_button_html(action_path: &str, next: &str, label: &str, state: &ActionState) -> String {
+    if state.enabled {
+        return enabled_action_form_html(action_path, next, label);
+    }
+
+    let reason = state.reason.as_deref().unwrap_or("unavailable");
+    format!(
+        "<span class=\"action\"><button type=\"button\" disabled title=\"{}\">{}</button><span class=\"action-note\">{}</span></span>",
+        html_escape(reason),
+        html_escape(label),
+        html_escape(reason),
     )
 }
 
@@ -731,6 +844,7 @@ fn load_dashboard_apps() -> Result<Vec<DashboardApp>, String> {
     let rows = observability_commands::ps_rows()?;
     let mut apps = Vec::with_capacity(rows.len());
     for row in rows {
+        let metadata = app_metadata(&row.app)?;
         let status = sqlite_store::get_app_status(&row.app)?;
         let runtime = sqlite_store::get_app_runtime_state(&row.app)?;
         let health = app_health_for_row(&row);
@@ -746,6 +860,8 @@ fn load_dashboard_apps() -> Result<Vec<DashboardApp>, String> {
             } else {
                 "unhealthy".to_string()
             },
+            source_kind: metadata.source_kind,
+            stack: metadata.stack,
             phase: status
                 .as_ref()
                 .map(|value| value.phase.clone())
@@ -763,6 +879,7 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
     let ps_row = observability_commands::ps_rows()?
         .into_iter()
         .find(|row| row.app == app);
+    let spec_row = sqlite_store::get_app_spec(app)?;
     let status_row = sqlite_store::get_app_status(app)?;
     let runtime_state = sqlite_store::get_app_runtime_state(app)?;
     let deploy_history = sqlite_store::list_deploy_history(app, 10)?;
@@ -772,6 +889,7 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
         .unwrap_or_else(|err| format!("tailscale status unavailable: {err}"));
 
     if ps_row.is_none()
+        && spec_row.is_none()
         && status_row.is_none()
         && runtime_state.is_none()
         && deploy_history.is_empty()
@@ -791,10 +909,24 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
             },
         ),
     };
-    let desired_state = control_plane::desired_state(app)
-        .unwrap_or(control_plane::DesiredState::Running)
-        .as_str()
-        .to_string();
+    let metadata = app_metadata_from_spec(app, spec_row.as_ref());
+    let desired_state = spec_row
+        .as_ref()
+        .map(|row| row.desired_state.clone())
+        .unwrap_or_else(|| control_plane::DesiredState::Running.as_str().to_string());
+    let active_instance = status_row
+        .as_ref()
+        .and_then(|value| value.active_instance.clone())
+        .or_else(|| {
+            runtime_state
+                .as_ref()
+                .map(|value| value.active_instance.clone())
+        });
+    let actions = app_actions(
+        app_status_kind(&status),
+        active_instance.is_some(),
+        tailscale_status_kind(&tailscale),
+    );
 
     Ok(Some(AppDetail {
         app: app.to_string(),
@@ -804,14 +936,7 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
             .as_ref()
             .map(|value| value.phase.clone())
             .unwrap_or_else(|| "-".to_string()),
-        active_instance: status_row
-            .as_ref()
-            .and_then(|value| value.active_instance.clone())
-            .or_else(|| {
-                runtime_state
-                    .as_ref()
-                    .map(|value| value.active_instance.clone())
-            }),
+        active_instance,
         candidate_instance: status_row
             .as_ref()
             .and_then(|value| value.candidate_instance.clone()),
@@ -830,11 +955,155 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
             .as_ref()
             .and_then(|value| value.candidate_revision.clone()),
         runtime_project: runtime_state.and_then(|value| value.runtime_project),
+        generation: metadata.generation,
+        source_kind: metadata.source_kind,
+        stack: metadata.stack,
         health,
         deploy_history,
         logs,
         tailscale,
+        actions,
     }))
+}
+
+fn app_metadata(app: &str) -> Result<AppMetadata, String> {
+    let spec_row = sqlite_store::get_app_spec(app)?;
+    Ok(app_metadata_from_spec(app, spec_row.as_ref()))
+}
+
+fn app_metadata_from_spec(app: &str, spec_row: Option<&sqlite_store::AppSpecRow>) -> AppMetadata {
+    AppMetadata {
+        generation: spec_row.map(|row| row.generation),
+        source_kind: spec_row.map(|row| source_kind_label(&row.source_kind).to_string()),
+        stack: detect_app_stack(app, spec_row.map(|row| row.source_kind.as_str())),
+    }
+}
+
+fn source_kind_label(kind: &str) -> &str {
+    match kind {
+        "tar-stdin" => "push",
+        _ => kind,
+    }
+}
+
+fn detect_app_stack(app: &str, source_kind: Option<&str>) -> Option<String> {
+    for dir in app_source_dirs(app, source_kind) {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some(stack) = detect_stack_in_dir(&dir) {
+            return Some(stack);
+        }
+    }
+    None
+}
+
+fn app_source_dirs(app: &str, source_kind: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let push_dir = super::home_dir().join(app);
+    let git_dir = super::builds_dir().join(app);
+
+    match source_kind {
+        Some("tar-stdin") => {
+            dirs.push(push_dir);
+            dirs.push(git_dir);
+        }
+        Some("git") => {
+            dirs.push(git_dir);
+            dirs.push(push_dir);
+        }
+        _ => {
+            dirs.push(push_dir);
+            dirs.push(git_dir);
+        }
+    }
+
+    dirs
+}
+
+fn detect_stack_in_dir(dir: &Path) -> Option<String> {
+    let uses_custom_stack = dir.join("psht-stack.sh").exists();
+    match detect::detect(dir) {
+        Ok(config) if uses_custom_stack => Some(format!("custom ({})", config.stack())),
+        Ok(config) => Some(config.stack().to_string()),
+        Err(_) if uses_custom_stack => Some("custom".to_string()),
+        Err(_) => None,
+    }
+}
+
+fn app_status_kind(status: &str) -> AppStatusKind {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "running" => AppStatusKind::Running,
+        "down" => AppStatusKind::Down,
+        "stopped" => AppStatusKind::Stopped,
+        _ => AppStatusKind::Missing,
+    }
+}
+
+fn tailscale_status_kind(summary: &str) -> TailscaleStatusKind {
+    if summary.starts_with("tailscale status unavailable:") {
+        return TailscaleStatusKind::Unavailable;
+    }
+    if summary.contains("State: Running")
+        && summary.contains("Online: yes")
+        && !summary.contains("\nHealth:")
+        && !summary.contains("\nRepair:")
+    {
+        return TailscaleStatusKind::Healthy;
+    }
+    TailscaleStatusKind::Unhealthy
+}
+
+fn app_actions(
+    status: AppStatusKind,
+    has_active_instance: bool,
+    tailscale: TailscaleStatusKind,
+) -> AppActions {
+    let missing = ActionState::disabled("app missing");
+    let stopped = ActionState::disabled("already stopped");
+
+    let start = match status {
+        AppStatusKind::Running => ActionState::disabled("already running"),
+        AppStatusKind::Missing => missing.clone(),
+        AppStatusKind::Down | AppStatusKind::Stopped => ActionState::enabled(),
+    };
+    let stop = match status {
+        AppStatusKind::Running | AppStatusKind::Down => ActionState::enabled(),
+        AppStatusKind::Stopped => stopped.clone(),
+        AppStatusKind::Missing => missing.clone(),
+    };
+    let restart = match status {
+        AppStatusKind::Running | AppStatusKind::Down => ActionState::enabled(),
+        AppStatusKind::Stopped => stopped,
+        AppStatusKind::Missing => missing.clone(),
+    };
+    let tailscale_up = if matches!(status, AppStatusKind::Missing) {
+        ActionState::disabled("app missing")
+    } else if !has_active_instance {
+        ActionState::disabled("start the app first")
+    } else if matches!(tailscale, TailscaleStatusKind::Healthy) {
+        ActionState::disabled("tailscale already healthy")
+    } else {
+        ActionState::enabled()
+    };
+    let tailscale_down = if matches!(status, AppStatusKind::Missing) {
+        ActionState::disabled("app missing")
+    } else if !has_active_instance {
+        ActionState::disabled("start the app first")
+    } else if matches!(tailscale, TailscaleStatusKind::Healthy) {
+        ActionState::enabled()
+    } else {
+        ActionState::disabled("use tailscale up")
+    };
+
+    AppActions {
+        start,
+        stop,
+        restart,
+        destroy: ActionState::enabled(),
+        tailscale_up,
+        tailscale_down,
+    }
 }
 
 fn app_health_for_row(row: &PsRow) -> AppHealthReport {
@@ -962,6 +1231,7 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parse_query_string_decodes_values() {
@@ -995,5 +1265,110 @@ mod tests {
     fn path_segments_ignore_empty_pieces() {
         assert_eq!(path_segments("/apps/demo/"), vec!["apps", "demo"]);
         assert!(path_segments("/").is_empty());
+    }
+
+    #[test]
+    fn app_actions_disable_start_when_running() {
+        let actions = app_actions(AppStatusKind::Running, true, TailscaleStatusKind::Healthy);
+
+        assert_eq!(actions.start, ActionState::disabled("already running"));
+        assert_eq!(actions.stop, ActionState::enabled());
+        assert_eq!(actions.restart, ActionState::enabled());
+        assert_eq!(
+            actions.tailscale_up,
+            ActionState::disabled("tailscale already healthy")
+        );
+        assert_eq!(actions.tailscale_down, ActionState::enabled());
+    }
+
+    #[test]
+    fn app_actions_require_start_before_tailscale_when_stopped() {
+        let actions = app_actions(
+            AppStatusKind::Stopped,
+            false,
+            TailscaleStatusKind::Unavailable,
+        );
+
+        assert_eq!(actions.start, ActionState::enabled());
+        assert_eq!(actions.stop, ActionState::disabled("already stopped"));
+        assert_eq!(actions.restart, ActionState::disabled("already stopped"));
+        assert_eq!(
+            actions.tailscale_up,
+            ActionState::disabled("start the app first")
+        );
+        assert_eq!(
+            actions.tailscale_down,
+            ActionState::disabled("start the app first")
+        );
+    }
+
+    #[test]
+    fn app_actions_keep_destroy_enabled_when_missing() {
+        let actions = app_actions(
+            AppStatusKind::Missing,
+            false,
+            TailscaleStatusKind::Unavailable,
+        );
+
+        assert_eq!(actions.start, ActionState::disabled("app missing"));
+        assert_eq!(actions.stop, ActionState::disabled("app missing"));
+        assert_eq!(actions.restart, ActionState::disabled("app missing"));
+        assert_eq!(actions.destroy, ActionState::enabled());
+        assert_eq!(actions.tailscale_up, ActionState::disabled("app missing"));
+        assert_eq!(actions.tailscale_down, ActionState::disabled("app missing"));
+    }
+
+    #[test]
+    fn app_actions_enable_tailscale_up_when_running_but_unhealthy() {
+        let actions = app_actions(AppStatusKind::Down, true, TailscaleStatusKind::Unhealthy);
+
+        assert_eq!(actions.start, ActionState::enabled());
+        assert_eq!(actions.stop, ActionState::enabled());
+        assert_eq!(actions.restart, ActionState::enabled());
+        assert_eq!(actions.tailscale_up, ActionState::enabled());
+        assert_eq!(
+            actions.tailscale_down,
+            ActionState::disabled("use tailscale up")
+        );
+    }
+
+    #[test]
+    fn action_button_html_renders_disabled_reason() {
+        let html = action_button_html(
+            "/apps/demo/start",
+            "/apps/demo",
+            "Start",
+            &ActionState::disabled("already running"),
+        );
+
+        assert!(html.contains("disabled"));
+        assert!(html.contains("already running"));
+        assert!(!html.contains("method=\"post\""));
+    }
+
+    #[test]
+    fn detect_stack_in_dir_reports_detected_stack() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        assert_eq!(detect_stack_in_dir(tmp.path()).as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn detect_stack_in_dir_marks_custom_stack() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("index.html"), "<!doctype html>\n").unwrap();
+        fs::write(tmp.path().join("psht-stack.sh"), "#!/bin/sh\n").unwrap();
+
+        assert_eq!(
+            detect_stack_in_dir(tmp.path()).as_deref(),
+            Some("custom (static)")
+        );
     }
 }

@@ -3742,13 +3742,17 @@ fn run_hook(app: &str, phase: &str, command: Option<&str>) -> Result<(), String>
     container::exec_cmd_rolling(app, &command, 5).map_err(|e| format!("{phase} hook failed: {e}"))
 }
 
-fn apt_install_command(packages: &[String]) -> Option<String> {
-    let packages: Vec<String> = packages
+fn normalized_apt_packages(packages: &[String]) -> Vec<String> {
+    packages
         .iter()
         .map(|pkg| pkg.trim())
         .filter(|pkg| !pkg.is_empty())
         .map(ToString::to_string)
-        .collect();
+        .collect()
+}
+
+fn apt_install_command(packages: &[String]) -> Option<String> {
+    let packages = normalized_apt_packages(packages);
     if packages.is_empty() {
         return None;
     }
@@ -3779,12 +3783,93 @@ exit "$status""#
     ))
 }
 
+fn extract_missing_apt_packages(text: &str) -> Vec<String> {
+    let mut missing = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for line in text.lines().map(str::trim) {
+        let candidate = if let Some(pkg) = line
+            .strip_prefix("E: Unable to locate package ")
+            .or_else(|| line.strip_prefix("N: Unable to locate package "))
+        {
+            Some(pkg.trim())
+        } else if let Some(rest) = line.strip_prefix("E: Package ") {
+            if let Some(pkg) = rest
+                .strip_prefix('\'')
+                .and_then(|value| value.split_once('\''))
+                .map(|(pkg, _)| pkg.trim())
+            {
+                Some(pkg)
+            } else {
+                rest.strip_suffix(" has no installation candidate")
+                    .map(str::trim)
+            }
+        } else {
+            line.strip_prefix("Package ")
+                .and_then(|rest| {
+                    rest.strip_suffix(" is not available, but is referred to by another package.")
+                })
+                .map(str::trim)
+        };
+
+        let Some(pkg) = candidate else {
+            continue;
+        };
+        if pkg.is_empty() || !seen.insert(pkg.to_string()) {
+            continue;
+        }
+        missing.push(pkg.to_string());
+    }
+
+    missing
+}
+
+fn apt_policy_output_indicates_unavailable(policy_output: &str) -> bool {
+    let lowered = policy_output.to_ascii_lowercase();
+    lowered.contains("unable to locate package") || lowered.contains("candidate: (none)")
+}
+
+fn diagnose_unavailable_apt_packages(app: &str, packages: &[String]) -> Vec<String> {
+    let mut missing = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for package in normalized_apt_packages(packages) {
+        let command = format!("apt-cache policy {} 2>&1 || true", shell_quote(&package));
+        let Ok(output) = container::exec_output(app, &command) else {
+            continue;
+        };
+        if !apt_policy_output_indicates_unavailable(&output) {
+            continue;
+        }
+        if seen.insert(package.clone()) {
+            missing.push(package);
+        }
+    }
+
+    missing
+}
+
 fn install_apt_packages(app: &str, packages: &[String]) -> Result<(), String> {
     let Some(command) = apt_install_command(packages) else {
         return Ok(());
     };
     eprintln!("-----> Installing apt packages");
-    run_install_command_with_logging(app, &command, "apt package install")
+    match run_install_command_with_logging(app, &command, "apt package install") {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let mut unavailable = extract_missing_apt_packages(&err);
+            if unavailable.is_empty() {
+                unavailable = diagnose_unavailable_apt_packages(app, packages);
+            }
+
+            let mut message = err;
+            if !unavailable.is_empty() {
+                message.push_str("\nUnavailable apt package(s) in the current base image: ");
+                message.push_str(&unavailable.join(", "));
+            }
+            Err(message)
+        }
+    }
 }
 
 fn blocking_op_age_secs(seen_at: &HashMap<String, Instant>, op_id: &str) -> u64 {
@@ -6511,6 +6596,35 @@ devices:
         assert!(cmd.contains("apt-get install -y"));
         assert!(cmd.contains("'curl'"));
         assert!(cmd.contains("'libssl-dev'"));
+    }
+
+    #[test]
+    fn extract_missing_apt_packages_parses_common_resolution_errors() {
+        let missing = extract_missing_apt_packages(
+            "Package chromium-browser is not available, but is referred to by another package.\nE: Unable to locate package foo-dev\nE: Package 'bar' has no installation candidate\nE: Package baz has no installation candidate\n",
+        );
+        assert_eq!(
+            missing,
+            vec![
+                "chromium-browser".to_string(),
+                "foo-dev".to_string(),
+                "bar".to_string(),
+                "baz".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn apt_policy_output_indicates_unavailable_handles_missing_candidates() {
+        assert!(apt_policy_output_indicates_unavailable(
+            "chromium-browser:\n  Installed: (none)\n  Candidate: (none)\n"
+        ));
+        assert!(apt_policy_output_indicates_unavailable(
+            "N: Unable to locate package chromium-browser"
+        ));
+        assert!(!apt_policy_output_indicates_unavailable(
+            "curl:\n  Installed: (none)\n  Candidate: 8.5.0\n"
+        ));
     }
 
     #[test]
