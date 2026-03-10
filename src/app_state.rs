@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::app_name;
 use crate::container;
 use crate::control_plane::{self, AppRuntimeState, DesiredState, RuntimeSnapshot};
 use crate::runtime_graph;
@@ -55,6 +56,53 @@ pub fn clear_app_runtime_state(app: &str) -> Result<(), String> {
 
 pub fn read_all_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
     control_plane::read_all_app_runtime_states()
+}
+
+fn transient_runtime_state_references_existing_instance<E>(
+    state: &AppRuntimeState,
+    exists_instance: &E,
+) -> bool
+where
+    E: Fn(&str) -> bool,
+{
+    app_ref_from_instance_name(&state.active_instance)
+        .as_deref()
+        .is_some_and(exists_instance)
+        || state
+            .previous_instance
+            .as_deref()
+            .and_then(app_ref_from_instance_name)
+            .as_deref()
+            .is_some_and(exists_instance)
+}
+
+fn managed_runtime_states_with<E, C>(
+    states: Vec<(String, AppRuntimeState)>,
+    exists_instance: E,
+    mut clear_state: C,
+) -> Result<Vec<(String, AppRuntimeState)>, String>
+where
+    E: Fn(&str) -> bool,
+    C: FnMut(&str) -> Result<(), String>,
+{
+    let mut managed = Vec::with_capacity(states.len());
+    for (app, state) in states {
+        if app_name::is_transient_deploy_app_name(&app) {
+            // Drop leaked transient rows once neither recorded instance still exists.
+            if !transient_runtime_state_references_existing_instance(&state, &exists_instance) {
+                clear_state(&app)?;
+            }
+            continue;
+        }
+        managed.push((app, state));
+    }
+    Ok(managed)
+}
+
+pub fn read_managed_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
+    managed_runtime_states_with(read_all_app_runtime_states()?, container::exists, |app| {
+        clear_app_runtime_state(app)
+    })
 }
 
 pub fn resolve_active_app_ref(app: &str) -> Result<Option<String>, String> {
@@ -143,5 +191,72 @@ mod tests {
     fn instance_name_from_app_ref_prefixes_plain_names() {
         assert_eq!(instance_name_from_app_ref("demo"), "psht-demo");
         assert_eq!(instance_name_from_app_ref("psht-demo"), "psht-demo");
+    }
+
+    #[test]
+    fn managed_runtime_states_skip_transient_apps_and_clear_stale_ones() {
+        let mut cleared = Vec::new();
+        let states = vec![
+            (
+                "hyperlinked".to_string(),
+                AppRuntimeState {
+                    active_instance: "psht-hyperlinked-build-100".to_string(),
+                    previous_instance: None,
+                    runtime_project: Some("user-1000".to_string()),
+                    updated_at: 1,
+                },
+            ),
+            (
+                "hyperlinked-build-100".to_string(),
+                AppRuntimeState {
+                    active_instance: "psht-hyperlinked-build-100".to_string(),
+                    previous_instance: Some("psht-hyperlinked-prev-99".to_string()),
+                    runtime_project: Some("user-1000".to_string()),
+                    updated_at: 1,
+                },
+            ),
+        ];
+
+        let managed = managed_runtime_states_with(
+            states,
+            |_| false,
+            |app| {
+                cleared.push(app.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].0, "hyperlinked");
+        assert_eq!(cleared, vec!["hyperlinked-build-100".to_string()]);
+    }
+
+    #[test]
+    fn managed_runtime_states_keep_transient_apps_with_live_instances() {
+        let mut cleared = Vec::new();
+        let transient = "hyperlinked-build-100".to_string();
+        let states = vec![(
+            transient.clone(),
+            AppRuntimeState {
+                active_instance: "psht-hyperlinked-build-100".to_string(),
+                previous_instance: None,
+                runtime_project: Some("user-1000".to_string()),
+                updated_at: 1,
+            },
+        )];
+
+        let managed = managed_runtime_states_with(
+            states,
+            |app| app == "hyperlinked-build-100",
+            |app| {
+                cleared.push(app.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(managed.is_empty());
+        assert!(cleared.is_empty());
     }
 }

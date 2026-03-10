@@ -144,9 +144,9 @@ use self::deploy_commands::{
 };
 #[cfg(test)]
 use self::observability_commands::{
-    PsContainerState, canonical_app_name_from_container, check_app_health, has_deploy_suffix,
-    is_transient_deploy_app_name, normalize_candidate_app_ref, ps_container_state,
-    ps_status_from_parts, should_delegate_health_to_psht,
+    PsContainerState, app_targets_from_runtime_state, canonical_app_name_from_container,
+    check_app_health, is_transient_deploy_app_name, normalize_candidate_app_ref,
+    ps_container_state, ps_status_from_parts, should_delegate_health_to_psht,
 };
 
 fn home_dir() -> PathBuf {
@@ -2670,8 +2670,8 @@ fn clear_app_runtime_state(app: &str) -> Result<(), String> {
     app_state::clear_app_runtime_state(app)
 }
 
-fn read_all_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
-    app_state::read_all_app_runtime_states()
+fn read_managed_app_runtime_states() -> Result<Vec<(String, AppRuntimeState)>, String> {
+    app_state::read_managed_app_runtime_states()
 }
 
 fn resolve_active_app_ref(app: &str) -> Result<Option<String>, String> {
@@ -6282,15 +6282,6 @@ devices:
     }
 
     #[test]
-    fn has_deploy_suffix_requires_numeric_suffix() {
-        assert!(has_deploy_suffix("demo-build-1772425113", "-build-"));
-        assert!(has_deploy_suffix("demo-prev-1772425113", "-prev-"));
-        assert!(has_deploy_suffix("demo-failed-1772425113", "-failed-"));
-        assert!(!has_deploy_suffix("demo-build-next", "-build-"));
-        assert!(!has_deploy_suffix("demo-build-", "-build-"));
-    }
-
-    #[test]
     fn transient_deploy_app_names_are_detected() {
         assert!(is_transient_deploy_app_name("hyperlinked-build-1772425113"));
         assert!(is_transient_deploy_app_name("hyperlinked-prev-1772425113"));
@@ -6370,6 +6361,52 @@ devices:
         assert!(loaded.runtime_project.as_deref().is_some());
         assert!(loaded.updated_at > 0);
         clear_app_runtime_state(&app).unwrap();
+    }
+
+    #[test]
+    fn managed_runtime_state_reader_prunes_stale_transient_rows() {
+        let app = unique_test_app("managed-runtime");
+        let transient_app = format!("{app}-build-1773093670739");
+        write_app_runtime_state(&app, &format!("{app}-build-100"), None).unwrap();
+        write_app_runtime_state(&transient_app, &transient_app, None).unwrap();
+
+        let managed = read_managed_app_runtime_states().unwrap();
+
+        assert!(managed.iter().any(|(managed_app, _)| managed_app == &app));
+        assert!(
+            !managed
+                .iter()
+                .any(|(managed_app, _)| managed_app == &transient_app)
+        );
+        assert!(read_app_runtime_state(&transient_app).unwrap().is_none());
+
+        clear_app_runtime_state(&app).unwrap();
+    }
+
+    #[test]
+    fn app_targets_ignore_stale_transient_runtime_rows() {
+        let app = unique_test_app("health-targets");
+        let transient_app = format!("{app}-build-1773093670739");
+        write_app_runtime_state(&transient_app, &transient_app, None).unwrap();
+
+        let targets = app_targets_from_runtime_state(&[container::ContainerInfo {
+            name: format!("psht-{app}"),
+            status: "Running".to_string(),
+        }])
+        .unwrap();
+
+        let canonical = targets
+            .iter()
+            .find(|(target_app, _, _)| target_app == &app)
+            .expect("canonical app target should be present");
+        assert_eq!(canonical.1.as_deref(), Some(app.as_str()));
+        assert_eq!(canonical.2, "Running");
+        assert!(
+            !targets
+                .iter()
+                .any(|(target_app, _, _)| target_app == &transient_app)
+        );
+        assert!(read_app_runtime_state(&transient_app).unwrap().is_none());
     }
 
     #[test]

@@ -104,17 +104,8 @@ pub(super) struct AppHealthReport {
     pub(super) details: Vec<String>,
 }
 
-pub(super) fn has_deploy_suffix(app: &str, marker: &str) -> bool {
-    let Some((base, suffix)) = app.rsplit_once(marker) else {
-        return false;
-    };
-    !base.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
-}
-
 pub(super) fn is_transient_deploy_app_name(app: &str) -> bool {
-    has_deploy_suffix(app, "-build-")
-        || has_deploy_suffix(app, "-prev-")
-        || has_deploy_suffix(app, "-failed-")
+    app_name::is_transient_deploy_app_name(app)
 }
 
 pub(super) fn canonical_app_name_from_container(container_name: &str) -> Option<String> {
@@ -125,7 +116,7 @@ pub(super) fn canonical_app_name_from_container(container_name: &str) -> Option<
     Some(app.to_string())
 }
 
-fn app_targets_from_runtime_state(
+pub(super) fn app_targets_from_runtime_state(
     containers: &[container::ContainerInfo],
 ) -> Result<Vec<(String, Option<String>, String)>, String> {
     let mut status_by_name = BTreeMap::new();
@@ -134,7 +125,7 @@ fn app_targets_from_runtime_state(
     }
 
     let mut targets: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
-    for (app, state) in read_all_app_runtime_states()? {
+    for (app, state) in read_managed_app_runtime_states()? {
         let mut active_app_ref = app_ref_from_instance_name(&state.active_instance);
         if active_app_ref.is_none() {
             active_app_ref = resolve_active_app_ref(&app)?;

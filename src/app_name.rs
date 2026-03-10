@@ -28,6 +28,21 @@ pub fn validate_app_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
+pub fn has_deploy_suffix(name: &str, marker: &str) -> bool {
+    let Some((base, suffix)) = name.rsplit_once(marker) else {
+        return false;
+    };
+    !base.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+}
+
+#[allow(dead_code)]
+pub fn is_transient_deploy_app_name(name: &str) -> bool {
+    has_deploy_suffix(name, "-build-")
+        || has_deploy_suffix(name, "-prev-")
+        || has_deploy_suffix(name, "-failed-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +82,25 @@ mod tests {
                 "expected invalid app name: {name}"
             );
         }
+    }
+
+    #[test]
+    fn deploy_suffix_requires_numeric_suffix() {
+        assert!(has_deploy_suffix("demo-build-1772425113", "-build-"));
+        assert!(has_deploy_suffix("demo-prev-1772425113", "-prev-"));
+        assert!(has_deploy_suffix("demo-failed-1772425113", "-failed-"));
+        assert!(!has_deploy_suffix("demo-build-next", "-build-"));
+        assert!(!has_deploy_suffix("demo-build-", "-build-"));
+    }
+
+    #[test]
+    fn transient_deploy_app_names_are_detected() {
+        assert!(is_transient_deploy_app_name("hyperlinked-build-1772425113"));
+        assert!(is_transient_deploy_app_name("hyperlinked-prev-1772425113"));
+        assert!(is_transient_deploy_app_name(
+            "hyperlinked-failed-1772425113"
+        ));
+        assert!(!is_transient_deploy_app_name("hyperlinked-build-cache"));
+        assert!(!is_transient_deploy_app_name("hyperlinked"));
     }
 }

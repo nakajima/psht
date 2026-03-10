@@ -1008,7 +1008,7 @@ pub fn daemon() -> Result<(), String> {
 }
 
 pub fn supervise() -> Result<(), String> {
-    let states = read_all_app_runtime_states()?;
+    let states = read_managed_app_runtime_states()?;
     if states.is_empty() {
         return Ok(());
     }
