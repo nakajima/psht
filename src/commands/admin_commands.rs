@@ -992,6 +992,21 @@ fn enforce_supervised_app_stopped(app: &str, project: &str) -> Result<(), String
     reconcile_family_instances_strict(app, &keep, project)
 }
 
+fn repair_phase_after_supervise(
+    app: &str,
+    converged: bool,
+    repair_error: Option<&str>,
+) -> Result<(), String> {
+    let _ = crate::control_plane::repair_stale_phase(
+        app,
+        control_plane_snapshot(app),
+        converged,
+        repair_error,
+        (reconcile_lease_ttl_secs() * 1_000) as i64,
+    )?;
+    Ok(())
+}
+
 pub fn daemon() -> Result<(), String> {
     let lock_path = deploy_lock_path(SUPERVISE_DAEMON_LOCK_APP);
     let Some(_guard) = try_acquire_deploy_lock_at(&lock_path)? else {
@@ -1041,6 +1056,13 @@ pub fn supervise() -> Result<(), String> {
         } else {
             enforce_supervised_app_running(&app, &project)
         };
+        if let Err(err) = repair_phase_after_supervise(
+            &app,
+            result.is_ok(),
+            result.as_ref().err().map(|err| err.as_str()),
+        ) {
+            eprintln!("       Warning: failed to repair stale phase for {app}: {err}");
+        }
         if let Err(err) = result {
             eprintln!("       Warning: supervise reconciliation failed for {app}: {err}");
             failures.push(format!("{app}: {err}"));

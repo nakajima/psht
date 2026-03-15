@@ -33,6 +33,7 @@ pub struct AppStatusRow {
     pub health_json: String,
     pub last_error_json: Option<String>,
     pub recovery_actions_json: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +125,17 @@ pub struct ReconcileAttemptRow {
     pub finished_at_ms: Option<i64>,
     pub result: String,
     pub detail_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileCheckpointRow {
+    pub app_id: String,
+    pub generation: i64,
+    pub plan_hash: String,
+    pub op_index: i64,
+    pub op_name: String,
+    pub last_result_json: Option<String>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,7 +511,7 @@ pub fn get_app_status(app_id: &str) -> Result<Option<AppStatusRow>, String> {
     let conn = open_connection()?;
     conn.query_row(
         "SELECT app_id, observed_generation, phase, active_instance, candidate_instance, previous_instance,
-                active_revision, candidate_revision, health_json, last_error_json, recovery_actions_json
+                active_revision, candidate_revision, health_json, last_error_json, recovery_actions_json, updated_at_ms
          FROM app_status WHERE app_id = ?1",
         params![app_id],
         |row| {
@@ -515,11 +527,34 @@ pub fn get_app_status(app_id: &str) -> Result<Option<AppStatusRow>, String> {
                 health_json: row.get(8)?,
                 last_error_json: row.get(9)?,
                 recovery_actions_json: row.get(10)?,
+                updated_at_ms: row.get(11)?,
             })
         },
     )
     .optional()
     .map_err(|e| format!("failed to read app status for {app_id}: {e}"))
+}
+
+pub fn get_reconcile_checkpoint(app_id: &str) -> Result<Option<ReconcileCheckpointRow>, String> {
+    let conn = open_connection()?;
+    conn.query_row(
+        "SELECT app_id, generation, plan_hash, op_index, op_name, last_result_json, updated_at_ms
+         FROM reconcile_checkpoints WHERE app_id = ?1",
+        params![app_id],
+        |row| {
+            Ok(ReconcileCheckpointRow {
+                app_id: row.get(0)?,
+                generation: row.get(1)?,
+                plan_hash: row.get(2)?,
+                op_index: row.get(3)?,
+                op_name: row.get(4)?,
+                last_result_json: row.get(5)?,
+                updated_at_ms: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| format!("failed to read reconcile checkpoint for {app_id}: {e}"))
 }
 
 pub fn insert_deploy_intent(row: &DeployIntentRow) -> Result<(), String> {
@@ -1375,11 +1410,13 @@ mod tests {
             health_json: "{\"healthy\":true}".to_string(),
             last_error_json: None,
             recovery_actions_json: "[]".to_string(),
+            updated_at_ms: 0,
         })
         .unwrap();
         let status = get_app_status(&app).unwrap().unwrap();
         assert_eq!(status.phase, "Idle");
         assert_eq!(status.active_revision.as_deref(), Some("abc"));
+        assert!(status.updated_at_ms > 0);
     }
 
     #[test]
@@ -1553,5 +1590,20 @@ mod tests {
             detail_json: "{\"ops\":1}".to_string(),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn reconcile_checkpoint_round_trip() {
+        let app = unique_app("sqlite-checkpoint");
+        upsert_reconcile_checkpoint(&app, 7, "plan-1", 2, "wait-for-operation", Some("{}"))
+            .unwrap();
+
+        let checkpoint = get_reconcile_checkpoint(&app).unwrap().unwrap();
+        assert_eq!(checkpoint.generation, 7);
+        assert_eq!(checkpoint.op_name, "wait-for-operation");
+        assert!(checkpoint.updated_at_ms > 0);
+
+        clear_reconcile_checkpoint(&app).unwrap();
+        assert!(get_reconcile_checkpoint(&app).unwrap().is_none());
     }
 }

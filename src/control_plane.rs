@@ -48,6 +48,16 @@ impl AppPhase {
             Self::Degraded => "Degraded",
         }
     }
+
+    fn from_persisted(raw: &str) -> Option<Self> {
+        match raw {
+            "Idle" => Some(Self::Idle),
+            "Reconciling" => Some(Self::Reconciling),
+            "Blocked" => Some(Self::Blocked),
+            "Degraded" => Some(Self::Degraded),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -159,6 +169,13 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn sqlite_i64_to_u64(value: i64, app: &str, field: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| {
         format!("invalid sqlite value for {field} in app '{app}': expected non-negative integer")
@@ -202,7 +219,16 @@ fn upsert_status(status: &AppStatus) -> Result<(), String> {
             .map(|error| serialize_json(error, "error report"))
             .transpose()?,
         recovery_actions_json: serialize_json(&status.recovery_actions, "recovery actions")?,
+        updated_at_ms: 0,
     })
+}
+
+fn degraded_recovery_actions() -> Vec<String> {
+    vec![
+        "inspect deploy logs".to_string(),
+        "run `psht health`".to_string(),
+        "retry deploy".to_string(),
+    ]
 }
 
 pub fn read_app_runtime_state(app: &str) -> Result<Option<AppRuntimeState>, String> {
@@ -387,11 +413,7 @@ pub fn complete_reconcile_intent(
             AppPhase::Degraded,
             Some(ErrorReport::with_generation(err, ctx.generation)),
             HealthState::unhealthy(),
-            vec![
-                "inspect deploy logs".to_string(),
-                "run `psht health`".to_string(),
-                "retry deploy".to_string(),
-            ],
+            degraded_recovery_actions(),
             "failed".to_string(),
             err.to_string(),
         ),
@@ -436,9 +458,173 @@ pub fn complete_reconcile_intent(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhaseRepairDecision {
+    phase: AppPhase,
+    health: HealthState,
+    last_error: Option<ErrorReport>,
+    recovery_actions: Vec<String>,
+    clear_checkpoint: bool,
+}
+
+fn stale_reconcile_error(
+    checkpoint: Option<&sqlite_store::ReconcileCheckpointRow>,
+    repair_error: Option<&str>,
+) -> String {
+    let base = match checkpoint {
+        Some(checkpoint) => format!(
+            "reconcile stalled without an active lease at step '{}'",
+            checkpoint.op_name
+        ),
+        None => "reconcile stalled without an active lease".to_string(),
+    };
+    match repair_error {
+        Some(err) if !err.trim().is_empty() => format!("{base}: {err}"),
+        _ => base,
+    }
+}
+
+fn phase_repair_decision(
+    now_ms: i64,
+    status: &sqlite_store::AppStatusRow,
+    checkpoint: Option<&sqlite_store::ReconcileCheckpointRow>,
+    lease: Option<&sqlite_store::AppLeaseRow>,
+    converged: bool,
+    repair_error: Option<&str>,
+    stale_after_ms: i64,
+) -> Option<PhaseRepairDecision> {
+    let phase = AppPhase::from_persisted(&status.phase)?;
+    if lease.is_some_and(|lease| lease.expires_at_ms > now_ms) {
+        return None;
+    }
+
+    if phase == AppPhase::Degraded {
+        return converged.then(|| PhaseRepairDecision {
+            phase: AppPhase::Idle,
+            health: HealthState::healthy(),
+            last_error: None,
+            recovery_actions: Vec::new(),
+            clear_checkpoint: true,
+        });
+    }
+
+    if !matches!(phase, AppPhase::Reconciling | AppPhase::Blocked) {
+        return None;
+    }
+
+    let last_update_ms = checkpoint
+        .map(|checkpoint| checkpoint.updated_at_ms)
+        .unwrap_or(status.updated_at_ms)
+        .max(status.updated_at_ms);
+    if now_ms < last_update_ms.saturating_add(stale_after_ms.max(0)) {
+        return None;
+    }
+
+    if converged {
+        return Some(PhaseRepairDecision {
+            phase: AppPhase::Idle,
+            health: HealthState::healthy(),
+            last_error: None,
+            recovery_actions: Vec::new(),
+            clear_checkpoint: true,
+        });
+    }
+
+    Some(PhaseRepairDecision {
+        phase: AppPhase::Degraded,
+        health: HealthState::unhealthy(),
+        last_error: Some(ErrorReport::with_generation(
+            stale_reconcile_error(checkpoint, repair_error),
+            status.observed_generation,
+        )),
+        recovery_actions: degraded_recovery_actions(),
+        clear_checkpoint: false,
+    })
+}
+
+fn repair_stale_phase_at(
+    app: &str,
+    snapshot: RuntimeSnapshot,
+    converged: bool,
+    repair_error: Option<&str>,
+    stale_after_ms: i64,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let Some(status) = sqlite_store::get_app_status(app)? else {
+        return Ok(false);
+    };
+    let checkpoint = sqlite_store::get_reconcile_checkpoint(app)?;
+    let lease = sqlite_store::get_app_lease(app)?;
+    let Some(decision) = phase_repair_decision(
+        now_ms,
+        &status,
+        checkpoint.as_ref(),
+        lease.as_ref(),
+        converged,
+        repair_error,
+        stale_after_ms,
+    ) else {
+        return Ok(false);
+    };
+
+    upsert_status(&AppStatus {
+        app_id: app.to_string(),
+        observed_generation: status.observed_generation,
+        phase: decision.phase,
+        active_instance: snapshot.active_instance.or(status.active_instance.clone()),
+        candidate_instance: if decision.clear_checkpoint {
+            None
+        } else {
+            snapshot
+                .candidate_instance
+                .or(status.candidate_instance.clone())
+        },
+        previous_instance: snapshot.previous_instance.or(status.previous_instance.clone()),
+        active_revision: snapshot.active_revision.or(status.active_revision.clone()),
+        candidate_revision: if decision.clear_checkpoint {
+            None
+        } else {
+            snapshot
+                .candidate_revision
+                .or(status.candidate_revision.clone())
+        },
+        health: decision.health,
+        last_error: decision.last_error,
+        recovery_actions: decision.recovery_actions,
+    })?;
+
+    if decision.clear_checkpoint {
+        sqlite_store::clear_reconcile_checkpoint(app)?;
+    }
+
+    Ok(true)
+}
+
+pub fn repair_stale_phase(
+    app: &str,
+    snapshot: RuntimeSnapshot,
+    converged: bool,
+    repair_error: Option<&str>,
+    stale_after_ms: i64,
+) -> Result<bool, String> {
+    repair_stale_phase_at(
+        app,
+        snapshot,
+        converged,
+        repair_error,
+        stale_after_ms,
+        now_unix_ms(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite_store;
+
+    fn unique_app(prefix: &str) -> String {
+        format!("{prefix}-{}-{}", std::process::id(), now_unix_ms())
+    }
 
     #[test]
     fn desired_state_normalizes_unknown_values_to_running() {
@@ -459,6 +645,8 @@ mod tests {
         assert_eq!(AppPhase::Reconciling.as_str(), "Reconciling");
         assert_eq!(AppPhase::Blocked.as_str(), "Blocked");
         assert_eq!(AppPhase::Degraded.as_str(), "Degraded");
+        assert_eq!(AppPhase::from_persisted("Idle"), Some(AppPhase::Idle));
+        assert_eq!(AppPhase::from_persisted("weird"), None);
     }
 
     #[test]
@@ -469,5 +657,216 @@ mod tests {
             Some("reconciling")
         );
         assert_eq!(HealthState::blocked().reason.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn stale_reconciling_phase_repairs_to_idle_when_converged() {
+        let app = unique_app("phase-repair-idle");
+
+        sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+            app_id: app.clone(),
+            observed_generation: 7,
+            phase: AppPhase::Reconciling.as_str().to_string(),
+            active_instance: Some("psht-demo".to_string()),
+            candidate_instance: Some("psht-demo-build-1".to_string()),
+            previous_instance: None,
+            active_revision: Some("abc".to_string()),
+            candidate_revision: Some("def".to_string()),
+            health_json: "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string(),
+            last_error_json: None,
+            recovery_actions_json: "[]".to_string(),
+            updated_at_ms: 0,
+        })
+        .unwrap();
+        sqlite_store::upsert_reconcile_checkpoint(&app, 7, "plan-1", 3, "start", Some("{}"))
+            .unwrap();
+
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        let repaired = repair_stale_phase_at(
+            &app,
+            RuntimeSnapshot {
+                active_instance: Some("psht-demo".to_string()),
+                active_revision: Some("abc".to_string()),
+                ..RuntimeSnapshot::default()
+            },
+            true,
+            None,
+            50,
+            status.updated_at_ms + 100,
+        )
+        .unwrap();
+
+        assert!(repaired);
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        assert_eq!(status.phase, AppPhase::Idle.as_str());
+        assert!(status.candidate_instance.is_none());
+        assert!(sqlite_store::get_reconcile_checkpoint(&app).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_reconciling_phase_repairs_to_degraded_when_not_converged() {
+        let app = unique_app("phase-repair-degraded");
+
+        sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+            app_id: app.clone(),
+            observed_generation: 9,
+            phase: AppPhase::Reconciling.as_str().to_string(),
+            active_instance: Some("psht-demo".to_string()),
+            candidate_instance: Some("psht-demo-build-2".to_string()),
+            previous_instance: None,
+            active_revision: Some("abc".to_string()),
+            candidate_revision: Some("def".to_string()),
+            health_json: "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string(),
+            last_error_json: None,
+            recovery_actions_json: "[]".to_string(),
+            updated_at_ms: 0,
+        })
+        .unwrap();
+        sqlite_store::upsert_reconcile_checkpoint(
+            &app,
+            9,
+            "plan-2",
+            4,
+            "wait-for-operation",
+            Some("{}"),
+        )
+        .unwrap();
+
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        let repaired = repair_stale_phase_at(
+            &app,
+            RuntimeSnapshot::default(),
+            false,
+            Some("supervision could not recover app"),
+            50,
+            status.updated_at_ms + 100,
+        )
+        .unwrap();
+
+        assert!(repaired);
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        assert_eq!(status.phase, AppPhase::Degraded.as_str());
+        assert!(status.last_error_json.as_deref().unwrap().contains("wait-for-operation"));
+        assert!(
+            sqlite_store::get_reconcile_checkpoint(&app)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn degraded_phase_repairs_to_idle_when_converged() {
+        let app = unique_app("phase-repair-healed");
+
+        sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+            app_id: app.clone(),
+            observed_generation: 11,
+            phase: AppPhase::Degraded.as_str().to_string(),
+            active_instance: Some("psht-demo".to_string()),
+            candidate_instance: Some("psht-demo-build-3".to_string()),
+            previous_instance: None,
+            active_revision: Some("abc".to_string()),
+            candidate_revision: Some("def".to_string()),
+            health_json: "{\"healthy\":false}".to_string(),
+            last_error_json: Some("{\"error\":\"boom\"}".to_string()),
+            recovery_actions_json: "[\"retry\"]".to_string(),
+            updated_at_ms: 0,
+        })
+        .unwrap();
+        sqlite_store::upsert_reconcile_checkpoint(&app, 11, "plan-3", 999, "failed", Some("{}"))
+            .unwrap();
+
+        let repaired = repair_stale_phase_at(
+            &app,
+            RuntimeSnapshot {
+                active_instance: Some("psht-demo".to_string()),
+                active_revision: Some("abc".to_string()),
+                ..RuntimeSnapshot::default()
+            },
+            true,
+            None,
+            50,
+            now_unix_ms(),
+        )
+        .unwrap();
+
+        assert!(repaired);
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        assert_eq!(status.phase, AppPhase::Idle.as_str());
+        assert!(status.last_error_json.is_none());
+        assert!(sqlite_store::get_reconcile_checkpoint(&app).unwrap().is_none());
+    }
+
+    #[test]
+    fn recent_reconciling_phase_is_not_repaired_before_timeout() {
+        let app = unique_app("phase-repair-recent");
+
+        sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+            app_id: app.clone(),
+            observed_generation: 13,
+            phase: AppPhase::Reconciling.as_str().to_string(),
+            active_instance: Some("psht-demo".to_string()),
+            candidate_instance: None,
+            previous_instance: None,
+            active_revision: Some("abc".to_string()),
+            candidate_revision: None,
+            health_json: "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string(),
+            last_error_json: None,
+            recovery_actions_json: "[]".to_string(),
+            updated_at_ms: 0,
+        })
+        .unwrap();
+
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        let repaired = repair_stale_phase_at(
+            &app,
+            RuntimeSnapshot::default(),
+            true,
+            None,
+            1_000,
+            status.updated_at_ms + 100,
+        )
+        .unwrap();
+
+        assert!(!repaired);
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        assert_eq!(status.phase, AppPhase::Reconciling.as_str());
+    }
+
+    #[test]
+    fn live_lease_prevents_phase_repair() {
+        let app = unique_app("phase-repair-lease");
+
+        sqlite_store::upsert_app_status(&sqlite_store::AppStatusRow {
+            app_id: app.clone(),
+            observed_generation: 15,
+            phase: AppPhase::Reconciling.as_str().to_string(),
+            active_instance: Some("psht-demo".to_string()),
+            candidate_instance: Some("psht-demo-build-4".to_string()),
+            previous_instance: None,
+            active_revision: Some("abc".to_string()),
+            candidate_revision: Some("def".to_string()),
+            health_json: "{\"healthy\":false,\"reason\":\"reconciling\"}".to_string(),
+            last_error_json: None,
+            recovery_actions_json: "[]".to_string(),
+            updated_at_ms: 0,
+        })
+        .unwrap();
+        let lease = sqlite_store::acquire_app_lease(&app, "owner-a", "intent-a", 15, 5_000)
+            .unwrap();
+
+        let repaired = repair_stale_phase_at(
+            &app,
+            RuntimeSnapshot::default(),
+            true,
+            None,
+            0,
+            lease.expires_at_ms - 1,
+        )
+        .unwrap();
+
+        assert!(!repaired);
+        let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
+        assert_eq!(status.phase, AppPhase::Reconciling.as_str());
     }
 }
