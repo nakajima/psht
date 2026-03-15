@@ -792,6 +792,7 @@ fn failed_candidate_app_name(app: &str, deploy_id: &str) -> String {
     format!("{app}-failed-{deploy_id}")
 }
 
+const CANDIDATE_BUSY_RETRY_ATTEMPTS: usize = 3;
 const TAILSCALE_STATE_DIR_PATH: &str = "/var/lib/tailscale";
 const SYSTEMD_MULTI_USER_WANTS_DIR: &str = "/etc/systemd/system/multi-user.target.wants";
 
@@ -814,6 +815,97 @@ fn choose_candidate_preparation_strategy(
         CandidatePreparationStrategy::ReusePreparedRuntime
     } else {
         CandidatePreparationStrategy::FreshProvision
+    }
+}
+
+fn is_transient_incus_busy_operation_error(err: &str) -> bool {
+    let lowered = err.to_ascii_lowercase();
+    (lowered.contains("failed to create instance update operation") && lowered.contains("busy"))
+        || (lowered.contains("instance is busy running a") && lowered.contains("operation"))
+        || lowered.contains("busy running a \"stop\" operation")
+        || lowered.contains("busy running a 'stop' operation")
+}
+
+fn wait_for_candidate_operation_quiet(
+    deploy_app: &str,
+    candidate_app: &str,
+    project: &str,
+    context: &str,
+) -> Result<(), String> {
+    eprintln!("       Waiting for candidate Incus operations to settle ({context})");
+    wait_for_container_operation_quiet(candidate_app, project, Some(deploy_app))
+}
+
+fn retry_candidate_busy_operation_with_wait<T, FWait, FAction>(
+    action_label: &str,
+    mut wait_for_quiet: FWait,
+    mut action: FAction,
+) -> Result<T, String>
+where
+    FWait: FnMut() -> Result<(), String>,
+    FAction: FnMut() -> Result<T, String>,
+{
+    for attempt in 1..=CANDIDATE_BUSY_RETRY_ATTEMPTS {
+        match action() {
+            Ok(value) => return Ok(value),
+            Err(err)
+                if is_transient_incus_busy_operation_error(&err)
+                    && attempt < CANDIDATE_BUSY_RETRY_ATTEMPTS =>
+            {
+                eprintln!(
+                    "       Candidate hit transient Incus busy state during {action_label}; waiting before retry ({attempt}/{CANDIDATE_BUSY_RETRY_ATTEMPTS})"
+                );
+                wait_for_quiet()?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("candidate busy retry loop should always return")
+}
+
+fn retry_candidate_busy_operation<T, F>(
+    deploy_app: &str,
+    candidate_app: &str,
+    project: &str,
+    action_label: &str,
+    action: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, String>,
+{
+    retry_candidate_busy_operation_with_wait(
+        action_label,
+        || wait_for_candidate_operation_quiet(deploy_app, candidate_app, project, action_label),
+        action,
+    )
+}
+
+fn preservation_failure_detail(candidate_app: &str, project: &str) -> String {
+    let mut detail = Vec::new();
+    match container::is_running(candidate_app) {
+        Ok(true) => detail.push("instance still running".to_string()),
+        Ok(false) => {}
+        Err(err) => detail.push(format!("running-state check failed: {err}")),
+    }
+
+    match container::list_blocking_operations_in_project(candidate_app, project) {
+        Ok(blocking) if !blocking.is_empty() => {
+            let ids = blocking
+                .iter()
+                .map(|op| op.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            detail.push(format!("blocking ops: {ids}"));
+        }
+        Ok(_) => {}
+        Err(err) => detail.push(format!("blocking-op check failed: {err}")),
+    }
+
+    if detail.is_empty() {
+        "no running or blocking Incus state detected".to_string()
+    } else {
+        detail.join("; ")
     }
 }
 
@@ -870,6 +962,7 @@ fn sanitize_cloned_candidate_runtime(
 }
 
 fn prepare_candidate_from_active_runtime(
+    deploy_app: &str,
     candidate_app: &str,
     active_app: &str,
     project: &str,
@@ -881,12 +974,14 @@ fn prepare_candidate_from_active_runtime(
 
     eprintln!("-----> Reusing prepared runtime from active container");
     container::copy_instance_in_project(&active_instance, &candidate_instance, project)?;
+    wait_for_candidate_operation_quiet(deploy_app, candidate_app, project, "candidate clone")?;
 
     eprintln!("-----> Sanitizing cloned candidate runtime");
     sanitize_cloned_candidate_runtime(candidate_app, &candidate_instance, project, skip_tailscale)?;
 
     eprintln!("-----> Starting cloned candidate runtime");
     container::start(candidate_app)?;
+    wait_for_candidate_operation_quiet(deploy_app, candidate_app, project, "candidate start")?;
     container::exec_cmd_in_instance_project(
         &candidate_instance,
         project,
@@ -1063,9 +1158,21 @@ fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, pr
         let _ = container::stop(candidate_app);
     }
 
+    if let Err(err) = wait_for_candidate_operation_quiet(
+        app,
+        candidate_app,
+        project,
+        "failed candidate preservation",
+    ) {
+        eprintln!("       Warning: failed to settle candidate before preservation: {err}");
+    }
+
     match container::rename_instance_in_project(&candidate_instance, &failed_instance, project) {
         Ok(()) => eprintln!("       Preserved failed candidate as {failed_app}"),
-        Err(err) => eprintln!("       Warning: failed to preserve failed candidate: {err}"),
+        Err(err) => eprintln!(
+            "       Warning: failed to preserve failed candidate: {err} ({})",
+            preservation_failure_detail(candidate_app, project)
+        ),
     }
 }
 
@@ -1194,6 +1301,7 @@ fn deploy_zero_downtime(
         {
             check_deploy_interrupt(app, "candidate runtime reuse")?;
             match prepare_candidate_from_active_runtime(
+                app,
                 &candidate_app,
                 old_active_app,
                 &current_project,
@@ -1235,7 +1343,13 @@ fn deploy_zero_downtime(
 
         eprintln!("-----> Attaching storage to candidate container");
         check_deploy_interrupt(app, "candidate storage attach")?;
-        container::ensure_storage_mount(&candidate_app, &storage_pool, &storage_volume)?;
+        retry_candidate_busy_operation(
+            app,
+            &candidate_app,
+            &current_project,
+            "candidate storage attach",
+            || container::ensure_storage_mount(&candidate_app, &storage_pool, &storage_volume),
+        )?;
 
         eprintln!("-----> Pushing code to candidate");
         check_deploy_interrupt(app, "candidate code push")?;
@@ -1474,6 +1588,99 @@ mod tests {
             choose_candidate_preparation_strategy(true, true, Some("setup-123"), "setup-123"),
             CandidatePreparationStrategy::FreshProvision
         );
+    }
+
+    #[test]
+    fn transient_incus_busy_error_detects_stop_operation_message() {
+        assert!(is_transient_incus_busy_operation_error(
+            "Failed to create instance update operation: Instance is busy running a \"stop\" operation"
+        ));
+    }
+
+    #[test]
+    fn transient_incus_busy_error_ignores_non_busy_errors() {
+        assert!(!is_transient_incus_busy_operation_error(
+            "incus config device add psht-demo storage disk path=/storage pool=default source=vol failed: device already exists"
+        ));
+    }
+
+    #[test]
+    fn candidate_busy_retry_retries_transient_busy_error() {
+        let mut wait_calls = 0usize;
+        let mut action_calls = 0usize;
+
+        let result = retry_candidate_busy_operation_with_wait(
+            "candidate storage attach",
+            || {
+                wait_calls += 1;
+                Ok(())
+            },
+            || {
+                action_calls += 1;
+                if action_calls == 1 {
+                    Err(
+                        "Failed to create instance update operation: Instance is busy running a \"stop\" operation"
+                            .to_string(),
+                    )
+                } else {
+                    Ok("attached")
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "attached");
+        assert_eq!(action_calls, 2);
+        assert_eq!(wait_calls, 1);
+    }
+
+    #[test]
+    fn candidate_busy_retry_returns_non_busy_error_without_waiting() {
+        let mut wait_calls = 0usize;
+        let mut action_calls = 0usize;
+
+        let err = retry_candidate_busy_operation_with_wait(
+            "candidate storage attach",
+            || {
+                wait_calls += 1;
+                Ok(())
+            },
+            || {
+                action_calls += 1;
+                Result::<(), String>::Err("permission denied".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "permission denied");
+        assert_eq!(action_calls, 1);
+        assert_eq!(wait_calls, 0);
+    }
+
+    #[test]
+    fn candidate_busy_retry_stops_after_retry_budget() {
+        let mut wait_calls = 0usize;
+        let mut action_calls = 0usize;
+        let busy_err =
+            "Failed to create instance update operation: Instance is busy running a \"stop\" operation"
+                .to_string();
+
+        let err = retry_candidate_busy_operation_with_wait(
+            "candidate storage attach",
+            || {
+                wait_calls += 1;
+                Ok(())
+            },
+            || {
+                action_calls += 1;
+                Result::<(), String>::Err(busy_err.clone())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, busy_err);
+        assert_eq!(action_calls, CANDIDATE_BUSY_RETRY_ATTEMPTS);
+        assert_eq!(wait_calls, CANDIDATE_BUSY_RETRY_ATTEMPTS - 1);
     }
 
     #[test]
