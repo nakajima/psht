@@ -13,7 +13,7 @@ use crate::deploy_log;
 use crate::detect;
 use crate::sqlite_store;
 
-use super::observability_commands::{self, AppHealthReport, PsRow};
+use super::observability_commands::{self, AppHealthReport};
 
 const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
@@ -71,7 +71,7 @@ struct VersionStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DashboardApp {
     app: String,
-    status: String,
+    runtime_status: String,
     health: String,
     phase: String,
     desired_state: String,
@@ -83,7 +83,7 @@ struct DashboardApp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppDetail {
     app: String,
-    status: String,
+    runtime_status: String,
     desired_state: String,
     phase: String,
     active_instance: Option<String>,
@@ -320,39 +320,7 @@ fn dashboard_response(request: &HttpRequest) -> HttpResponse {
     body.push_str(&nav_html());
     body.push_str(&message_banner_html(request));
     body.push_str(&version_section_html(&version, false));
-    body.push_str("<section><h2>Apps</h2>");
-    if apps.is_empty() {
-        body.push_str("<p>No deployed apps found.</p>");
-    } else {
-        body.push_str("<table><thead><tr><th>App</th><th>Status</th><th>Health</th><th>Phase</th><th>Desired</th><th>Source</th><th>Stack</th><th>Active</th></tr></thead><tbody>");
-        for app in apps {
-            let app_path = app_path(&app.app);
-            body.push_str("<tr>");
-            body.push_str(&format!(
-                "<td><a href=\"{app_path}\">{}</a></td>",
-                html_escape(&app.app)
-            ));
-            body.push_str(&format!("<td>{}</td>", html_escape(&app.status)));
-            body.push_str(&format!("<td>{}</td>", html_escape(&app.health)));
-            body.push_str(&format!("<td>{}</td>", html_escape(&app.phase)));
-            body.push_str(&format!("<td>{}</td>", html_escape(&app.desired_state)));
-            body.push_str(&format!(
-                "<td>{}</td>",
-                html_escape(app.source_kind.as_deref().unwrap_or("-"))
-            ));
-            body.push_str(&format!(
-                "<td>{}</td>",
-                html_escape(app.stack.as_deref().unwrap_or("-"))
-            ));
-            body.push_str(&format!(
-                "<td>{}</td>",
-                html_escape(app.active_instance.as_deref().unwrap_or("-"))
-            ));
-            body.push_str("</tr>");
-        }
-        body.push_str("</tbody></table>");
-    }
-    body.push_str("</section>");
+    body.push_str(&dashboard_apps_section_html(&apps));
 
     html_response(page_html("psht", &body))
 }
@@ -394,7 +362,7 @@ fn app_response(request: &HttpRequest, app: &str) -> HttpResponse {
     body.push_str(&nav_html());
     body.push_str(&message_banner_html(request));
     body.push_str("<section><h2>Overview</h2><table><tbody>");
-    body.push_str(&table_row_html("Status", &detail.status));
+    body.push_str(&table_row_html("Runtime", &detail.runtime_status));
     body.push_str(&table_row_html("Desired", &detail.desired_state));
     body.push_str(&table_row_html("Phase", &detail.phase));
     body.push_str(&table_row_html(
@@ -482,7 +450,7 @@ fn app_response(request: &HttpRequest, app: &str) -> HttpResponse {
     ));
     body.push_str("</section>");
 
-    body.push_str("<section><h2>Health</h2>");
+    body.push_str("<section><h2>Service Health</h2>");
     body.push_str(&format!(
         "<p>{}</p>",
         html_escape(if detail.health.healthy {
@@ -840,36 +808,59 @@ fn build_version_status(running: &str, installed: &str, latest: Option<&str>) ->
     }
 }
 
+fn dashboard_apps_section_html(apps: &[DashboardApp]) -> String {
+    let mut body = String::new();
+    body.push_str("<section><h2>Apps</h2>");
+    if apps.is_empty() {
+        body.push_str("<p>No deployed apps found.</p>");
+    } else {
+        body.push_str("<table><thead><tr><th>App</th><th>Runtime</th><th>Health</th><th>Phase</th><th>Desired</th><th>Source</th><th>Stack</th><th>Active</th></tr></thead><tbody>");
+        for app in apps {
+            let app_path = app_path(&app.app);
+            body.push_str("<tr>");
+            body.push_str(&format!(
+                "<td><a href=\"{app_path}\">{}</a></td>",
+                html_escape(&app.app)
+            ));
+            body.push_str(&format!("<td>{}</td>", html_escape(&app.runtime_status)));
+            body.push_str(&format!("<td>{}</td>", html_escape(&app.health)));
+            body.push_str(&format!("<td>{}</td>", html_escape(&app.phase)));
+            body.push_str(&format!("<td>{}</td>", html_escape(&app.desired_state)));
+            body.push_str(&format!(
+                "<td>{}</td>",
+                html_escape(app.source_kind.as_deref().unwrap_or("-"))
+            ));
+            body.push_str(&format!(
+                "<td>{}</td>",
+                html_escape(app.stack.as_deref().unwrap_or("-"))
+            ));
+            body.push_str(&format!(
+                "<td>{}</td>",
+                html_escape(app.active_instance.as_deref().unwrap_or("-"))
+            ));
+            body.push_str("</tr>");
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str("</section>");
+    body
+}
+
 fn load_dashboard_apps() -> Result<Vec<DashboardApp>, String> {
     let rows = observability_commands::ps_rows()?;
     let mut apps = Vec::with_capacity(rows.len());
     for row in rows {
         let metadata = app_metadata(&row.app)?;
-        let status = sqlite_store::get_app_status(&row.app)?;
         let runtime = sqlite_store::get_app_runtime_state(&row.app)?;
-        let health = app_health_for_row(&row);
-        let desired = control_plane::desired_state(&row.app)
-            .unwrap_or(control_plane::DesiredState::Running)
-            .as_str()
-            .to_string();
         apps.push(DashboardApp {
             app: row.app,
-            status: row.status,
-            health: if health.healthy {
-                "ok".to_string()
-            } else {
-                "unhealthy".to_string()
-            },
+            runtime_status: row.runtime_status,
+            health: observability_commands::service_health_label(&row.health).to_string(),
             source_kind: metadata.source_kind,
             stack: metadata.stack,
-            phase: status
-                .as_ref()
-                .map(|value| value.phase.clone())
-                .unwrap_or_else(|| "-".to_string()),
-            desired_state: desired,
-            active_instance: status
-                .and_then(|value| value.active_instance)
-                .or_else(|| runtime.map(|value| value.active_instance)),
+            phase: row.phase,
+            desired_state: row.desired_state,
+            active_instance: row.active_app.or_else(|| runtime.map(|value| value.active_instance)),
         });
     }
     Ok(apps)
@@ -899,12 +890,13 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
     }
 
     let (status, health) = match ps_row.as_ref() {
-        Some(row) => (row.status.clone(), app_health_for_row(row)),
+        Some(row) => (row.runtime_status.clone(), row.health.clone()),
         None => (
             "Missing".to_string(),
             AppHealthReport {
                 app: app.to_string(),
                 healthy: false,
+                service_ready: false,
                 details: vec!["active container missing".to_string()],
             },
         ),
@@ -930,7 +922,7 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
 
     Ok(Some(AppDetail {
         app: app.to_string(),
-        status,
+        runtime_status: status,
         desired_state,
         phase: status_row
             .as_ref()
@@ -1103,21 +1095,6 @@ fn app_actions(
         destroy: ActionState::enabled(),
         tailscale_up,
         tailscale_down,
-    }
-}
-
-fn app_health_for_row(row: &PsRow) -> AppHealthReport {
-    if let Some(active_app) = row.active_app.as_deref() {
-        return observability_commands::check_app_health(
-            &row.app,
-            active_app,
-            &row.container_status,
-        );
-    }
-    AppHealthReport {
-        app: row.app.clone(),
-        healthy: false,
-        details: vec!["active container missing".to_string()],
     }
 }
 
@@ -1370,5 +1347,27 @@ mod tests {
             detect_stack_in_dir(tmp.path()).as_deref(),
             Some("custom (static)")
         );
+    }
+
+    #[test]
+    fn dashboard_apps_section_uses_explicit_state_columns() {
+        let html = dashboard_apps_section_html(&[DashboardApp {
+            app: "demo".to_string(),
+            runtime_status: "Running".to_string(),
+            health: "ok".to_string(),
+            phase: "Reconciling".to_string(),
+            desired_state: "running".to_string(),
+            source_kind: Some("git".to_string()),
+            stack: Some("rust".to_string()),
+            active_instance: Some("psht-demo".to_string()),
+        }]);
+
+        assert!(html.contains("<th>Runtime</th>"));
+        assert!(html.contains("<th>Health</th>"));
+        assert!(html.contains("<th>Phase</th>"));
+        assert!(html.contains("Running"));
+        assert!(html.contains("ok"));
+        assert!(html.contains("Reconciling"));
+        assert!(html.contains("running"));
     }
 }

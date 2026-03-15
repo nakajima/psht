@@ -7053,6 +7053,7 @@ devices:
     fn stopped_container_is_unhealthy() {
         let report = check_app_health("hyperlinked", "hyperlinked", "Stopped");
         assert!(!report.healthy);
+        assert!(!report.service_ready);
         assert_eq!(report.app, "hyperlinked");
         assert!(
             report

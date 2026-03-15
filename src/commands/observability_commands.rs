@@ -1,15 +1,13 @@
 use super::*;
+use crate::control_plane;
 
 pub fn ps() -> Result<(), String> {
     let rows = ps_rows()?;
     if rows.is_empty() {
-        println!("No apps running.");
+        println!("No deployed apps found.");
         return Ok(());
     }
-    println!("{:<20} {:<10}", "APP", "STATUS");
-    for row in rows {
-        println!("{:<20} {:<10}", row.app, row.status);
-    }
+    println!("{}", render_ps_table(&rows));
     Ok(())
 }
 
@@ -18,7 +16,10 @@ pub(super) struct PsRow {
     pub(super) app: String,
     pub(super) active_app: Option<String>,
     pub(super) container_status: String,
-    pub(super) status: String,
+    pub(super) runtime_status: String,
+    pub(super) health: AppHealthReport,
+    pub(super) phase: String,
+    pub(super) desired_state: String,
 }
 
 pub(super) fn ps_rows() -> Result<Vec<PsRow>, String> {
@@ -27,33 +28,49 @@ pub(super) fn ps_rows() -> Result<Vec<PsRow>, String> {
     let mut rows = Vec::with_capacity(apps.len());
     for (app, active_app, container_status) in apps {
         let container_state = ps_container_state(&container_status);
-        let service_ready = match container_state {
-            PsContainerState::Running => match active_app.as_deref() {
-                Some(active_app) => {
-                    let port = allocate_port(&app);
-                    match probe_app_service(active_app, port) {
-                        Ok(probe) => Some(probe.is_ready()),
-                        Err(err) => {
-                            eprintln!(
-                                "       Warning: failed to check app service for {app}: {err}"
-                            );
-                            Some(false)
-                        }
-                    }
-                }
-                None => None,
-            },
-            PsContainerState::Stopped | PsContainerState::Missing => None,
+        let health = match active_app.as_deref() {
+            Some(active_app) => check_app_health(&app, active_app, &container_status),
+            None => missing_app_health_report(&app),
         };
-        let status = ps_status_from_parts(container_state, service_ready).to_string();
+        let runtime_status =
+            ps_status_from_parts(container_state, Some(health.service_ready)).to_string();
+        let phase = sqlite_store::get_app_status(&app)?
+            .map(|value| value.phase)
+            .unwrap_or_else(|| "-".to_string());
+        let desired_state = control_plane::desired_state(&app)
+            .unwrap_or(DesiredState::Running)
+            .as_str()
+            .to_string();
         rows.push(PsRow {
             app,
             active_app,
             container_status,
-            status,
+            runtime_status,
+            health,
+            phase,
+            desired_state,
         });
     }
     Ok(rows)
+}
+
+fn render_ps_table(rows: &[PsRow]) -> String {
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(format!(
+        "{:<20} {:<10} {:<10} {:<12} {:<10}",
+        "APP", "RUNTIME", "HEALTH", "PHASE", "DESIRED"
+    ));
+    for row in rows {
+        lines.push(format!(
+            "{:<20} {:<10} {:<10} {:<12} {:<10}",
+            row.app,
+            row.runtime_status,
+            service_health_label(&row.health),
+            row.phase,
+            row.desired_state
+        ));
+    }
+    lines.join("\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +111,25 @@ pub(super) fn ps_status_from_parts(
 pub(super) struct AppHealthReport {
     pub(super) app: String,
     pub(super) healthy: bool,
+    pub(super) service_ready: bool,
     pub(super) details: Vec<String>,
+}
+
+pub(super) fn service_health_label(report: &AppHealthReport) -> &'static str {
+    if report.healthy {
+        "ok"
+    } else {
+        "unhealthy"
+    }
+}
+
+fn missing_app_health_report(app: &str) -> AppHealthReport {
+    AppHealthReport {
+        app: app.to_string(),
+        healthy: false,
+        service_ready: false,
+        details: vec!["active container missing".to_string()],
+    }
 }
 
 pub(super) fn is_transient_deploy_app_name(app: &str) -> bool {
@@ -165,6 +200,7 @@ pub(super) fn check_app_health(
 ) -> AppHealthReport {
     let mut details = Vec::new();
     let mut healthy = true;
+    let mut service_ready = false;
     let active_instance = instance_name_from_app_ref(active_app);
     details.push(format!("active instance: {active_instance}"));
 
@@ -175,6 +211,7 @@ pub(super) fn check_app_health(
         return AppHealthReport {
             app: app.to_string(),
             healthy: false,
+            service_ready,
             details,
         };
     }
@@ -183,6 +220,7 @@ pub(super) fn check_app_health(
     match probe_app_service(active_app, port) {
         Ok(probe) => {
             if probe.is_active() {
+                service_ready = true;
                 details.push("app service active".to_string());
             } else {
                 healthy = false;
@@ -248,6 +286,7 @@ pub(super) fn check_app_health(
     AppHealthReport {
         app: app.to_string(),
         healthy,
+        service_ready,
         details,
     }
 }
@@ -312,17 +351,12 @@ pub fn health() -> Result<(), String> {
         let report = if let Some(active_app) = active_app.as_deref() {
             check_app_health(&app, active_app, &status)
         } else {
-            AppHealthReport {
-                app: app.clone(),
-                healthy: false,
-                details: vec!["active container missing".to_string()],
-            }
+            missing_app_health_report(&app)
         };
-        let health_status = if report.healthy { "ok" } else { "unhealthy" };
         println!(
             "{:<20} {:<10} {}",
             report.app,
-            health_status,
+            service_health_label(&report),
             report.details.join("; ")
         );
         if !report.healthy {
@@ -357,6 +391,44 @@ pub(super) fn normalize_candidate_app_ref(raw: &str) -> Option<String> {
         return Some(app_ref);
     }
     Some(trimmed.trim_start_matches("psht-").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_ps_table_shows_explicit_state_columns() {
+        let rendered = render_ps_table(&[PsRow {
+            app: "demo".to_string(),
+            active_app: Some("demo".to_string()),
+            container_status: "Running".to_string(),
+            runtime_status: "Running".to_string(),
+            health: AppHealthReport {
+                app: "demo".to_string(),
+                healthy: true,
+                service_ready: true,
+                details: vec!["app service active".to_string()],
+            },
+            phase: "Degraded".to_string(),
+            desired_state: "running".to_string(),
+        }]);
+
+        let mut lines = rendered.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+
+        assert!(header.contains("APP"));
+        assert!(header.contains("RUNTIME"));
+        assert!(header.contains("HEALTH"));
+        assert!(header.contains("PHASE"));
+        assert!(header.contains("DESIRED"));
+        assert!(row.contains("demo"));
+        assert!(row.contains("Running"));
+        assert!(row.contains("ok"));
+        assert!(row.contains("Degraded"));
+        assert!(row.contains("running"));
+    }
 }
 
 pub fn debug_resources(app: Option<&str>, candidate: Option<&str>) -> Result<(), String> {

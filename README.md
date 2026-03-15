@@ -86,7 +86,7 @@ The app will be started and added to your tailnet. The app will have access to a
 
 #### `psht ps`
 
-See what's running.
+See each app's runtime state, health, reconcile phase, and desired state.
 
 #### `psht logs [-f]`
 
