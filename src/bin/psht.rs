@@ -580,6 +580,63 @@ fn parse_push_updated(porcelain: &str) -> Option<bool> {
     if saw_ref_line { Some(updated) } else { None }
 }
 
+fn current_git_ssh_command(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["config", "--get", "core.sshCommand"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+fn missing_exec_path(stderr: &str) -> Option<String> {
+    const PREFIX: &str = "fork/exec ";
+    const SUFFIX: &str = ": no such file or directory";
+
+    stderr.lines().find_map(|line| {
+        let raw = line.trim();
+        let path = raw.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+        let path = path.trim();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        }
+    })
+}
+
+fn git_push_failure_message(cwd: &Path, status: std::process::ExitStatus, stderr: &str) -> String {
+    let base = format!("git push failed with status {status}");
+    let Some(path) = missing_exec_path(stderr) else {
+        return base;
+    };
+
+    if current_git_ssh_command(cwd)
+        .as_deref()
+        .is_some_and(|command| command.contains(&path))
+    {
+        return format!(
+            "{base}: local git config references missing sshCommand executable {path}; inspect `git config --show-origin --get core.sshCommand` in this repo"
+        );
+    }
+
+    if path.ends_with("/psht") || path.ends_with("/psht-server") {
+        return format!(
+            "{base}: missing psht executable {path}; if `git config --show-origin --get core.sshCommand` in this repo prints that path, fix the local git config, otherwise the host still references it in the psht SSH shell or git hook and needs `sudo psht-server bootstrap` or `sudo psht-server upgrade`"
+        );
+    }
+
+    base
+}
+
 fn deploy_ssh_args(app: &str, ref_name: &str, sha: &str, force: bool) -> Vec<String> {
     let mut args = vec![
         "deploy".to_string(),
@@ -627,7 +684,7 @@ fn deploy_from_git(host: &str, app: &str, cwd: &Path, force: bool) -> Result<(),
     }
 
     if !output.status.success() {
-        return Err(format!("git push failed with status {}", output.status));
+        return Err(git_push_failure_message(cwd, output.status, &stderr));
     }
 
     let pushed_updated = parse_push_updated(&stdout);
@@ -2312,6 +2369,76 @@ mod tests {
     fn parse_push_updated_ignores_non_ref_lines() {
         let out = "To psht:app\nDone\n";
         assert_eq!(parse_push_updated(out), None);
+    }
+
+    #[test]
+    fn missing_exec_path_parses_fork_exec_errors() {
+        assert_eq!(
+            missing_exec_path("fork/exec /usr/local/bin/psht: no such file or directory")
+                .as_deref(),
+            Some("/usr/local/bin/psht")
+        );
+        assert!(missing_exec_path("fatal: unrelated").is_none());
+    }
+
+    #[test]
+    fn git_push_failure_message_points_to_local_git_ssh_command() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "config",
+                "core.sshCommand",
+                "/usr/local/bin/psht -i ~/.ssh/id_ed25519",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let status = Command::new("sh")
+            .args(["-c", "exit 128"])
+            .status()
+            .unwrap();
+
+        let message = git_push_failure_message(
+            dir.path(),
+            status,
+            "fork/exec /usr/local/bin/psht: no such file or directory",
+        );
+
+        assert!(message.contains("local git config references missing sshCommand executable"));
+        assert!(message.contains("git config --show-origin --get core.sshCommand"));
+    }
+
+    #[test]
+    fn git_push_failure_message_points_to_host_when_no_local_ssh_command_exists() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let status = Command::new("sh")
+            .args(["-c", "exit 128"])
+            .status()
+            .unwrap();
+
+        let message = git_push_failure_message(
+            dir.path(),
+            status,
+            "fork/exec /usr/local/bin/psht: no such file or directory",
+        );
+
+        assert!(message.contains("missing psht executable /usr/local/bin/psht"));
+        assert!(message.contains("psht SSH shell or git hook"));
+        assert!(message.contains("sudo psht-server upgrade"));
     }
 
     #[test]
