@@ -936,16 +936,23 @@ pub fn tailscale_down(app: &str) -> Result<(), String> {
 
 fn enforce_supervised_app_running(app: &str, project: &str) -> Result<(), String> {
     let active_app = resolve_existing_active_app_ref(app)?;
+    let port = allocate_port(app);
     if !container::is_running(&active_app)? {
         eprintln!("-----> Supervise: starting container for {app}");
         container::start(&active_app)?;
     }
 
-    if app_service_is_active(&active_app)? {
-        let mut keep = BTreeSet::new();
-        keep.insert(instance_name_from_app_ref(&active_app));
-        reconcile_family_instances_strict(app, &keep, project)?;
-        return Ok(());
+    match probe_app_service(&active_app, port) {
+        Ok(probe) if probe.is_ready() => {
+            let mut keep = BTreeSet::new();
+            keep.insert(instance_name_from_app_ref(&active_app));
+            reconcile_family_instances_strict(app, &keep, project)?;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("       Warning: failed to inspect app service for {app}: {err}");
+        }
     }
 
     eprintln!("-----> Supervise: starting app service for {app}");
@@ -953,7 +960,6 @@ fn enforce_supervised_app_running(app: &str, project: &str) -> Result<(), String
     let required_env = read_required_env(&active_app)?;
     ensure_required_env_present(&required_env, &vars)?;
     let command = read_start_command(&active_app)?;
-    let port = allocate_port(app);
     launch_app_process(&active_app, port, &command, &vars)?;
     if tailscale::dns_name_in_container(&active_app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(&active_app, port)

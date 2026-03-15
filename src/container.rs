@@ -130,12 +130,16 @@ impl IncusCommand {
 
     fn run(self) -> Result<(), String> {
         let args_display = self.args.join(" ");
-        let status = self
+        let output = self
             .build()
-            .status()
+            .output()
             .map_err(|e| format!("failed to run incus {args_display}: {e}"))?;
-        if !status.success() {
-            return Err(format!("incus {args_display} failed"));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Err(format!("incus {args_display} failed"));
+            }
+            return Err(format!("incus {args_display} failed: {stderr}"));
         }
         Ok(())
     }
@@ -279,6 +283,18 @@ fn is_missing_device_error(stderr: &str) -> bool {
     let lowered = stderr.to_ascii_lowercase();
     lowered.contains("device")
         && (lowered.contains("not found") || lowered.contains("doesn't exist"))
+}
+
+pub fn is_missing_instance_error(err: &str) -> bool {
+    let lowered = err.to_ascii_lowercase();
+    let missing_phrase = lowered.contains("not found")
+        || lowered.contains("doesn't exist")
+        || lowered.contains("does not exist")
+        || lowered.contains("no such object");
+
+    lowered.contains("failed to fetch instance")
+        || lowered.contains("instance not found")
+        || ((lowered.contains("instance \"") || lowered.contains("instance '")) && missing_phrase)
 }
 
 fn device_value(app: &str, device: &str, key: &str) -> Result<Option<String>, String> {
@@ -1848,6 +1864,20 @@ mod tests {
         assert!(ops[0].may_cancel);
         assert_eq!(ops[0].class, "task");
         assert_eq!(ops[0].instance_names, vec!["psht-demo"]);
+    }
+
+    #[test]
+    fn missing_instance_error_detects_failed_fetch_message() {
+        assert!(is_missing_instance_error(
+            "incus --project user-1001 exec psht-demo -- sh -c true failed: Error: Failed to fetch instance \"psht-demo\" in project \"user-1001\": Instance not found"
+        ));
+    }
+
+    #[test]
+    fn missing_instance_error_ignores_unrelated_not_found_errors() {
+        assert!(!is_missing_instance_error(
+            "failed to read file in instance: path not found"
+        ));
     }
 
     #[test]

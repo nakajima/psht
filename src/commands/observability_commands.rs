@@ -29,25 +29,18 @@ pub(super) fn ps_rows() -> Result<Vec<PsRow>, String> {
         let container_state = ps_container_state(&container_status);
         let service_ready = match container_state {
             PsContainerState::Running => match active_app.as_deref() {
-                Some(active_app) => match app_process_is_running(active_app) {
-                    Ok(false) => Some(false),
-                    Ok(true) => {
-                        let port = allocate_port(&app);
-                        match app_port_listening(active_app, port) {
-                            Ok(ready) => Some(ready),
-                            Err(err) => {
-                                eprintln!(
-                                    "       Warning: failed to check app listener for {app}: {err}"
-                                );
-                                Some(false)
-                            }
+                Some(active_app) => {
+                    let port = allocate_port(&app);
+                    match probe_app_service(active_app, port) {
+                        Ok(probe) => Some(probe.is_ready()),
+                        Err(err) => {
+                            eprintln!(
+                                "       Warning: failed to check app service for {app}: {err}"
+                            );
+                            Some(false)
                         }
                     }
-                    Err(err) => {
-                        eprintln!("       Warning: failed to check app process for {app}: {err}");
-                        Some(false)
-                    }
-                },
+                }
                 None => None,
             },
             PsContainerState::Stopped | PsContainerState::Missing => None,
@@ -165,16 +158,6 @@ pub(super) fn app_targets_from_runtime_state(
         .collect())
 }
 
-fn app_port_listening(app: &str, port: u16) -> Result<bool, String> {
-    let output = container::exec_output(
-        app,
-        &format!(
-            "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
-        ),
-    )?;
-    Ok(output.trim() == "ready")
-}
-
 pub(super) fn check_app_health(
     app: &str,
     active_app: &str,
@@ -196,22 +179,33 @@ pub(super) fn check_app_health(
         };
     }
 
-    let app_running = match app_process_is_running(active_app) {
-        Ok(true) => {
-            details.push("app process running".to_string());
-            true
-        }
-        Ok(false) => {
-            healthy = false;
-            details.push("app process not running".to_string());
-            false
+    let port = allocate_port(app);
+    match probe_app_service(active_app, port) {
+        Ok(probe) => {
+            if probe.is_active() {
+                details.push("app service active".to_string());
+            } else {
+                healthy = false;
+                details.push(format!("app service not ready: {}", probe.detail(port)));
+            }
+
+            if probe.port_listening && probe.listener_matches_service {
+                details.push(format!("tcp :{port} listening"));
+            } else if probe.port_listening {
+                healthy = false;
+                details.push(format!(
+                    "tcp :{port} listener is not owned by psht-app.service"
+                ));
+            } else {
+                healthy = false;
+                details.push(format!("tcp :{port} is not listening"));
+            }
         }
         Err(err) => {
             healthy = false;
-            details.push(format!("failed to check app process: {err}"));
-            false
+            details.push(format!("failed to check app service: {err}"));
         }
-    };
+    }
 
     match read_start_command(active_app) {
         Ok(command) => details.push(format!("start command: {}", command.trim())),
@@ -244,21 +238,6 @@ pub(super) fn check_app_health(
         Err(err) => {
             healthy = false;
             details.push(format!("required env metadata error: {err}"));
-        }
-    }
-
-    if app_running {
-        let port = allocate_port(app);
-        match app_port_listening(active_app, port) {
-            Ok(true) => details.push(format!("tcp :{port} listening")),
-            Ok(false) => {
-                healthy = false;
-                details.push(format!("tcp :{port} is not listening"));
-            }
-            Err(err) => {
-                healthy = false;
-                details.push(format!("failed to check tcp :{port}: {err}"));
-            }
         }
     }
 

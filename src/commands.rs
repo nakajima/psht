@@ -86,6 +86,7 @@ const DEPLOY_INTERRUPT_ERR_PREFIX: &str = "deploy interrupted";
 const HEALTH_DELEGATED_ENV: &str = "PSHT_HEALTH_DELEGATED";
 const LOGS_DEPLOY_HISTORY_FILES: usize = 12;
 const LOGS_DEPLOY_HISTORY_LINES_PER_FILE: usize = 400;
+const DEPLOY_INSTANCE_AUDIT_MARKER: &str = "__psht_instance_audit__";
 const TAILSCALE_STATE_SEED_PATH: &str = "/var/lib/psht-tailscale-state";
 const INCUS_METADATA_TIMEOUT_SECS: u64 = 20;
 const TAILSCALE_HOSTNAME_ACQUIRE_RETRY_SLEEP_MS: u64 = 1000;
@@ -128,7 +129,8 @@ mod observability_commands;
 mod web_ui;
 
 use self::deploy_commands::{
-    check_deploy_interrupt, control_plane_snapshot, is_transient_deploy_app_for,
+    check_deploy_interrupt, control_plane_snapshot, is_deploy_interrupted_error,
+    is_transient_deploy_app_for,
 };
 
 #[cfg(test)]
@@ -139,8 +141,7 @@ use self::admin_commands::{
 };
 #[cfg(test)]
 use self::deploy_commands::{
-    deploy_interrupted_error, is_deploy_interrupted_error, pending_force_request_is_ours,
-    should_process_pending_request,
+    deploy_interrupted_error, pending_force_request_is_ours, should_process_pending_request,
 };
 #[cfg(test)]
 use self::observability_commands::{
@@ -1269,6 +1270,162 @@ fn reset_tailscale_for_retry(container_app: &str) -> Result<(), String> {
     )
 }
 
+pub(super) fn emit_instance_audit_event(
+    app_ref: &str,
+    instance_name: &str,
+    project: &str,
+    action: &str,
+    reason: &str,
+    details: serde_json::Value,
+) {
+    let payload = serde_json::json!({
+        "family_app": deploy_app_family_from_app_ref(app_ref),
+        "app_ref": app_ref,
+        "instance": instance_name,
+        "project": project,
+        "action": action,
+        "reason": reason,
+        "details": details,
+    });
+    eprintln!("{DEPLOY_INSTANCE_AUDIT_MARKER} {payload}");
+}
+
+fn instance_audit_payload_from_line(line: &str) -> Option<serde_json::Value> {
+    let (_, payload) = line.split_once(DEPLOY_INSTANCE_AUDIT_MARKER)?;
+    serde_json::from_str(payload.trim()).ok()
+}
+
+fn recent_instance_audit_summary_from_lines(
+    lines: &[String],
+    instance_name: &str,
+) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        let payload = instance_audit_payload_from_line(line)?;
+        if payload.get("instance").and_then(|value| value.as_str())? != instance_name {
+            return None;
+        }
+
+        let action = payload.get("action").and_then(|value| value.as_str())?;
+        let reason = payload.get("reason").and_then(|value| value.as_str())?;
+        let app_ref = payload
+            .get("app_ref")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let project = payload
+            .get("project")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let details = payload
+            .get("details")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let detail_suffix =
+            if details.is_null() || details.as_object().is_some_and(|object| object.is_empty()) {
+                String::new()
+            } else {
+                format!(", details={details}")
+            };
+
+        Some(format!(
+            "action={action}, reason={reason}, app_ref={app_ref}, project={project}{detail_suffix}"
+        ))
+    })
+}
+
+fn recent_instance_audit_summary(app: &str, instance_name: &str) -> Option<String> {
+    let lines = deploy_log::recent_entries(
+        app,
+        LOGS_DEPLOY_HISTORY_FILES,
+        LOGS_DEPLOY_HISTORY_LINES_PER_FILE,
+    )
+    .ok()?;
+    recent_instance_audit_summary_from_lines(&lines, instance_name)
+}
+
+fn build_vanished_candidate_error(
+    container_app: &str,
+    candidate_instance: &str,
+    phase: &str,
+    err: &str,
+    project: Option<&str>,
+    exists_now: Option<bool>,
+    interrupt_detail: Option<&str>,
+    recent_audit: Option<&str>,
+) -> String {
+    let mut message =
+        format!("candidate container '{container_app}' disappeared during {phase}: {err}");
+    message.push_str(&format!("\nCandidate instance: {candidate_instance}"));
+    if let Some(project) = project {
+        message.push_str(&format!("\nProject: {project}"));
+    }
+    if let Some(exists_now) = exists_now {
+        message.push_str(&format!("\nCandidate exists now: {exists_now}"));
+    }
+    if let Some(interrupt_detail) = interrupt_detail {
+        message.push_str(&format!("\nDeploy interrupt state: {interrupt_detail}"));
+    }
+    if let Some(recent_audit) = recent_audit {
+        message.push_str(&format!("\nRecent instance audit: {recent_audit}"));
+    }
+    message.push_str(
+        "\nLikely causes: forced deploy takeover, blocked-operation reconciliation, or cleanup removed the transient candidate.",
+    );
+    message
+}
+
+fn vanished_candidate_retry_error(
+    app: &str,
+    container_app: &str,
+    phase: &str,
+    err: &str,
+) -> String {
+    let candidate_instance = instance_name_from_app_ref(container_app);
+    let project = current_project_name().ok();
+    let exists_now = project
+        .as_deref()
+        .map(|project| container::exists_instance_in_project(&candidate_instance, project));
+    let interrupt_detail = match read_deploy_interrupt(app) {
+        Ok(Some(state)) => Some(format!(
+            "request={}, requested_at={}, target_sha={}",
+            state.request_id, state.requested_at, state.target_sha
+        )),
+        Ok(None) => None,
+        Err(read_err) => Some(format!("unavailable ({read_err})")),
+    };
+    let recent_audit = recent_instance_audit_summary(app, &candidate_instance);
+
+    build_vanished_candidate_error(
+        container_app,
+        &candidate_instance,
+        phase,
+        err,
+        project.as_deref(),
+        exists_now,
+        interrupt_detail.as_deref(),
+        recent_audit.as_deref(),
+    )
+}
+
+fn terminal_tailscale_acquire_error(
+    app: &str,
+    container_app: &str,
+    phase: &str,
+    err: &str,
+) -> Option<String> {
+    if is_deploy_interrupted_error(err) {
+        return Some(err.to_string());
+    }
+    if container::is_missing_instance_error(err) {
+        return Some(vanished_candidate_retry_error(
+            app,
+            container_app,
+            phase,
+            err,
+        ));
+    }
+    None
+}
+
 fn retry_attempt_budget(timeout_secs: u64, retry_sleep: Duration) -> u64 {
     let sleep_ms = retry_sleep.as_millis().max(1);
     let timeout_ms = u128::from(timeout_secs).saturating_mul(1000);
@@ -1326,6 +1483,14 @@ where
             match join_with_state(container_app, app) {
                 Ok(attempt) => attempt,
                 Err(state_err) => {
+                    if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                        app,
+                        container_app,
+                        "tailscale state join",
+                        &state_err,
+                    ) {
+                        return Err(terminal_err);
+                    }
                     last_observation = format!("state join failed: {state_err}");
                     eprintln!("       State-based tailscale join failed: {state_err}");
                     in_auth_phase = true;
@@ -1333,6 +1498,14 @@ where
                         "       State-based tailscale recovery failed; switching to auth-key recovery"
                     );
                     if let Err(reset_err) = reset_for_retry(container_app) {
+                        if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                            app,
+                            container_app,
+                            "tailscale retry reset",
+                            &reset_err,
+                        ) {
+                            return Err(terminal_err);
+                        }
                         eprintln!(
                             "       Warning: failed to reset tailscale before retry: {reset_err}"
                         );
@@ -1345,9 +1518,25 @@ where
             match join_with_auth_key(container_app, app) {
                 Ok(attempt) => attempt,
                 Err(auth_err) => {
+                    if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                        app,
+                        container_app,
+                        "tailscale auth-key join",
+                        &auth_err,
+                    ) {
+                        return Err(terminal_err);
+                    }
                     last_observation = format!("auth-key join failed: {auth_err}");
                     eprintln!("       Auth-key tailscale join failed: {auth_err}");
                     if let Err(reset_err) = reset_for_retry(container_app) {
+                        if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                            app,
+                            container_app,
+                            "tailscale retry reset",
+                            &reset_err,
+                        ) {
+                            return Err(terminal_err);
+                        }
                         eprintln!(
                             "       Warning: failed to reset tailscale before retry: {reset_err}"
                         );
@@ -1405,6 +1594,14 @@ where
                 ));
             }
             if let Err(reset_err) = reset_for_retry(container_app) {
+                if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                    app,
+                    container_app,
+                    "tailscale retry reset",
+                    &reset_err,
+                ) {
+                    return Err(terminal_err);
+                }
                 eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
             }
             sleep(retry_sleep);
@@ -1431,6 +1628,14 @@ where
                 ));
             }
             if let Err(reset_err) = reset_for_retry(container_app) {
+                if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                    app,
+                    container_app,
+                    "tailscale retry reset",
+                    &reset_err,
+                ) {
+                    return Err(terminal_err);
+                }
                 eprintln!("       Warning: failed to reset tailscale before retry: {reset_err}");
             }
             sleep(retry_sleep);
@@ -1443,6 +1648,14 @@ where
                 return Ok(name);
             }
             Err(health_err) => {
+                if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                    app,
+                    container_app,
+                    "tailscale health wait",
+                    &health_err,
+                ) {
+                    return Err(terminal_err);
+                }
                 last_observation = format!("tailscale not healthy yet: {health_err}");
                 eprintln!("       Tailscale not healthy yet: {health_err}");
                 if !used_auth_phase {
@@ -1452,6 +1665,14 @@ where
                     );
                 }
                 if let Err(reset_err) = reset_for_retry(container_app) {
+                    if let Some(terminal_err) = terminal_tailscale_acquire_error(
+                        app,
+                        container_app,
+                        "tailscale retry reset",
+                        &reset_err,
+                    ) {
+                        return Err(terminal_err);
+                    }
                     eprintln!(
                         "       Warning: failed to reset tailscale before retry: {reset_err}"
                     );
@@ -3336,7 +3557,7 @@ fn app_runner_script_content(
     let escaped = shell_quote(cmd);
     let exports = start_exports(port, vars)?;
     Ok(format!(
-        "#!/bin/sh\nset -eu\nmkdir -p /var/psht\ncd /app\n{exports}\nexec sh -c {escaped}\n"
+        "#!/bin/sh\nset -eu\nmkdir -p /var/psht\nprintf '%s\\n' \"$$\" > {APP_PROCESS_PID_PATH}\ncd /app\n{exports}\nexec sh -c {escaped}\n"
     ))
 }
 
@@ -3379,12 +3600,176 @@ fn ensure_app_service_installed(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppServiceProbe {
+    active_state: String,
+    sub_state: String,
+    main_pid: Option<u32>,
+    control_group: Option<String>,
+    port_listening: bool,
+    listener_matches_service: bool,
+    listener_pids: Vec<u32>,
+}
+
+impl AppServiceProbe {
+    fn is_active(&self) -> bool {
+        self.active_state == "active" && self.main_pid.is_some()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.is_active() && self.listener_matches_service
+    }
+
+    fn detail(&self, port: u16) -> String {
+        let mut parts = Vec::new();
+        if self.active_state.is_empty() {
+            parts.push("service state unavailable".to_string());
+        } else if self.sub_state.is_empty() {
+            parts.push(format!("service {}", self.active_state));
+        } else {
+            parts.push(format!(
+                "service {} ({})",
+                self.active_state, self.sub_state
+            ));
+        }
+        if let Some(pid) = self.main_pid {
+            parts.push(format!("MainPID {pid}"));
+        } else {
+            parts.push("MainPID unavailable".to_string());
+        }
+        if !self.port_listening {
+            parts.push(format!("tcp :{port} not listening"));
+        } else if self.listener_matches_service {
+            parts.push(format!("tcp :{port} owned by psht-app.service"));
+        } else if self.listener_pids.is_empty() {
+            parts.push(format!(
+                "tcp :{port} listener not owned by psht-app.service"
+            ));
+        } else {
+            let pids = self
+                .listener_pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!(
+                "tcp :{port} listener not owned by psht-app.service (listener pids: {pids})"
+            ));
+        }
+        parts.join(", ")
+    }
+}
+
 fn app_service_is_active(app: &str) -> Result<bool, String> {
     let output = container::exec_output(
         app,
         &format!("if systemctl is-active --quiet {APP_SERVICE_NAME}; then echo active; fi; true"),
     )?;
     Ok(output.trim() == "active")
+}
+
+fn parse_app_service_probe(raw: &str) -> Result<AppServiceProbe, String> {
+    let mut active_state = String::new();
+    let mut sub_state = String::new();
+    let mut main_pid = None;
+    let mut control_group = None;
+    let mut port_listening = false;
+    let mut listener_matches_service = false;
+    let mut listener_pids = Vec::new();
+
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "ActiveState" => active_state = value.trim().to_string(),
+            "SubState" => sub_state = value.trim().to_string(),
+            "MainPID" => {
+                main_pid = value
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|pid| (pid > 0).then_some(pid))
+            }
+            "ControlGroup" => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    control_group = Some(value.to_string());
+                }
+            }
+            "PortListening" => port_listening = value.trim() == "yes",
+            "ListenerMatchesService" => listener_matches_service = value.trim() == "yes",
+            "ListenerPids" => {
+                listener_pids = value
+                    .split_whitespace()
+                    .filter_map(|item| item.parse::<u32>().ok())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
+    if !raw.contains("ActiveState=") || !raw.contains("PortListening=") {
+        return Err(format!(
+            "unexpected app service probe output: {}",
+            raw.trim()
+        ));
+    }
+
+    Ok(AppServiceProbe {
+        active_state,
+        sub_state,
+        main_pid,
+        control_group,
+        port_listening,
+        listener_matches_service,
+        listener_pids,
+    })
+}
+
+fn app_service_probe_cmd(port: u16) -> String {
+    format!(
+        r#"show_output="$(systemctl show {APP_SERVICE_NAME} --property=ActiveState --property=SubState --property=MainPID --property=ControlGroup --no-pager 2>/dev/null || true)"
+active_state="$(printf '%s\n' "$show_output" | sed -n 's/^ActiveState=//p' | head -n1)"
+sub_state="$(printf '%s\n' "$show_output" | sed -n 's/^SubState=//p' | head -n1)"
+main_pid="$(printf '%s\n' "$show_output" | sed -n 's/^MainPID=//p' | head -n1)"
+control_group="$(printf '%s\n' "$show_output" | sed -n 's/^ControlGroup=//p' | head -n1)"
+case "$main_pid" in
+  ''|*[!0-9]*) main_pid=0 ;;
+esac
+port_listening=no
+listener_matches_service=no
+listener_pids=""
+if command -v ss >/dev/null 2>&1; then
+  for pid in $(ss -ltnp "sport = :{port}" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u); do
+    port_listening=yes
+    if [ -n "$listener_pids" ]; then
+      listener_pids="$listener_pids "
+    fi
+    listener_pids="${{listener_pids}}${{pid}}"
+    if [ "$pid" = "$main_pid" ]; then
+      listener_matches_service=yes
+    elif [ -n "$control_group" ] && [ "$control_group" != "/" ] && [ -r "/proc/$pid/cgroup" ]; then
+      if awk -F: -v cg="$control_group" '($3 == cg || index($3, cg "/") == 1) {{ found=1 }} END {{ exit found ? 0 : 1 }}' "/proc/$pid/cgroup" 2>/dev/null; then
+        listener_matches_service=yes
+      fi
+    fi
+  done
+fi
+printf 'ActiveState=%s\n' "$active_state"
+printf 'SubState=%s\n' "$sub_state"
+printf 'MainPID=%s\n' "$main_pid"
+printf 'ControlGroup=%s\n' "$control_group"
+printf 'PortListening=%s\n' "$port_listening"
+printf 'ListenerMatchesService=%s\n' "$listener_matches_service"
+printf 'ListenerPids=%s\n' "$listener_pids"
+true"#
+    )
+}
+
+fn probe_app_service(app: &str, port: u16) -> Result<AppServiceProbe, String> {
+    let output = container::exec_output(app, &app_service_probe_cmd(port))?;
+    parse_app_service_probe(&output)
 }
 
 fn app_process_probe_cmd() -> String {
@@ -3558,16 +3943,23 @@ fn launch_app_process(
     ensure_app_service_installed(app, port, cmd, vars)?;
     stop_app_process_on_port(app, port)?;
     container::exec_cmd(app, &format!("systemctl restart {APP_SERVICE_NAME}"))?;
+    let mut last_probe = None;
     for _ in 0..APP_PROCESS_START_WAIT_CHECKS {
-        if app_service_is_active(app)? {
+        let probe = probe_app_service(app, port)?;
+        if probe.is_ready() {
             return Ok(());
         }
+        last_probe = Some(probe);
         thread::sleep(Duration::from_millis(200));
     }
     let mut message = format!(
-        "app process failed to stay up after launch (start command: {}); check logs with: psht logs {app}",
+        "app process failed to become ready after launch (start command: {}); check logs with: psht logs {app}",
         cmd.trim()
     );
+    if let Some(probe) = last_probe.as_ref() {
+        message.push_str("\nService state: ");
+        message.push_str(&probe.detail(port));
+    }
     if let Some(log_excerpt) = app_log_tail(app, APP_LOG_TAIL_LINES) {
         message.push_str("\nLast app log lines:\n");
         message.push_str(&log_excerpt);
@@ -4144,6 +4536,9 @@ fn wait_for_container_operation_quiet(
     project: &str,
     deploy_app: Option<&str>,
 ) -> Result<(), String> {
+    let audit_family_app = deploy_app
+        .map(deploy_app_family_from_app_ref)
+        .unwrap_or_else(|| deploy_app_family_from_app_ref(app));
     let policy = busy_op_policy();
     let initial_wait_window =
         Duration::from_millis(CONTAINER_OP_INITIAL_WAIT_CHECKS as u64 * CONTAINER_OP_WAIT_SLEEP_MS);
@@ -4338,6 +4733,24 @@ fn wait_for_container_operation_quiet(
                 } else {
                     action_steps.push("target already absent".to_string());
                 }
+                if is_instance_in_app_family(&audit_family_app, &target_instance) {
+                    let audit_app_ref = app_ref_from_instance_name(&target_instance)
+                        .unwrap_or_else(|| target_instance.clone());
+                    emit_instance_audit_event(
+                        &audit_app_ref,
+                        &target_instance,
+                        project,
+                        "forced-reset",
+                        "blocked-operation-reconcile",
+                        serde_json::json!({
+                            "op_id": op.id,
+                            "phase": phase,
+                            "description": op.description,
+                            "status": op.status,
+                            "steps": action_steps.clone(),
+                        }),
+                    );
+                }
                 let action_record = format!(
                     "{} (op {}): {}",
                     target_instance,
@@ -4398,22 +4811,72 @@ fn ensure_create_prereqs(project: &str) -> Result<(), String> {
 }
 
 fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String> {
+    let family_app = deploy_app_family_from_app_ref(app);
+    let instance_name = instance_name_from_app_ref(app);
+    let audit_candidate = is_transient_deploy_app_for(&family_app, app);
+    if audit_candidate {
+        emit_instance_audit_event(
+            app,
+            &instance_name,
+            project,
+            "cleanup-start",
+            "cleanup_container_for_rebuild",
+            serde_json::json!({}),
+        );
+    }
+
     wait_for_container_operation_quiet(app, project, None)?;
 
     if !container::exists(app) {
+        if audit_candidate {
+            emit_instance_audit_event(
+                app,
+                &instance_name,
+                project,
+                "cleanup-skip-missing",
+                "cleanup_container_for_rebuild",
+                serde_json::json!({}),
+            );
+        }
         return Ok(());
     }
 
-    if container::is_running(app).unwrap_or(false) {
+    let was_running = container::is_running(app).unwrap_or(false);
+    if was_running {
         let _ = container::stop(app);
     }
 
     for _ in 0..CONTAINER_DELETE_RETRY_CHECKS {
         if !container::exists(app) {
+            if audit_candidate {
+                emit_instance_audit_event(
+                    app,
+                    &instance_name,
+                    project,
+                    "cleanup-delete-success",
+                    "cleanup_container_for_rebuild",
+                    serde_json::json!({
+                        "was_running": was_running,
+                    }),
+                );
+            }
             return Ok(());
         }
         if let Err(err) = container::delete(app) {
             if !container::exists(app) {
+                if audit_candidate {
+                    emit_instance_audit_event(
+                        app,
+                        &instance_name,
+                        project,
+                        "cleanup-delete-success",
+                        "cleanup_container_for_rebuild",
+                        serde_json::json!({
+                            "was_running": was_running,
+                            "delete_error": err,
+                        }),
+                    );
+                }
                 return Ok(());
             }
             eprintln!("       Retry delete after error: {err}");
@@ -4422,9 +4885,33 @@ fn cleanup_container_for_rebuild(app: &str, project: &str) -> Result<(), String>
     }
 
     if container::exists(app) {
+        if audit_candidate {
+            emit_instance_audit_event(
+                app,
+                &instance_name,
+                project,
+                "cleanup-delete-failed",
+                "cleanup_container_for_rebuild",
+                serde_json::json!({
+                    "was_running": was_running,
+                }),
+            );
+        }
         return Err(format!(
             "failed to delete container '{app}' after waiting for background operations"
         ));
+    }
+    if audit_candidate {
+        emit_instance_audit_event(
+            app,
+            &instance_name,
+            project,
+            "cleanup-delete-success",
+            "cleanup_container_for_rebuild",
+            serde_json::json!({
+                "was_running": was_running,
+            }),
+        );
     }
     Ok(())
 }
@@ -5642,6 +6129,49 @@ devices:
     }
 
     #[test]
+    fn acquire_exact_tailscale_hostname_fails_fast_when_state_join_reports_missing_instance() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
+
+        let err = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Err(
+                    "incus --project user-1001 exec psht-candidate --force-noninteractive -- sh -c systemctl start tailscaled failed: Error: Failed to fetch instance \"psht-candidate\" in project \"user-1001\": Instance not found"
+                        .to_string(),
+                )
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "unexpected.tail.ts.net".to_string(),
+                )))
+            },
+            |_container| Ok(()),
+            |_container| {
+                reset_calls += 1;
+                Ok(())
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("candidate container 'candidate' disappeared"));
+        assert!(err.contains("Candidate instance: psht-candidate"));
+        assert!(err.contains("Likely causes: forced deploy takeover"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 0);
+        assert_eq!(reset_calls, 0);
+        assert_eq!(sleep_calls, 0);
+    }
+
+    #[test]
     fn acquire_exact_tailscale_hostname_switches_to_auth_when_state_has_no_dns() {
         let mut state_calls = 0usize;
         let mut auth_calls = 0usize;
@@ -5677,6 +6207,48 @@ devices:
         assert_eq!(auth_calls, 1);
         assert_eq!(reset_calls, 1);
         assert_eq!(sleep_calls, 1);
+    }
+
+    #[test]
+    fn acquire_exact_tailscale_hostname_fails_fast_when_reset_reports_missing_instance() {
+        let mut state_calls = 0usize;
+        let mut auth_calls = 0usize;
+        let mut reset_calls = 0usize;
+        let mut sleep_calls = 0usize;
+
+        let err = acquire_exact_tailscale_hostname_with_retry(
+            "candidate",
+            "hyperlinked",
+            |_container, _app| {
+                state_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(None))
+            },
+            |_container, _app| {
+                auth_calls += 1;
+                Ok(TailscaleJoinAttempt::from_dns_name(Some(
+                    "unexpected.tail.ts.net".to_string(),
+                )))
+            },
+            |_container| Ok(()),
+            |_container| {
+                reset_calls += 1;
+                Err(
+                    "incus --project user-1001 exec psht-candidate --force-noninteractive -- sh -c tailscale down >/dev/null 2>&1 || true failed: Error: Failed to fetch instance \"psht-candidate\" in project \"user-1001\": Instance not found"
+                        .to_string(),
+                )
+            },
+            |_duration| {
+                sleep_calls += 1;
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("candidate container 'candidate' disappeared"));
+        assert!(err.contains("tailscale retry reset"));
+        assert_eq!(state_calls, 1);
+        assert_eq!(auth_calls, 0);
+        assert_eq!(reset_calls, 1);
+        assert_eq!(sleep_calls, 0);
     }
 
     #[test]
@@ -5808,6 +6380,64 @@ devices:
         assert_eq!(auth_calls, 2);
         assert_eq!(reset_calls, 2);
         assert_eq!(sleep_calls, 2);
+    }
+
+    #[test]
+    fn recent_instance_audit_summary_from_lines_returns_latest_match() {
+        let lines = vec![
+            format!(
+                "1.000 [deploy] {DEPLOY_INSTANCE_AUDIT_MARKER} {}",
+                serde_json::json!({
+                    "app_ref": "hyperlinked-build-1",
+                    "instance": "psht-hyperlinked-build-1",
+                    "project": "user-1001",
+                    "action": "cleanup-start",
+                    "reason": "cleanup_container_for_rebuild",
+                    "details": {}
+                })
+            ),
+            format!(
+                "2.000 [deploy] {DEPLOY_INSTANCE_AUDIT_MARKER} {}",
+                serde_json::json!({
+                    "app_ref": "hyperlinked-build-1",
+                    "instance": "psht-hyperlinked-build-1",
+                    "project": "user-1001",
+                    "action": "forced-reset",
+                    "reason": "blocked-operation-reconcile",
+                    "details": {
+                        "op_id": "op-123"
+                    }
+                })
+            ),
+        ];
+
+        let summary =
+            recent_instance_audit_summary_from_lines(&lines, "psht-hyperlinked-build-1").unwrap();
+
+        assert!(summary.contains("action=forced-reset"));
+        assert!(summary.contains("reason=blocked-operation-reconcile"));
+        assert!(summary.contains("\"op_id\":\"op-123\""));
+    }
+
+    #[test]
+    fn build_vanished_candidate_error_includes_context() {
+        let err = build_vanished_candidate_error(
+            "hyperlinked-build-1",
+            "psht-hyperlinked-build-1",
+            "tailscale state join",
+            "incus exec failed: instance not found",
+            Some("user-1001"),
+            Some(false),
+            Some("request=req-123, requested_at=123, target_sha=deadbeef"),
+            Some("action=forced-reset, reason=blocked-operation-reconcile"),
+        );
+
+        assert!(err.contains("candidate container 'hyperlinked-build-1' disappeared"));
+        assert!(err.contains("Project: user-1001"));
+        assert!(err.contains("Candidate exists now: false"));
+        assert!(err.contains("Deploy interrupt state: request=req-123"));
+        assert!(err.contains("Recent instance audit: action=forced-reset"));
+        assert!(err.contains("Likely causes: forced deploy takeover"));
     }
 
     #[test]
@@ -6438,6 +7068,7 @@ devices:
         vars.insert("HELLO".to_string(), "world".to_string());
         let script = app_runner_script_content(3737, "bun run index.ts", &vars).unwrap();
         assert!(script.starts_with("#!/bin/sh"));
+        assert!(script.contains("printf '%s\\n' \"$$\" > /var/psht/app.pid"));
         assert!(script.contains("cd /app"));
         assert!(script.contains("export PORT=3737"));
         assert!(script.contains("export HELLO='world'"));
@@ -6461,6 +7092,48 @@ devices:
         assert!(cmd.contains("/proc/uptime"));
         assert!(cmd.contains("date +%s"));
         assert!(cmd.contains("echo alive"));
+    }
+
+    #[test]
+    fn app_service_probe_cmd_checks_listener_ownership() {
+        let cmd = app_service_probe_cmd(3430);
+        assert!(cmd.contains("systemctl show psht-app.service"));
+        assert!(cmd.contains("ControlGroup"));
+        assert!(cmd.contains("ListenerMatchesService"));
+        assert!(cmd.contains("/proc/$pid/cgroup"));
+        assert!(cmd.contains("sport = :3430"));
+    }
+
+    #[test]
+    fn parse_app_service_probe_tracks_listener_ownership() {
+        let probe = parse_app_service_probe(
+            "ActiveState=active\nSubState=running\nMainPID=42\nControlGroup=/system.slice/psht-app.service\nPortListening=yes\nListenerMatchesService=no\nListenerPids=7 8\n",
+        )
+        .unwrap();
+        assert!(probe.is_active());
+        assert!(!probe.is_ready());
+        assert_eq!(probe.main_pid, Some(42));
+        assert_eq!(probe.listener_pids, vec![7, 8]);
+        assert!(
+            probe
+                .detail(3430)
+                .contains("listener not owned by psht-app.service")
+        );
+    }
+
+    #[test]
+    fn parse_app_service_probe_marks_ready_listener() {
+        let probe = parse_app_service_probe(
+            "ActiveState=active\nSubState=running\nMainPID=42\nControlGroup=/system.slice/psht-app.service\nPortListening=yes\nListenerMatchesService=yes\nListenerPids=42\n",
+        )
+        .unwrap();
+        assert!(probe.is_active());
+        assert!(probe.is_ready());
+        assert!(
+            probe
+                .detail(3737)
+                .contains("tcp :3737 owned by psht-app.service")
+        );
     }
 
     #[test]

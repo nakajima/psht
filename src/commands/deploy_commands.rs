@@ -58,6 +58,7 @@ fn record_cleanup_job_failure(
 
 pub fn cleanup_previous(app: &str) -> Result<(), String> {
     app_name::validate_app_name(app)?;
+    let _deploy_log_session = start_deploy_log_session(app);
     let Some(_cleanup_lock) = try_acquire_cleanup_lock(app)? else {
         return Ok(());
     };
@@ -1092,13 +1093,8 @@ fn wait_for_tcp_listener(
     let mut next_heartbeat = DEPLOY_PROGRESS_HEARTBEAT_SECS;
 
     loop {
-        let output = container::exec_output(
-            app,
-            &format!(
-                "if ss -ltn \"sport = :{port}\" 2>/dev/null | grep -q LISTEN; then echo ready; fi; true"
-            ),
-        )?;
-        if output.trim() == "ready" {
+        let probe = probe_app_service(app, port)?;
+        if probe.is_ready() {
             return Ok(());
         }
 
@@ -1119,12 +1115,16 @@ fn wait_for_tcp_listener(
 
         if elapsed >= timeout_secs {
             return Err(format!(
-                "{label} timed out after {timeout_secs}s waiting for TCP :{port}"
+                "{label} timed out after {timeout_secs}s waiting for TCP :{port}\nService state: {}",
+                probe.detail(port)
             ));
         }
 
         if elapsed >= next_heartbeat {
-            eprintln!("       Still waiting for TCP :{port} ({elapsed}s elapsed)");
+            eprintln!(
+                "       Still waiting for TCP :{port} ({elapsed}s elapsed): {}",
+                probe.detail(port)
+            );
             next_heartbeat += DEPLOY_PROGRESS_HEARTBEAT_SECS;
         }
         thread::sleep(Duration::from_secs(1));
@@ -1145,6 +1145,18 @@ fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, pr
 
     let candidate_instance = instance_name_from_app_ref(candidate_app);
     let failed_instance = instance_name_from_app_ref(&failed_app);
+
+    emit_instance_audit_event(
+        candidate_app,
+        &candidate_instance,
+        project,
+        "preserve-start",
+        "preserve_failed_candidate",
+        serde_json::json!({
+            "failed_app": failed_app.clone(),
+            "failed_instance": failed_instance.clone(),
+        }),
+    );
 
     let _ = container::remove_proxy_in_project(&candidate_instance, project);
     let _ = container::exec_cmd(candidate_app, "tailscale down >/dev/null 2>&1 || true");
@@ -1168,11 +1180,36 @@ fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, pr
     }
 
     match container::rename_instance_in_project(&candidate_instance, &failed_instance, project) {
-        Ok(()) => eprintln!("       Preserved failed candidate as {failed_app}"),
-        Err(err) => eprintln!(
-            "       Warning: failed to preserve failed candidate: {err} ({})",
-            preservation_failure_detail(candidate_app, project)
-        ),
+        Ok(()) => {
+            emit_instance_audit_event(
+                &failed_app,
+                &failed_instance,
+                project,
+                "preserve-success",
+                "preserve_failed_candidate",
+                serde_json::json!({
+                    "source_instance": candidate_instance.clone(),
+                }),
+            );
+            eprintln!("       Preserved failed candidate as {failed_app}");
+        }
+        Err(err) => {
+            emit_instance_audit_event(
+                candidate_app,
+                &candidate_instance,
+                project,
+                "preserve-failed",
+                "preserve_failed_candidate",
+                serde_json::json!({
+                    "failed_app": failed_app.clone(),
+                    "error": err.clone(),
+                }),
+            );
+            eprintln!(
+                "       Warning: failed to preserve failed candidate: {err} ({})",
+                preservation_failure_detail(candidate_app, project)
+            );
+        }
     }
 }
 

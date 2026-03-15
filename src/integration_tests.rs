@@ -1044,7 +1044,7 @@ fn integration_start_launches_app_process_from_metadata() {
 
     container::exec_cmd(
         &app,
-        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'while true; do sleep 60; done' > /app/run.sh && chmod 755 /app/run.sh",
+        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'exec python3 -m http.server \"$PORT\" --bind 127.0.0.1' > /app/run.sh && chmod 755 /app/run.sh",
     )
     .expect("failed to prepare app script");
     container::exec_cmd(&app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
@@ -1070,7 +1070,7 @@ fn integration_start_is_noop_when_app_process_already_running() {
 
     container::exec_cmd(
         &app,
-        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'while true; do sleep 60; done' > /app/run.sh && chmod 755 /app/run.sh",
+        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'exec python3 -m http.server \"$PORT\" --bind 127.0.0.1' > /app/run.sh && chmod 755 /app/run.sh",
     )
     .expect("failed to prepare app script");
     container::exec_cmd(&app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
@@ -1087,6 +1087,33 @@ fn integration_start_is_noop_when_app_process_already_running() {
         second_pid.trim(),
         first_pid.trim(),
         "start should no-op when app process is already running"
+    );
+}
+
+#[test]
+fn integration_start_fails_when_app_never_listens_on_port() {
+    let _serial = integration_test_lock();
+    let app = unique_name("inttest-start-no-listener");
+    let _guard = ContainerGuard::new(&app).expect("create container failed");
+    wait_for_container_network(&app).expect("container network not ready");
+
+    container::exec_cmd(
+        &app,
+        "mkdir -p /app /var/psht /etc && printf '%s\\n' '#!/bin/sh' 'while true; do sleep 60; done' > /app/run.sh && chmod 755 /app/run.sh",
+    )
+    .expect("failed to prepare app script");
+    container::exec_cmd(&app, "printf '%s\\n' './run.sh' > /etc/psht-start-command")
+        .expect("failed to write start metadata");
+    container::stop(&app).expect("failed to stop container before start test");
+
+    let err = commands::start(&app).expect_err("commands::start should fail without a listener");
+    assert!(
+        err.contains("failed to become ready after launch"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        err.contains("tcp :"),
+        "expected readiness detail in error: {err}"
     );
 }
 

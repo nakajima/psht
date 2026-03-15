@@ -124,19 +124,25 @@ pub fn start(app: &str) -> Result<(), String> {
     let active_app = resolve_existing_active_app_ref(app)?;
     set_app_desired_state(app, DESIRED_STATE_RUNNING)?;
     eprintln!("-----> Starting {app}");
+    let port = allocate_port(app);
     if !container::is_running(&active_app)? {
         container::start(&active_app)?;
     }
-    if app_service_is_active(&active_app)? {
-        eprintln!("       {app} is already running; skipping launch");
-        eprintln!("=====> {app} started");
-        return Ok(());
+    match probe_app_service(&active_app, port) {
+        Ok(probe) if probe.is_ready() => {
+            eprintln!("       {app} is already running; skipping launch");
+            eprintln!("=====> {app} started");
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("       Warning: failed to inspect existing app service for {app}: {err}");
+        }
     }
     let vars = read_env_vars(app)?;
     let required_env = read_required_env(&active_app)?;
     ensure_required_env_present(&required_env, &vars)?;
     let command = read_start_command(&active_app)?;
-    let port = allocate_port(app);
     launch_app_process(&active_app, port, &command, &vars)?;
     if tailscale::dns_name_in_container(&active_app).is_some()
         && let Err(e) = tailscale::expose_http_in_container(&active_app, port)
