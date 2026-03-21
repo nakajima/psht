@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
-use std::io::BufRead;
+use std::io::{BufRead, ErrorKind, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,8 @@ const TAILSCALE_STATE_DEVICE_NAME: &str = "tailscale-state";
 const TAILSCALE_STATE_MOUNT_PATH: &str = "/var/lib/tailscale";
 const TAILSCALE_STATE_SEED_DEVICE_NAME: &str = "tailscale-state-seed";
 const TAILSCALE_STATE_SEED_MOUNT_PATH: &str = "/var/lib/psht-tailscale-state";
+const LOG_FOLLOW_POLL_INTERVAL_MS: u64 = 500;
+const LOG_FOLLOW_INITIAL_LINES: usize = 10;
 
 macro_rules! eprintln {
     () => {
@@ -651,6 +653,112 @@ pub fn push_file(app: &str, local_path: &str, remote_path: &str) -> Result<(), S
         .run()
 }
 
+fn pull_file_output(
+    instance_name: &str,
+    project: Option<&str>,
+    remote_path: &str,
+) -> Result<String, String> {
+    let target = instance_file_target(instance_name, remote_path);
+    let output = pull_file_command(instance_name, project, remote_path)
+        .build()
+        .output()
+        .map_err(|e| format!("failed to run incus file pull {target} -: {e}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if is_missing_file_error(&stderr) {
+        return Ok(String::new());
+    }
+    Err(format!("incus file pull {target} - failed: {stderr}"))
+}
+
+fn pull_file_command(
+    instance_name: &str,
+    project: Option<&str>,
+    remote_path: &str,
+) -> IncusCommand {
+    let target = instance_file_target(instance_name, remote_path);
+    let mut command = incus();
+    if let Some(project) = project {
+        command = command.arg("--project").arg(project);
+    }
+    command.args(&["file", "pull"]).arg(target).arg("-")
+}
+
+fn print_log_chunk(chunk: &str) -> Result<bool, String> {
+    if chunk.is_empty() {
+        return Ok(true);
+    }
+    let mut stdout = std::io::stdout();
+    if let Err(e) = stdout.write_all(chunk.as_bytes()) {
+        if e.kind() == ErrorKind::BrokenPipe {
+            return Ok(false);
+        }
+        return Err(format!("failed to write log output: {e}"));
+    }
+    if let Err(e) = stdout.flush() {
+        if e.kind() == ErrorKind::BrokenPipe {
+            return Ok(false);
+        }
+        return Err(format!("failed to flush log output: {e}"));
+    }
+    Ok(true)
+}
+
+fn tail_lines(text: &str, count: usize) -> &str {
+    if count == 0 || text.is_empty() {
+        return "";
+    }
+    let segments = text.split_inclusive('\n').collect::<Vec<_>>();
+    if segments.len() <= count {
+        return text;
+    }
+    let start = segments[..segments.len() - count]
+        .iter()
+        .map(|segment| segment.len())
+        .sum();
+    &text[start..]
+}
+
+fn stream_log_file(
+    instance_name: &str,
+    project: Option<&str>,
+    remote_path: &str,
+) -> Result<(), String> {
+    let mut previous = pull_file_output(instance_name, project, remote_path)?;
+    if !print_log_chunk(tail_lines(&previous, LOG_FOLLOW_INITIAL_LINES))? {
+        return Ok(());
+    }
+
+    loop {
+        std::thread::sleep(Duration::from_millis(LOG_FOLLOW_POLL_INTERVAL_MS));
+        let current = pull_file_output(instance_name, project, remote_path)?;
+        if current == previous {
+            continue;
+        }
+
+        if current.starts_with(&previous) {
+            if let Some(chunk) = current.get(previous.len()..) {
+                if !print_log_chunk(chunk)? {
+                    return Ok(());
+                }
+            }
+        } else {
+            if !print_log_chunk(
+                "\n[psht] app log rotated or truncated; resuming from current file contents\n",
+            )? {
+                return Ok(());
+            }
+            if !print_log_chunk(&current)? {
+                return Ok(());
+            }
+        }
+        previous = current;
+    }
+}
+
 pub fn add_proxy_in_project(
     instance_name: &str,
     host_port: u16,
@@ -869,17 +977,15 @@ pub fn delete(app: &str) -> Result<(), String> {
 }
 
 pub fn logs(app: &str, follow: bool) -> Result<(), String> {
-    let cmd = if follow {
-        "tail -f /var/psht/app.log"
-    } else {
-        "cat /var/psht/app.log"
-    };
     let name = resolved_instance_name(app);
-    scoped_incus_for_app(app)
-        .arg("exec")
-        .arg(&name)
-        .args(&["--", "sh", "-c", cmd])
-        .run()
+    let project = resolved_target(app).map(|target| target.project.name);
+    if follow {
+        return stream_log_file(&name, project.as_deref(), "/var/psht/app.log");
+    }
+
+    let output = pull_file_output(&name, project.as_deref(), "/var/psht/app.log")?;
+    let _ = print_log_chunk(&output)?;
+    Ok(())
 }
 
 pub fn list() -> Result<Vec<ContainerInfo>, String> {
@@ -1160,45 +1266,38 @@ mod tests {
     #[test]
     fn incus_logs_cat_command_builds_correctly() {
         let name = container_name("myapp");
-        let cmd = incus()
-            .arg("exec")
-            .arg(&name)
-            .args(&["--", "sh", "-c", "cat /var/psht/app.log"])
-            .build();
+        let cmd = pull_file_command(&name, None, "/var/psht/app.log").build();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec!["file", "pull", "psht-myapp/var/psht/app.log", "-"]
+        );
+    }
+
+    #[test]
+    fn incus_logs_cat_command_scopes_project_when_present() {
+        let name = container_name("myapp");
+        let cmd = pull_file_command(&name, Some("user-1001"), "/var/psht/app.log").build();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
             vec![
-                "exec",
-                "psht-myapp",
-                "--",
-                "sh",
-                "-c",
-                "cat /var/psht/app.log"
+                "--project",
+                "user-1001",
+                "file",
+                "pull",
+                "psht-myapp/var/psht/app.log",
+                "-"
             ]
         );
     }
 
     #[test]
-    fn incus_logs_follow_command_builds_correctly() {
-        let name = container_name("myapp");
-        let cmd = incus()
-            .arg("exec")
-            .arg(&name)
-            .args(&["--", "sh", "-c", "tail -f /var/psht/app.log"])
-            .build();
-        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
-        assert_eq!(
-            args,
-            vec![
-                "exec",
-                "psht-myapp",
-                "--",
-                "sh",
-                "-c",
-                "tail -f /var/psht/app.log"
-            ]
-        );
+    fn tail_lines_returns_requested_suffix() {
+        assert_eq!(tail_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(tail_lines("single", 10), "single");
+        assert_eq!(tail_lines("", 10), "");
     }
 
     #[test]
