@@ -4070,6 +4070,32 @@ fn format_install_failure_message(
     message
 }
 
+fn package_manager_repair_command() -> String {
+    format!(
+        r#"export DEBIAN_FRONTEND=noninteractive
+repair_attempt=1
+repair_status=1
+repair_max_attempts={APT_INSTALL_MAX_ATTEMPTS}
+while [ "$repair_attempt" -le "$repair_max_attempts" ]; do
+  if dpkg --configure -a; then
+    repair_status=0
+    break
+  fi
+  apt-get update -qq || true
+  if apt-get install -f -y -qq && dpkg --configure -a; then
+    repair_status=0
+    break
+  fi
+  if [ "$repair_attempt" -ge "$repair_max_attempts" ]; then
+    break
+  fi
+  sleep "$((repair_attempt * {APT_INSTALL_RETRY_SLEEP_SECS}))"
+  repair_attempt="$((repair_attempt + 1))"
+done
+[ "$repair_status" -eq 0 ]"#
+    )
+}
+
 fn logged_command_wrapper(command: &str, log_path: &str) -> String {
     let quoted_log_path = shell_quote(log_path);
     format!(
@@ -4107,20 +4133,63 @@ fn run_install_command_with_logging(app: &str, command: &str, label: &str) -> Re
     })
 }
 
-fn setup_log_tail(app: &str, lines: u32) -> Option<String> {
-    let output = container::exec_output(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupLogExcerpt {
+    Tail(String),
+    Empty,
+    Unavailable(String),
+}
+
+fn setup_log_excerpt(app: &str, lines: u32) -> SetupLogExcerpt {
+    match container::exec_output(
         app,
         &format!(
             "if [ -f {SETUP_LOG_PATH} ]; then tail -n {lines} {SETUP_LOG_PATH} 2>/dev/null || true; fi"
         ),
-    )
-    .ok()?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+    ) {
+        Ok(output) => {
+            let trimmed = output.trim();
+            if trimmed.is_empty() {
+                SetupLogExcerpt::Empty
+            } else {
+                SetupLogExcerpt::Tail(trimmed.to_string())
+            }
+        }
+        Err(err) => SetupLogExcerpt::Unavailable(err),
     }
+}
+
+fn format_setup_failure_message(
+    label: &str,
+    command_err: &str,
+    app: &str,
+    instance_name: &str,
+    log_excerpt: &SetupLogExcerpt,
+) -> String {
+    let mut message = format!("{label} failed: {command_err}");
+    message.push_str("\nCandidate runtime:\n");
+    message.push_str(&format!(
+        "  app: {app}\n  instance: {instance_name}\n  log: {SETUP_LOG_PATH}"
+    ));
+    match log_excerpt {
+        SetupLogExcerpt::Tail(log_excerpt) => {
+            message.push_str("\nLast setup log lines:\n");
+            message.push_str(log_excerpt);
+        }
+        SetupLogExcerpt::Empty => {
+            message.push_str("\nSetup log tail unavailable:\n");
+            message.push_str(&format!(
+                "  {SETUP_LOG_PATH} was empty or missing after the command failed."
+            ));
+        }
+        SetupLogExcerpt::Unavailable(err) => {
+            message.push_str("\nSetup log tail unavailable:\n");
+            message.push_str(&format!(
+                "  failed to read {SETUP_LOG_PATH} from {instance_name}: {err}"
+            ));
+        }
+    }
+    message
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4154,11 +4223,10 @@ fn classify_setup_failure(err: &str) -> SetupFailureClass {
 fn run_setup_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
     let wrapped = logged_command_wrapper(command, SETUP_LOG_PATH);
     container::exec_cmd_rolling(app, &wrapped, 5).map_err(|e| {
-        let mut message = format!("{label} failed: {e}");
-        if let Some(log_excerpt) = setup_log_tail(app, SETUP_LOG_TAIL_LINES) {
-            message.push_str("\nLast setup log lines:\n");
-            message.push_str(&log_excerpt);
-        }
+        let candidate_instance = instance_name_from_app_ref(app);
+        let log_excerpt = setup_log_excerpt(app, SETUP_LOG_TAIL_LINES);
+        let message =
+            format_setup_failure_message(label, &e, app, &candidate_instance, &log_excerpt);
         if let Ok(project) = current_project_name() {
             emit_resource_diagnostics(app, app, &project, label);
         }
@@ -4197,7 +4265,8 @@ fn apt_install_command(packages: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        r#"export DEBIAN_FRONTEND=noninteractive
+        r#"{repair}
+export DEBIAN_FRONTEND=noninteractive
 attempt=1
 status=1
 max_attempts={APT_INSTALL_MAX_ATTEMPTS}
@@ -4214,7 +4283,8 @@ while [ "$attempt" -le "$max_attempts" ]; do
   sleep "$((attempt * {APT_INSTALL_RETRY_SLEEP_SECS}))"
   attempt="$((attempt + 1))"
 done
-exit "$status""#
+exit "$status""#,
+        repair = package_manager_repair_command()
     ))
 }
 
@@ -7352,6 +7422,8 @@ devices:
     #[test]
     fn apt_install_command_builds_noninteractive_install() {
         let cmd = apt_install_command(&["curl".to_string(), "libssl-dev".to_string()]).unwrap();
+        assert!(cmd.contains("dpkg --configure -a"));
+        assert!(cmd.contains("apt-get install -f -y -qq"));
         assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
         assert!(cmd.contains("max_attempts="));
         assert!(cmd.contains("status=1"));
@@ -7458,6 +7530,48 @@ devices:
         );
         assert!(unreadable_message.contains("Install/build log tail unavailable:"));
         assert!(unreadable_message.contains("failed to read /var/psht/install.log"));
+        assert!(unreadable_message.contains("permission denied"));
+    }
+
+    #[test]
+    fn format_setup_failure_message_includes_saved_log_tail_and_candidate_identity() {
+        let message = format_setup_failure_message(
+            "candidate runtime setup",
+            "incus exec failed",
+            "pile-build-123",
+            "psht-pile-build-123",
+            &SetupLogExcerpt::Tail("dpkg: dependency problems".to_string()),
+        );
+        assert!(message.contains("candidate runtime setup failed: incus exec failed"));
+        assert!(message.contains("Candidate runtime:"));
+        assert!(message.contains("app: pile-build-123"));
+        assert!(message.contains("instance: psht-pile-build-123"));
+        assert!(message.contains("log: /var/psht/setup.log"));
+        assert!(message.contains("Last setup log lines:"));
+        assert!(message.contains("dpkg: dependency problems"));
+    }
+
+    #[test]
+    fn format_setup_failure_message_reports_missing_or_unreadable_saved_log() {
+        let empty_message = format_setup_failure_message(
+            "candidate runtime setup",
+            "incus exec failed",
+            "pile-build-123",
+            "psht-pile-build-123",
+            &SetupLogExcerpt::Empty,
+        );
+        assert!(empty_message.contains("Setup log tail unavailable:"));
+        assert!(empty_message.contains("was empty or missing"));
+
+        let unreadable_message = format_setup_failure_message(
+            "candidate runtime setup",
+            "incus exec failed",
+            "pile-build-123",
+            "psht-pile-build-123",
+            &SetupLogExcerpt::Unavailable("permission denied".to_string()),
+        );
+        assert!(unreadable_message.contains("Setup log tail unavailable:"));
+        assert!(unreadable_message.contains("failed to read /var/psht/setup.log"));
         assert!(unreadable_message.contains("permission denied"));
     }
 

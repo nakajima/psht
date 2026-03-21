@@ -150,6 +150,10 @@ fn deploy_request_id() -> String {
     format!("{}-{}", now_unix_secs(), std::process::id())
 }
 
+fn displayable_deploy_error(err: String) -> String {
+    strip_internal_deploy_error_markers(&err).to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FailedCandidateInspectionTarget {
     app_ref: String,
@@ -657,13 +661,7 @@ pub fn deploy(
         },
     );
 
-    result.map_err(|err| {
-        if is_deploy_interrupted_error(&err) {
-            strip_internal_deploy_error_markers(&err).to_string()
-        } else {
-            err
-        }
-    })
+    result.map_err(displayable_deploy_error)
 }
 
 fn deploy_impl(
@@ -1085,11 +1083,11 @@ fn prepare_candidate_fresh(
         &script_path.to_string_lossy(),
         "/tmp/setup.sh",
     )?;
-    run_setup_command_with_logging(
-        candidate_app,
-        "chmod +x /tmp/setup.sh && /tmp/setup.sh",
-        "candidate runtime setup",
-    )?;
+    let setup_command = format!(
+        "{}\nchmod +x /tmp/setup.sh && /tmp/setup.sh",
+        package_manager_repair_command()
+    );
+    run_setup_command_with_logging(candidate_app, &setup_command, "candidate runtime setup")?;
 
     install_apt_packages(candidate_app, apt_packages)?;
     container::exec_cmd(
@@ -1819,6 +1817,15 @@ mod tests {
         assert!(previous_cleanup_target_allowed("demo", "demo-prev-42"));
         assert!(previous_cleanup_target_allowed("demo", "demo-failed-42"));
         assert!(!previous_cleanup_target_allowed("demo", "other-build-42"));
+    }
+
+    #[test]
+    fn displayable_deploy_error_strips_internal_setup_markers() {
+        let err = mark_setup_nonretryable_failure("candidate runtime setup failed".to_string());
+        assert_eq!(
+            displayable_deploy_error(err),
+            "candidate runtime setup failed"
+        );
     }
 
     #[test]
