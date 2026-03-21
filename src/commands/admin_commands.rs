@@ -920,7 +920,7 @@ pub fn tailscale_up(app: &str) -> Result<(), String> {
         );
     }
     if let Some(name) = tailnet_hostname {
-        eprintln!("=====> Tailscale ready: http://{name} (also http://{name}:{port})");
+        eprintln!("=====> Tailscale ready: http://{name} (host port :{port} on server)");
     } else {
         eprintln!("=====> Tailscale repaired for {app}");
     }

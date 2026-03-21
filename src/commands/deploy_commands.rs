@@ -1188,6 +1188,41 @@ fn wait_for_tcp_listener(
     }
 }
 
+fn connect_localhost_port(port: u16, timeout: Duration) -> Result<(), String> {
+    let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port);
+    let stream = std::net::TcpStream::connect_timeout(&addr.into(), timeout)
+        .map_err(|err| err.to_string())?;
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn wait_for_host_port_connect(port: u16, timeout_secs: u64, label: &str) -> Result<(), String> {
+    let started = Instant::now();
+    let mut next_heartbeat = DEPLOY_PROGRESS_HEARTBEAT_SECS;
+
+    loop {
+        let last_error = match connect_localhost_port(port, Duration::from_secs(1)) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= timeout_secs {
+            return Err(format!(
+                "{label} timed out after {timeout_secs}s waiting for host TCP :{port}\nLast host connection error: {last_error}"
+            ));
+        }
+
+        if elapsed >= next_heartbeat {
+            eprintln!(
+                "       Still waiting for host TCP :{port} ({elapsed}s elapsed): {last_error}"
+            );
+            next_heartbeat += DEPLOY_PROGRESS_HEARTBEAT_SECS;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 fn preserve_failed_candidate(
     app: &str,
     candidate_app: &str,
@@ -1629,10 +1664,6 @@ fn deploy_zero_downtime(
 
     let build_number = increment_build_number(app)?;
 
-    if let Some(name) = tailnet_hostname {
-        eprintln!("       Tailnet: http://{name} (also http://{name}:{port})");
-    }
-
     if let Some(hash) = binary_hash {
         if let Err(e) = write_binary_hash(app, &hash) {
             eprintln!("       Warning: failed to persist binary hash: {e}");
@@ -1646,8 +1677,18 @@ fn deploy_zero_downtime(
         &candidate_app,
         port,
         CANDIDATE_READY_TIMEOUT_SECS,
-        "post-cutover verification",
+        "post-cutover app verification",
     )?;
+    wait_for_host_port_connect(
+        port,
+        CANDIDATE_READY_TIMEOUT_SECS,
+        "post-cutover host proxy verification",
+    )?;
+
+    if let Some(name) = tailnet_hostname {
+        eprintln!("       Tailnet HTTP: http://{name}");
+    }
+    eprintln!("       Host port proxy: server :{port}");
 
     eprintln!("=====> App {app} deployed on port {port} (build {build_number})");
     Ok(())
