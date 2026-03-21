@@ -1007,6 +1007,35 @@ fn repair_phase_after_supervise(
     Ok(())
 }
 
+fn supervision_should_skip_for_active_deploy_lock(app: &str) -> Result<Option<String>, String> {
+    supervision_should_skip_for_active_deploy_lock_path(&deploy_lock_path(app))
+}
+
+fn supervision_should_skip_for_active_deploy_lock_path(
+    path: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let Some(metadata) = read_deploy_lock_metadata_from(path)? else {
+        return Ok(None);
+    };
+
+    if let Some(pid) = metadata.pid {
+        if pid_is_alive(pid) {
+            return Ok(Some(format!("deploy lock is held by pid {pid}")));
+        }
+        return Ok(None);
+    }
+
+    if !lock_file_is_stale(path) {
+        return Ok(Some("deploy lock exists with no recorded pid".to_string()));
+    }
+
+    Ok(None)
+}
+
 pub fn daemon() -> Result<(), String> {
     let lock_path = deploy_lock_path(SUPERVISE_DAEMON_LOCK_APP);
     let Some(_guard) = try_acquire_deploy_lock_at(&lock_path)? else {
@@ -1037,6 +1066,11 @@ pub fn supervise() -> Result<(), String> {
 
     let mut failures = Vec::new();
     for (app, _) in states {
+        if let Some(detail) = supervision_should_skip_for_active_deploy_lock(&app)? {
+            eprintln!("       Supervise: skipping {app} while {detail}");
+            continue;
+        }
+
         match container::has_running_operation(&app) {
             Ok(true) => {
                 eprintln!("       Supervise: skipping {app} while container operation is active");
@@ -1073,5 +1107,71 @@ pub fn supervise() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("supervise failures: {}", failures.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process;
+
+    fn write_test_lock(path: &std::path::Path, pid: Option<u32>) {
+        let now = now_unix_secs();
+        let mut body = String::new();
+        if let Some(pid) = pid {
+            body.push_str(&format!("pid={pid}\n"));
+        }
+        body.push_str(&format!("created={now}\nupdated={now}\n"));
+        fs::write(path, body).unwrap();
+    }
+
+    fn dead_pid_for_test() -> u32 {
+        let candidates = [process::id().saturating_add(10_000), 999_999, 2_147_483_647];
+        for pid in candidates {
+            if !pid_is_alive(pid) {
+                return pid;
+            }
+        }
+        panic!("failed to find a dead pid candidate for test");
+    }
+
+    #[test]
+    fn supervision_skip_detects_live_deploy_lock_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("deploy.lock");
+        write_test_lock(&lock_path, Some(process::id()));
+
+        let reason = supervision_should_skip_for_active_deploy_lock_path(&lock_path).unwrap();
+
+        assert_eq!(
+            reason,
+            Some(format!("deploy lock is held by pid {}", process::id()))
+        );
+    }
+
+    #[test]
+    fn supervision_skip_ignores_dead_deploy_lock_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("deploy.lock");
+        write_test_lock(&lock_path, Some(dead_pid_for_test()));
+
+        let reason = supervision_should_skip_for_active_deploy_lock_path(&lock_path).unwrap();
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn supervision_skip_treats_recent_pidless_lock_as_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("deploy.lock");
+        write_test_lock(&lock_path, None);
+
+        let reason = supervision_should_skip_for_active_deploy_lock_path(&lock_path).unwrap();
+
+        assert_eq!(
+            reason,
+            Some("deploy lock exists with no recorded pid".to_string())
+        );
     }
 }
