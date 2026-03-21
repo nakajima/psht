@@ -258,6 +258,10 @@ fn project_config_template(app: &str) -> String {
     )
 }
 
+fn remote_command_exit_error(status: std::process::ExitStatus) -> String {
+    format!("remote command exited with status {status}; see remote output above")
+}
+
 fn ssh_cmd(host: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new("ssh")
         .arg(format!("psht@{host}"))
@@ -268,7 +272,7 @@ fn ssh_cmd(host: &str, args: &[&str]) -> Result<(), String> {
         .status()
         .map_err(|e| format!("failed to run ssh: {e}"))?;
     if !status.success() {
-        return Err(format!("ssh exited with status {}", status));
+        return Err(remote_command_exit_error(status));
     }
     Ok(())
 }
@@ -1835,6 +1839,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
     use tempfile::tempdir;
 
     #[test]
@@ -1842,6 +1848,16 @@ mod tests {
         let config = load_config_from(Path::new("/nonexistent/config.toml"));
         assert!(config.host.is_none());
         assert!(config.projects.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_exit_error_mentions_remote_output() {
+        let status = std::process::ExitStatus::from_raw(256);
+        assert_eq!(
+            remote_command_exit_error(status),
+            "remote command exited with status exit status: 1; see remote output above"
+        );
     }
 
     #[test]

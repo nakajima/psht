@@ -150,6 +150,65 @@ fn deploy_request_id() -> String {
     format!("{}-{}", now_unix_secs(), std::process::id())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedCandidateInspectionTarget {
+    app_ref: String,
+    instance_name: String,
+    preserved: bool,
+}
+
+fn candidate_install_inspection_commands(project: &str, instance_name: &str) -> [String; 2] {
+    let tail_cmd = shell_quote(&format!("tail -n 200 {INSTALL_LOG_PATH}"));
+    let grep_cmd = shell_quote(&format!(
+        "grep -n \"error\" {INSTALL_LOG_PATH} | tail -n 20"
+    ));
+    [
+        format!(
+            "incus --project {project} exec {instance_name} --force-noninteractive -- sh -lc {tail_cmd}"
+        ),
+        format!(
+            "incus --project {project} exec {instance_name} --force-noninteractive -- sh -lc {grep_cmd}"
+        ),
+    ]
+}
+
+fn finalize_candidate_install_failure(
+    err: &str,
+    project: &str,
+    inspection_target: Option<&FailedCandidateInspectionTarget>,
+) -> String {
+    let base = candidate_install_failure_message(err).unwrap_or(err);
+    let mut message = base.to_string();
+    message.push_str("\nCandidate inspection:\n");
+    message.push_str(&format!("  project: {project}"));
+    match inspection_target {
+        Some(target) => {
+            if target.preserved {
+                message.push_str(&format!(
+                    "\n  preserved failed candidate: {}\n  preserved instance: {}",
+                    target.app_ref, target.instance_name
+                ));
+            } else {
+                message.push_str(&format!(
+                    "\n  candidate app: {}\n  candidate instance: {}",
+                    target.app_ref, target.instance_name
+                ));
+                message.push_str("\n  note: failed candidate rename did not complete; inspect the current candidate instance.");
+            }
+            let [tail_cmd, grep_cmd] =
+                candidate_install_inspection_commands(project, &target.instance_name);
+            message.push_str("\nManual inspection:\n");
+            message.push_str(&format!("  {tail_cmd}\n  {grep_cmd}"));
+        }
+        None => {
+            message.push_str(
+                "\n  failed candidate container was not available for postmortem inspection.",
+            );
+        }
+    }
+    message
+}
+
 pub(super) fn deploy_interrupted_error(phase: &str, state: &DeployInterruptState) -> String {
     format!(
         "{DEPLOY_INTERRUPT_ERR_PREFIX} (phase: {phase}, request: {}, requested_at: {})",
@@ -1131,9 +1190,14 @@ fn wait_for_tcp_listener(
     }
 }
 
-fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, project: &str) {
+fn preserve_failed_candidate(
+    app: &str,
+    candidate_app: &str,
+    deploy_id: &str,
+    project: &str,
+) -> Option<FailedCandidateInspectionTarget> {
     if !container::exists(candidate_app) {
-        return;
+        return None;
     }
 
     let failed_app = failed_candidate_app_name(app, deploy_id);
@@ -1192,6 +1256,11 @@ fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, pr
                 }),
             );
             eprintln!("       Preserved failed candidate as {failed_app}");
+            Some(FailedCandidateInspectionTarget {
+                app_ref: failed_app,
+                instance_name: failed_instance,
+                preserved: true,
+            })
         }
         Err(err) => {
             emit_instance_audit_event(
@@ -1209,6 +1278,11 @@ fn preserve_failed_candidate(app: &str, candidate_app: &str, deploy_id: &str, pr
                 "       Warning: failed to preserve failed candidate: {err} ({})",
                 preservation_failure_detail(candidate_app, project)
             );
+            Some(FailedCandidateInspectionTarget {
+                app_ref: candidate_app.to_string(),
+                instance_name: candidate_instance,
+                preserved: false,
+            })
         }
     }
 }
@@ -1405,7 +1479,8 @@ fn deploy_zero_downtime(
                 &candidate_app,
                 &command,
                 "candidate dependency install",
-            )?;
+            )
+            .map_err(mark_candidate_install_failure)?;
         }
 
         run_hook(
@@ -1431,8 +1506,16 @@ fn deploy_zero_downtime(
     if let Err(err) = build_candidate_result {
         if is_deploy_interrupted_error(&err) {
             let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
-        } else {
+            return Err(err);
+        }
+        let inspection_target =
             preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
+        if candidate_install_failure_message(&err).is_some() {
+            return Err(finalize_candidate_install_failure(
+                &err,
+                &current_project,
+                inspection_target.as_ref(),
+            ));
         }
         return Err(err);
     }
@@ -1467,7 +1550,12 @@ fn deploy_zero_downtime(
                 if is_deploy_interrupted_error(&err) {
                     let _ = cleanup_container_for_rebuild(&candidate_app, &current_project);
                 } else {
-                    preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
+                    let _ = preserve_failed_candidate(
+                        app,
+                        &candidate_app,
+                        &deploy_id,
+                        &current_project,
+                    );
                 }
                 return Err(err);
             }
@@ -1528,7 +1616,7 @@ fn deploy_zero_downtime(
             return Err(err);
         }
 
-        preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
+        let _ = preserve_failed_candidate(app, &candidate_app, &deploy_id, &current_project);
         if old_active_app.is_some() {
             return Err(format!(
                 "deploy cutover failed and rollback was applied: {err}"
@@ -1731,6 +1819,48 @@ mod tests {
         assert!(previous_cleanup_target_allowed("demo", "demo-prev-42"));
         assert!(previous_cleanup_target_allowed("demo", "demo-failed-42"));
         assert!(!previous_cleanup_target_allowed("demo", "other-build-42"));
+    }
+
+    #[test]
+    fn finalize_candidate_install_failure_includes_preserved_failed_candidate_details() {
+        let err = mark_candidate_install_failure("candidate dependency install failed".to_string());
+        let message = finalize_candidate_install_failure(
+            &err,
+            "user-1001",
+            Some(&FailedCandidateInspectionTarget {
+                app_ref: "pile-failed-42".to_string(),
+                instance_name: "psht-pile-failed-42".to_string(),
+                preserved: true,
+            }),
+        );
+
+        assert!(message.contains("candidate dependency install failed"));
+        assert!(message.contains("Candidate inspection:"));
+        assert!(message.contains("project: user-1001"));
+        assert!(message.contains("preserved failed candidate: pile-failed-42"));
+        assert!(message.contains("preserved instance: psht-pile-failed-42"));
+        assert!(message.contains("incus --project user-1001 exec psht-pile-failed-42"));
+        assert!(message.contains("tail -n 200 /var/psht/install.log"));
+        assert!(message.contains("grep -n \"error\" /var/psht/install.log | tail -n 20"));
+    }
+
+    #[test]
+    fn finalize_candidate_install_failure_handles_unpreserved_candidate() {
+        let err = mark_candidate_install_failure("candidate dependency install failed".to_string());
+        let message = finalize_candidate_install_failure(
+            &err,
+            "user-1001",
+            Some(&FailedCandidateInspectionTarget {
+                app_ref: "pile-build-42".to_string(),
+                instance_name: "psht-pile-build-42".to_string(),
+                preserved: false,
+            }),
+        );
+
+        assert!(message.contains("candidate app: pile-build-42"));
+        assert!(message.contains("candidate instance: psht-pile-build-42"));
+        assert!(message.contains("failed candidate rename did not complete"));
+        assert!(message.contains("incus --project user-1001 exec psht-pile-build-42"));
     }
 
     #[test]

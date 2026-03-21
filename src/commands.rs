@@ -101,6 +101,7 @@ const DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER: &str = "__psht_cached_setup_failur
 const DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER: &str = "__psht_fresh_setup_failure__:";
 const DEPLOY_ERR_SETUP_TRANSIENT_MARKER: &str = "__psht_setup_transient_failure__:";
 const DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER: &str = "__psht_setup_nonretryable_failure__:";
+const DEPLOY_ERR_CANDIDATE_INSTALL_FAILURE_MARKER: &str = "__psht_candidate_install_failure__:";
 const SUPERVISE_SERVICE_PATH: &str = "/etc/systemd/system/psht-supervise.service";
 const LEGACY_SUPERVISE_TIMER_PATH: &str = "/etc/systemd/system/psht-supervise.timer";
 const WEB_SERVICE_NAME: &str = "psht-web.service";
@@ -4010,20 +4011,63 @@ fn app_workdir_command(command: &str) -> Option<String> {
     }
 }
 
-fn install_log_tail(app: &str, lines: u32) -> Option<String> {
-    let output = container::exec_output(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallLogExcerpt {
+    Tail(String),
+    Empty,
+    Unavailable(String),
+}
+
+fn install_log_excerpt(app: &str, lines: u32) -> InstallLogExcerpt {
+    match container::exec_output(
         app,
         &format!(
             "if [ -f {INSTALL_LOG_PATH} ]; then tail -n {lines} {INSTALL_LOG_PATH} 2>/dev/null || true; fi"
         ),
-    )
-    .ok()?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+    ) {
+        Ok(output) => {
+            let trimmed = output.trim();
+            if trimmed.is_empty() {
+                InstallLogExcerpt::Empty
+            } else {
+                InstallLogExcerpt::Tail(trimmed.to_string())
+            }
+        }
+        Err(err) => InstallLogExcerpt::Unavailable(err),
     }
+}
+
+fn format_install_failure_message(
+    label: &str,
+    command_err: &str,
+    app: &str,
+    instance_name: &str,
+    log_excerpt: &InstallLogExcerpt,
+) -> String {
+    let mut message = format!("{label} failed: {command_err}");
+    message.push_str("\nCandidate runtime:\n");
+    message.push_str(&format!(
+        "  app: {app}\n  instance: {instance_name}\n  log: {INSTALL_LOG_PATH}"
+    ));
+    match log_excerpt {
+        InstallLogExcerpt::Tail(log_excerpt) => {
+            message.push_str("\nLast install/build log lines:\n");
+            message.push_str(log_excerpt);
+        }
+        InstallLogExcerpt::Empty => {
+            message.push_str("\nInstall/build log tail unavailable:\n");
+            message.push_str(&format!(
+                "  {INSTALL_LOG_PATH} was empty or missing after the command failed."
+            ));
+        }
+        InstallLogExcerpt::Unavailable(err) => {
+            message.push_str("\nInstall/build log tail unavailable:\n");
+            message.push_str(&format!(
+                "  failed to read {INSTALL_LOG_PATH} from {instance_name}: {err}"
+            ));
+        }
+    }
+    message
 }
 
 fn logged_command_wrapper(command: &str, log_path: &str) -> String {
@@ -4050,11 +4094,10 @@ exit "$status""#,
 fn run_install_command_with_logging(app: &str, command: &str, label: &str) -> Result<(), String> {
     let wrapped = logged_command_wrapper(command, INSTALL_LOG_PATH);
     container::exec_cmd_rolling(app, &wrapped, 5).map_err(|e| {
-        let mut message = format!("{label} failed: {e}");
-        if let Some(log_excerpt) = install_log_tail(app, INSTALL_LOG_TAIL_LINES) {
-            message.push_str("\nLast install/build log lines:\n");
-            message.push_str(&log_excerpt);
-        }
+        let candidate_instance = instance_name_from_app_ref(app);
+        let log_excerpt = install_log_excerpt(app, INSTALL_LOG_TAIL_LINES);
+        let message =
+            format_install_failure_message(label, &e, app, &candidate_instance, &log_excerpt);
         if is_resource_pressure_error(&message)
             && let Ok(project) = current_project_name()
         {
@@ -4403,11 +4446,20 @@ fn mark_setup_nonretryable_failure(err: String) -> String {
     format!("{DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER}{err}")
 }
 
+fn mark_candidate_install_failure(err: String) -> String {
+    format!("{DEPLOY_ERR_CANDIDATE_INSTALL_FAILURE_MARKER}{err}")
+}
+
+fn candidate_install_failure_message(err: &str) -> Option<&str> {
+    err.strip_prefix(DEPLOY_ERR_CANDIDATE_INSTALL_FAILURE_MARKER)
+}
+
 fn strip_internal_deploy_error_markers(err: &str) -> &str {
     err.strip_prefix(DEPLOY_ERR_CACHED_SETUP_FAILURE_MARKER)
         .or_else(|| err.strip_prefix(DEPLOY_ERR_FRESH_SETUP_FAILURE_MARKER))
         .or_else(|| err.strip_prefix(DEPLOY_ERR_SETUP_TRANSIENT_MARKER))
         .or_else(|| err.strip_prefix(DEPLOY_ERR_SETUP_NONRETRYABLE_MARKER))
+        .or_else(|| candidate_install_failure_message(err))
         .unwrap_or(err)
 }
 
@@ -7368,6 +7420,48 @@ devices:
     }
 
     #[test]
+    fn format_install_failure_message_includes_saved_log_tail_and_candidate_identity() {
+        let message = format_install_failure_message(
+            "candidate dependency install",
+            "incus exec failed",
+            "pile-build-123",
+            "psht-pile-build-123",
+            &InstallLogExcerpt::Tail("error[E0432]: unresolved import".to_string()),
+        );
+        assert!(message.contains("candidate dependency install failed: incus exec failed"));
+        assert!(message.contains("Candidate runtime:"));
+        assert!(message.contains("app: pile-build-123"));
+        assert!(message.contains("instance: psht-pile-build-123"));
+        assert!(message.contains("log: /var/psht/install.log"));
+        assert!(message.contains("Last install/build log lines:"));
+        assert!(message.contains("error[E0432]: unresolved import"));
+    }
+
+    #[test]
+    fn format_install_failure_message_reports_missing_or_unreadable_saved_log() {
+        let empty_message = format_install_failure_message(
+            "candidate dependency install",
+            "incus exec failed",
+            "pile-build-123",
+            "psht-pile-build-123",
+            &InstallLogExcerpt::Empty,
+        );
+        assert!(empty_message.contains("Install/build log tail unavailable:"));
+        assert!(empty_message.contains("was empty or missing"));
+
+        let unreadable_message = format_install_failure_message(
+            "candidate dependency install",
+            "incus exec failed",
+            "pile-build-123",
+            "psht-pile-build-123",
+            &InstallLogExcerpt::Unavailable("permission denied".to_string()),
+        );
+        assert!(unreadable_message.contains("Install/build log tail unavailable:"));
+        assert!(unreadable_message.contains("failed to read /var/psht/install.log"));
+        assert!(unreadable_message.contains("permission denied"));
+    }
+
+    #[test]
     fn resource_pressure_error_detection_matches_fork_failures() {
         assert!(is_resource_pressure_error(
             "dpkg: unrecoverable fatal error, aborting: fork failed: Resource temporarily unavailable"
@@ -7423,6 +7517,13 @@ devices:
         assert_eq!(
             strip_internal_deploy_error_markers(&nonretryable_marked),
             "nonretryable setup"
+        );
+
+        let candidate_install_marked =
+            mark_candidate_install_failure("candidate install failed".to_string());
+        assert_eq!(
+            strip_internal_deploy_error_markers(&candidate_install_marked),
+            "candidate install failed"
         );
     }
 }

@@ -84,6 +84,7 @@ struct DashboardApp {
 struct AppDetail {
     app: String,
     runtime_status: String,
+    status_kind: AppStatusKind,
     desired_state: String,
     phase: String,
     active_instance: Option<String>,
@@ -97,9 +98,15 @@ struct AppDetail {
     stack: Option<String>,
     health: AppHealthReport,
     deploy_history: Vec<sqlite_store::DeployHistoryRow>,
-    logs: String,
-    tailscale: String,
-    actions: AppActions,
+    actions: LifecycleActions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleActions {
+    start: ActionState,
+    stop: ActionState,
+    restart: ActionState,
+    destroy: ActionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -278,7 +285,11 @@ fn route_request(request: HttpRequest) -> HttpResponse {
     match (request.method.as_str(), segments.as_slice()) {
         ("GET", []) => dashboard_response(&request),
         ("GET", ["host"]) => host_response(&request),
+        ("GET", ["host", "sections", "doctor"]) => host_section_response("Doctor", &["doctor"]),
+        ("GET", ["host", "sections", "health"]) => host_section_response("Health", &["health"]),
         ("GET", ["apps", app]) => app_response(&request, app),
+        ("GET", ["apps", app, "sections", "logs"]) => app_logs_section_response(app),
+        ("GET", ["apps", app, "sections", "tailscale"]) => app_tailscale_section_response(app),
         ("POST", ["apps", app, "start"]) => {
             app_action_response(&request, app, "start", super::start)
         }
@@ -332,16 +343,20 @@ fn host_response(request: &HttpRequest) -> HttpResponse {
             return error_response(500, "Internal Server Error", "Version lookup failed", &err);
         }
     };
-    let doctor = capture_self_command(&["doctor"]);
-    let health = capture_self_command(&["health"]);
 
     let mut body = String::new();
     body.push_str("<h1>Host</h1>");
     body.push_str(&nav_html());
     body.push_str(&message_banner_html(request));
     body.push_str(&version_section_html(&version, true));
-    body.push_str(&pre_section_html("Doctor", &command_output_text(&doctor)));
-    body.push_str(&pre_section_html("Health", &command_output_text(&health)));
+    body.push_str(&async_section_placeholder_html(
+        "Doctor",
+        "/host/sections/doctor",
+    ));
+    body.push_str(&async_section_placeholder_html(
+        "Health",
+        "/host/sections/health",
+    ));
 
     html_response(page_html("psht host", &body))
 }
@@ -436,18 +451,6 @@ fn app_response(request: &HttpRequest, app: &str) -> HttpResponse {
         "Destroy",
         &detail.actions.destroy,
     ));
-    body.push_str(&action_button_html(
-        &format!("{next}/tailscale/up"),
-        &next,
-        "Tailscale Up",
-        &detail.actions.tailscale_up,
-    ));
-    body.push_str(&action_button_html(
-        &format!("{next}/tailscale/down"),
-        &next,
-        "Tailscale Down",
-        &detail.actions.tailscale_down,
-    ));
     body.push_str("</section>");
 
     body.push_str("<section><h2>Service Health</h2>");
@@ -488,10 +491,58 @@ fn app_response(request: &HttpRequest, app: &str) -> HttpResponse {
     }
     body.push_str("</section>");
 
-    body.push_str(&pre_section_html("Tailscale", &detail.tailscale));
-    body.push_str(&pre_section_html("Recent Logs", &detail.logs));
+    body.push_str(&async_section_placeholder_html(
+        "Tailscale",
+        &format!("{next}/sections/tailscale"),
+    ));
+    body.push_str(&async_section_placeholder_html(
+        "Recent Logs",
+        &format!("{next}/sections/logs"),
+    ));
 
     html_response(page_html(&format!("psht {}", detail.app), &body))
+}
+
+fn host_section_response(title: &str, args: &[&str]) -> HttpResponse {
+    let output = capture_self_command(args);
+    html_response(pre_section_html(title, &command_output_text(&output)))
+}
+
+fn app_logs_section_response(app: &str) -> HttpResponse {
+    if let Err(err) = app_name::validate_app_name(app) {
+        return error_response(400, "Bad Request", "Invalid app name", &err);
+    }
+
+    match load_app_detail(app) {
+        Ok(Some(_)) => {
+            let logs = read_recent_logs(app)
+                .unwrap_or_else(|err| format!("recent logs unavailable: {err}"));
+            html_response(pre_section_html("Recent Logs", &logs))
+        }
+        Ok(None) => error_response(404, "Not Found", "App not found", app),
+        Err(err) => error_response(500, "Internal Server Error", "App load failed", &err),
+    }
+}
+
+fn app_tailscale_section_response(app: &str) -> HttpResponse {
+    if let Err(err) = app_name::validate_app_name(app) {
+        return error_response(400, "Bad Request", "Invalid app name", &err);
+    }
+
+    match load_app_detail(app) {
+        Ok(Some(detail)) => {
+            let tailscale = read_tailscale_summary(app)
+                .unwrap_or_else(|err| format!("tailscale status unavailable: {err}"));
+            let actions = app_actions(
+                detail.status_kind,
+                detail.active_instance.is_some(),
+                tailscale_status_kind(&tailscale),
+            );
+            html_response(tailscale_section_html(app, &tailscale, &actions))
+        }
+        Ok(None) => error_response(404, "Not Found", "App not found", app),
+        Err(err) => error_response(500, "Internal Server Error", "App load failed", &err),
+    }
 }
 
 fn app_action_response<F>(
@@ -633,9 +684,10 @@ fn nav_html() -> String {
 
 fn page_html(title: &str, body: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>body{{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;line-height:1.4;}}nav{{margin:0 0 1rem 0;}}table{{border-collapse:collapse;width:100%;margin:0.5rem 0 1.5rem 0;}}th,td{{border:1px solid #d0d0d0;padding:0.5rem;text-align:left;vertical-align:top;}}pre{{background:#f5f5f5;border:1px solid #d0d0d0;padding:0.75rem;overflow-x:auto;white-space:pre-wrap;}}form{{display:inline-block;margin:0;}}button{{padding:0.35rem 0.6rem;}}button:disabled{{opacity:0.6;cursor:not-allowed;}}section{{margin:1.5rem 0;}}.banner{{padding:0.75rem;border:1px solid #d0d0d0;margin:1rem 0;}}.banner.ok{{background:#eef8ee;}}.banner.error{{background:#fff0f0;}}.banner.warn{{background:#fff8e8;}}.action{{display:inline-flex;align-items:center;gap:0.35rem;margin:0 0.5rem 0.5rem 0;}}.action-note{{color:#555;font-size:0.9rem;}}</style></head><body>{}</body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>body{{font-family:sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;line-height:1.4;}}nav{{margin:0 0 1rem 0;}}table{{border-collapse:collapse;width:100%;margin:0.5rem 0 1.5rem 0;}}th,td{{border:1px solid #d0d0d0;padding:0.5rem;text-align:left;vertical-align:top;}}pre{{background:#f5f5f5;border:1px solid #d0d0d0;padding:0.75rem;overflow-x:auto;white-space:pre-wrap;}}form{{display:inline-block;margin:0;}}button{{padding:0.35rem 0.6rem;}}button:disabled{{opacity:0.6;cursor:not-allowed;}}section{{margin:1.5rem 0;}}.banner{{padding:0.75rem;border:1px solid #d0d0d0;margin:1rem 0;}}.banner.ok{{background:#eef8ee;}}.banner.error{{background:#fff0f0;}}.banner.warn{{background:#fff8e8;}}.action{{display:inline-flex;align-items:center;gap:0.35rem;margin:0 0.5rem 0.5rem 0;}}.action-note{{color:#555;font-size:0.9rem;}}.async-status{{color:#555;}}</style></head><body>{}<script>{}</script></body></html>",
         html_escape(title),
-        body
+        body,
+        async_loader_script()
     )
 }
 
@@ -703,6 +755,39 @@ fn pre_section_html(title: &str, text: &str) -> String {
         html_escape(title),
         html_escape(text)
     )
+}
+
+fn async_section_placeholder_html(title: &str, src: &str) -> String {
+    format!(
+        "<section data-async-src=\"{}\" data-async-title=\"{}\"><h2>{}</h2><p class=\"async-status\">Loading…</p></section>",
+        html_escape(src),
+        html_escape(title),
+        html_escape(title),
+    )
+}
+
+fn tailscale_section_html(app: &str, summary: &str, actions: &AppActions) -> String {
+    let next = app_path(app);
+    let mut body = String::new();
+    body.push_str("<section><h2>Tailscale</h2>");
+    body.push_str(&action_button_html(
+        &format!("{next}/tailscale/up"),
+        &next,
+        "Tailscale Up",
+        &actions.tailscale_up,
+    ));
+    body.push_str(&action_button_html(
+        &format!("{next}/tailscale/down"),
+        &next,
+        "Tailscale Down",
+        &actions.tailscale_down,
+    ));
+    body.push_str(&format!("<pre>{}</pre></section>", html_escape(summary)));
+    body
+}
+
+fn async_loader_script() -> &'static str {
+    "document.addEventListener('DOMContentLoaded',function(){document.querySelectorAll('[data-async-src]').forEach(function(section){var src=section.getAttribute('data-async-src');var title=section.getAttribute('data-async-title')||'Section';if(!src){return;}fetch(src,{headers:{'X-Requested-With':'psht-web-ui'}}).then(function(response){if(!response.ok){throw new Error('HTTP '+response.status);}return response.text();}).then(function(html){section.outerHTML=html;}).catch(function(error){section.innerHTML='<h2>'+title+'</h2><p class=\"async-status\">Failed to load section: '+String(error.message||error)+'</p>';});});});"
 }
 
 fn enabled_action_form_html(action_path: &str, next: &str, label: &str) -> String {
@@ -860,7 +945,9 @@ fn load_dashboard_apps() -> Result<Vec<DashboardApp>, String> {
             stack: metadata.stack,
             phase: row.phase,
             desired_state: row.desired_state,
-            active_instance: row.active_app.or_else(|| runtime.map(|value| value.active_instance)),
+            active_instance: row
+                .active_app
+                .or_else(|| runtime.map(|value| value.active_instance)),
         });
     }
     Ok(apps)
@@ -874,25 +961,25 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
     let status_row = sqlite_store::get_app_status(app)?;
     let runtime_state = sqlite_store::get_app_runtime_state(app)?;
     let deploy_history = sqlite_store::list_deploy_history(app, 10)?;
-    let logs =
-        read_recent_logs(app).unwrap_or_else(|err| format!("recent logs unavailable: {err}"));
-    let tailscale = read_tailscale_summary(app)
-        .unwrap_or_else(|err| format!("tailscale status unavailable: {err}"));
 
     if ps_row.is_none()
         && spec_row.is_none()
         && status_row.is_none()
         && runtime_state.is_none()
         && deploy_history.is_empty()
-        && logs.trim() == "No recent logs."
     {
         return Ok(None);
     }
 
-    let (status, health) = match ps_row.as_ref() {
-        Some(row) => (row.runtime_status.clone(), row.health.clone()),
+    let (status, status_kind, health) = match ps_row.as_ref() {
+        Some(row) => (
+            row.runtime_status.clone(),
+            app_status_kind(&row.runtime_status),
+            row.health.clone(),
+        ),
         None => (
             "Missing".to_string(),
+            AppStatusKind::Missing,
             AppHealthReport {
                 app: app.to_string(),
                 healthy: false,
@@ -914,15 +1001,12 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
                 .as_ref()
                 .map(|value| value.active_instance.clone())
         });
-    let actions = app_actions(
-        app_status_kind(&status),
-        active_instance.is_some(),
-        tailscale_status_kind(&tailscale),
-    );
+    let actions = lifecycle_actions(status_kind);
 
     Ok(Some(AppDetail {
         app: app.to_string(),
         runtime_status: status,
+        status_kind,
         desired_state,
         phase: status_row
             .as_ref()
@@ -952,8 +1036,6 @@ fn load_app_detail(app: &str) -> Result<Option<AppDetail>, String> {
         stack: metadata.stack,
         health,
         deploy_history,
-        logs,
-        tailscale,
         actions,
     }))
 }
@@ -1051,24 +1133,7 @@ fn app_actions(
     has_active_instance: bool,
     tailscale: TailscaleStatusKind,
 ) -> AppActions {
-    let missing = ActionState::disabled("app missing");
-    let stopped = ActionState::disabled("already stopped");
-
-    let start = match status {
-        AppStatusKind::Running => ActionState::disabled("already running"),
-        AppStatusKind::Missing => missing.clone(),
-        AppStatusKind::Down | AppStatusKind::Stopped => ActionState::enabled(),
-    };
-    let stop = match status {
-        AppStatusKind::Running | AppStatusKind::Down => ActionState::enabled(),
-        AppStatusKind::Stopped => stopped.clone(),
-        AppStatusKind::Missing => missing.clone(),
-    };
-    let restart = match status {
-        AppStatusKind::Running | AppStatusKind::Down => ActionState::enabled(),
-        AppStatusKind::Stopped => stopped,
-        AppStatusKind::Missing => missing.clone(),
-    };
+    let lifecycle = lifecycle_actions(status);
     let tailscale_up = if matches!(status, AppStatusKind::Missing) {
         ActionState::disabled("app missing")
     } else if !has_active_instance {
@@ -1089,12 +1154,40 @@ fn app_actions(
     };
 
     AppActions {
+        start: lifecycle.start,
+        stop: lifecycle.stop,
+        restart: lifecycle.restart,
+        destroy: lifecycle.destroy,
+        tailscale_up,
+        tailscale_down,
+    }
+}
+
+fn lifecycle_actions(status: AppStatusKind) -> LifecycleActions {
+    let missing = ActionState::disabled("app missing");
+    let stopped = ActionState::disabled("already stopped");
+
+    let start = match status {
+        AppStatusKind::Running => ActionState::disabled("already running"),
+        AppStatusKind::Missing => missing.clone(),
+        AppStatusKind::Down | AppStatusKind::Stopped => ActionState::enabled(),
+    };
+    let stop = match status {
+        AppStatusKind::Running | AppStatusKind::Down => ActionState::enabled(),
+        AppStatusKind::Stopped => stopped.clone(),
+        AppStatusKind::Missing => missing.clone(),
+    };
+    let restart = match status {
+        AppStatusKind::Running | AppStatusKind::Down => ActionState::enabled(),
+        AppStatusKind::Stopped => stopped,
+        AppStatusKind::Missing => missing,
+    };
+
+    LifecycleActions {
         start,
         stop,
         restart,
         destroy: ActionState::enabled(),
-        tailscale_up,
-        tailscale_down,
     }
 }
 
@@ -1369,5 +1462,62 @@ mod tests {
         assert!(html.contains("ok"));
         assert!(html.contains("Reconciling"));
         assert!(html.contains("running"));
+    }
+
+    #[test]
+    fn async_section_placeholder_marks_loading_state() {
+        let html = async_section_placeholder_html("Recent Logs", "/apps/demo/sections/logs");
+
+        assert!(html.contains("data-async-src=\"/apps/demo/sections/logs\""));
+        assert!(html.contains("data-async-title=\"Recent Logs\""));
+        assert!(html.contains("Loading"));
+    }
+
+    #[test]
+    fn page_html_includes_async_loader_script() {
+        let html = page_html(
+            "psht",
+            "<section data-async-src=\"/host/sections/health\"></section>",
+        );
+
+        assert!(html.contains("data-async-src"));
+        assert!(html.contains("fetch(src"));
+        assert!(html.contains("DOMContentLoaded"));
+    }
+
+    #[test]
+    fn tailscale_section_renders_controls_and_summary() {
+        let html = tailscale_section_html(
+            "demo",
+            "State: Running\nOnline: yes",
+            &app_actions(AppStatusKind::Running, true, TailscaleStatusKind::Healthy),
+        );
+
+        assert!(html.contains("<h2>Tailscale</h2>"));
+        assert!(html.contains("Tailscale Down"));
+        assert!(html.contains("State: Running"));
+        assert!(html.contains("/apps/demo/tailscale/down"));
+    }
+
+    #[test]
+    fn new_logs_fragment_route_rejects_invalid_app_names() {
+        let response = route_request(HttpRequest {
+            method: "GET".to_string(),
+            path: "/apps/bad name/sections/logs".to_string(),
+            query: HashMap::new(),
+        });
+
+        assert_eq!(response.status_code, 400);
+    }
+
+    #[test]
+    fn new_tailscale_fragment_route_rejects_invalid_app_names() {
+        let response = route_request(HttpRequest {
+            method: "GET".to_string(),
+            path: "/apps/bad name/sections/tailscale".to_string(),
+            query: HashMap::new(),
+        });
+
+        assert_eq!(response.status_code, 400);
     }
 }

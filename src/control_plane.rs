@@ -579,7 +579,9 @@ fn repair_stale_phase_at(
                 .candidate_instance
                 .or(status.candidate_instance.clone())
         },
-        previous_instance: snapshot.previous_instance.or(status.previous_instance.clone()),
+        previous_instance: snapshot
+            .previous_instance
+            .or(status.previous_instance.clone()),
         active_revision: snapshot.active_revision.or(status.active_revision.clone()),
         candidate_revision: if decision.clear_checkpoint {
             None
@@ -700,7 +702,11 @@ mod tests {
         let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
         assert_eq!(status.phase, AppPhase::Idle.as_str());
         assert!(status.candidate_instance.is_none());
-        assert!(sqlite_store::get_reconcile_checkpoint(&app).unwrap().is_none());
+        assert!(
+            sqlite_store::get_reconcile_checkpoint(&app)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -746,7 +752,13 @@ mod tests {
         assert!(repaired);
         let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
         assert_eq!(status.phase, AppPhase::Degraded.as_str());
-        assert!(status.last_error_json.as_deref().unwrap().contains("wait-for-operation"));
+        assert!(
+            status
+                .last_error_json
+                .as_deref()
+                .unwrap()
+                .contains("wait-for-operation")
+        );
         assert!(
             sqlite_store::get_reconcile_checkpoint(&app)
                 .unwrap()
@@ -794,7 +806,11 @@ mod tests {
         let status = sqlite_store::get_app_status(&app).unwrap().unwrap();
         assert_eq!(status.phase, AppPhase::Idle.as_str());
         assert!(status.last_error_json.is_none());
-        assert!(sqlite_store::get_reconcile_checkpoint(&app).unwrap().is_none());
+        assert!(
+            sqlite_store::get_reconcile_checkpoint(&app)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -852,8 +868,8 @@ mod tests {
             updated_at_ms: 0,
         })
         .unwrap();
-        let lease = sqlite_store::acquire_app_lease(&app, "owner-a", "intent-a", 15, 5_000)
-            .unwrap();
+        let lease =
+            sqlite_store::acquire_app_lease(&app, "owner-a", "intent-a", 15, 5_000).unwrap();
 
         let repaired = repair_stale_phase_at(
             &app,

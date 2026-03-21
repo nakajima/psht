@@ -116,11 +116,7 @@ pub(super) struct AppHealthReport {
 }
 
 pub(super) fn service_health_label(report: &AppHealthReport) -> &'static str {
-    if report.healthy {
-        "ok"
-    } else {
-        "unhealthy"
-    }
+    if report.healthy { "ok" } else { "unhealthy" }
 }
 
 fn missing_app_health_report(app: &str) -> AppHealthReport {
