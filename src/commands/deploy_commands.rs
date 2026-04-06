@@ -1686,7 +1686,9 @@ fn deploy_zero_downtime(
     )?;
 
     if let Some(name) = tailnet_hostname {
-        eprintln!("       Tailnet HTTP: http://{name}");
+        eprintln!(
+            "       Tailnet HTTP: http://{name} (host-routed; reverse proxies must send Host: {name})"
+        );
     }
     eprintln!("       Host port proxy: server :{port}");
 

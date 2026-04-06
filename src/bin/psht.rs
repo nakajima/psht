@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process;
@@ -280,6 +280,27 @@ fn ssh_cmd(host: &str, args: &[&str]) -> Result<(), String> {
 fn ssh_cmd_owned(host: &str, args: &[String]) -> Result<(), String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     ssh_cmd(host, &refs)
+}
+
+fn relay_output<R: Read, W: Write>(mut reader: R, mut writer: W) -> Result<Vec<u8>, String> {
+    let mut captured = Vec::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buf)
+            .map_err(|e| format!("failed to read command output: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        captured.extend_from_slice(&buf[..read]);
+        writer
+            .write_all(&buf[..read])
+            .map_err(|e| format!("failed to write command output: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("failed to flush command output: {e}"))?;
+    }
+    Ok(captured)
 }
 
 fn deploy_from_dir(
@@ -671,24 +692,41 @@ fn deploy_from_git(host: &str, app: &str, cwd: &Path, force: bool) -> Result<(),
     ensure_psht_git_remote(host, app, cwd)?;
 
     let (ref_name, sha) = current_git_deploy_target(cwd)?;
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args(["push", "--porcelain", "psht", "HEAD"])
         .current_dir(cwd)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to run git push: {e}"))?;
 
-    // Preserve git push output so users can still see transport details.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.is_empty() {
-        print!("{stdout}");
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        eprint!("{stderr}");
-    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture git push stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture git push stderr".to_string())?;
 
-    if !output.status.success() {
-        return Err(git_push_failure_message(cwd, output.status, &stderr));
+    let stdout_thread = std::thread::spawn(move || relay_output(stdout, io::stdout()));
+    let stderr_thread = std::thread::spawn(move || relay_output(stderr, io::stderr()));
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait for git push: {e}"))?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "git push stdout relay panicked".to_string())??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "git push stderr relay panicked".to_string())??;
+
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+
+    if !status.success() {
+        return Err(git_push_failure_message(cwd, status, &stderr));
     }
 
     let pushed_updated = parse_push_updated(&stdout);
@@ -2385,6 +2423,16 @@ mod tests {
     fn parse_push_updated_ignores_non_ref_lines() {
         let out = "To psht:app\nDone\n";
         assert_eq!(parse_push_updated(out), None);
+    }
+
+    #[test]
+    fn relay_output_captures_and_forwards_bytes() {
+        let input = std::io::Cursor::new(b"remote line\nprogress...\rstill going\n".to_vec());
+        let mut output = Vec::new();
+        let captured = relay_output(input, &mut output).unwrap();
+
+        assert_eq!(captured, output);
+        assert_eq!(captured, b"remote line\nprogress...\rstill going\n");
     }
 
     #[test]
